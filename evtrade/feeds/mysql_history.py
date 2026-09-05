@@ -1,26 +1,26 @@
 from __future__ import annotations
-"""行情源 Feed (自 mysql_analyze_demo.py 原样迁移)"""
+"""MySQLBacktestFeed: 历史回测数据源
 
+================================================================
+✅  可改层 (feeds 子包)  ✅
+================================================================
+MySQL 分段查询, 含预热窗口, verbose 打印进度。
+参数与 evtrade.data._fetch 等价, 但用 yield 而非一次 fetchall,
+适合实盘节奏 (--no-sleep 关闭 delay 即可全速)。
+"""
 import time
 from datetime import datetime, timedelta
-from typing import Iterator
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 
-from .config import DB_URL, TABLE
-from .models import Bar
-from .timeutils import daterange
-
-
-# ============ 行情源 Feed (统一流入接口) ============
-
-class Feed:
-    """行情源抽象: stream() 按时间从旧到新 yield Bar"""
-
-    def stream(self) -> Iterator[Bar]:
-        raise NotImplementedError
+from ..core.config import DB_URL, TABLE
+from ..frozen.models import Bar
+from ..frozen.timeutils import daterange
+from ._registry import register_feed
+from .base import Feed
 
 
+@register_feed("mysql_history")
 class MySQLBacktestFeed(Feed):
     """MySQL 历史行情源 (分段查询, 闭区间, 按证券代码筛选)
 
@@ -37,16 +37,14 @@ class MySQLBacktestFeed(Feed):
         self.warmup_days = warmup_days
         self.delay = delay
         self.verbose = verbose
-        # 预热起点 = 策略起点 - warmup_days
         self.warmup_start = (datetime.strptime(start_ymd, "%Y%m%d")
                              - timedelta(days=warmup_days)).strftime("%Y%m%d")
 
     @property
     def warmup_until(self) -> str:
-        """mark 阈值: stime < start_ymd 000000 为预热"""
         return self.start_ymd + "000000"
 
-    def stream(self) -> Iterator[Bar]:
+    def stream(self):
         import pandas as pd
         engine = create_engine(DB_URL, pool_pre_ping=True, pool_recycle=3600)
         total = 0
@@ -56,7 +54,6 @@ class MySQLBacktestFeed(Feed):
                        f"FROM {TABLE} WHERE stime >= '{seg_start}' AND stime <= '{seg_end}' "
                        f"AND stock_code = '{self.code}' "
                        f"ORDER BY stime ASC")
-                # 批量取数 (pd.read_sql 一次性 fetchall, 比逐行 conn.execute 快数倍)
                 df = pd.read_sql(sql, conn)
                 seg_n = 0
                 for rec in df.itertuples(index=False):
@@ -71,17 +68,3 @@ class MySQLBacktestFeed(Feed):
                 if self.verbose:
                     print(f"  -- 段 {seg_start[:8]}~{seg_end[:8]} 处理 {seg_n} 根, 累计 {total}",
                           flush=True)
-
-
-class ChainedFeed(Feed):
-    """串联多个行情源: 先历史预热, 再接实时 (实盘用)
-
-    例: ChainedFeed(MySQLBacktestFeed(...今天), LiveFeed(code))
-    """
-
-    def __init__(self, *feeds: Feed):
-        self.feeds = feeds
-
-    def stream(self) -> Iterator[Bar]:
-        for feed in self.feeds:
-            yield from feed.stream()

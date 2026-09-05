@@ -1,6 +1,19 @@
 from __future__ import annotations
 """录制 / 回放 / 对账: 回测与实盘一致性的验收工具
 
+================================================================
+⚠️  冻结层模块  ⚠️
+================================================================
+本文件是实盘一致性的验收门: 内核 vs 参考引擎逐 bar 信号 + 逐笔成交
+bitwise 对账 (tests/test_replay.py 锁定 PASS)。
+
+任何修改必须保证:
+  - reconcile() 的对账口径 (信号 ts/side/qty/price 全部相等) 不变
+  - replay_kernel / replay_engine 输出 dict 的 keys 不变
+================================================================
+
+工作流
+
 工作流 (实盘上线前的标准验收, 见 kbs/13):
   1. 录制: 实盘进程每收到一根 1m bar, 追加一行到日志
      (append_bar / write_bars_log; 格式 stime,code,open,high,low,close,volume)
@@ -16,7 +29,7 @@ import numpy as np
 
 from .kernel import (bars_to_arrays, make_state, resolve_period_seconds,
                      run_backtest, summarize, trades_to_list)
-from .models import Bar
+from ..frozen.models import Bar
 
 BAR_HEADER = "stime,code,open,high,low,close,volume"
 
@@ -72,9 +85,11 @@ def read_bars_log(path: str) -> list[Bar]:
 # ============ 回放 (两条引擎路径, 同一数据各跑一遍) ============
 
 def replay_kernel(bars, period: str, warmup_until: int, tf1: int,
-                  low1: float, low2: float, high1: float, high2: float,
+                  low1: float, low2: float, high1: float, high2: float = 0.5,
                   init_cash: float = 200000.0, init_position: float = 200000.0,
-                  trade_qty: float = 10000.0, scale: float = 1.0) -> dict:
+                  trade_qty: float = 10000.0, scale: float = 1.0,
+                  buy_pct: float = 0.0, sell_pct: float = 0.0,
+                  all_in: bool = False) -> dict:
     """内核回放: 返回逐 bar 信号轨迹 (全 bar 对齐) + 成交流 + 绩效"""
     arr = bars_to_arrays(bars)
     n = len(bars)
@@ -82,6 +97,7 @@ def replay_kernel(bars, period: str, warmup_until: int, tf1: int,
                     low1=low1, low2=low2, high1=high1, high2=high2,
                     init_cash=init_cash, init_position=init_position,
                     trade_qty=trade_qty, scale=scale,
+                    buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in,
                     record_trades=True, trade_cap=n)
     sig = np.zeros(n, np.int8)
     up = np.full(n, np.nan)
@@ -95,7 +111,9 @@ def replay_kernel(bars, period: str, warmup_until: int, tf1: int,
 def replay_engine(bars, period: str, warmup_until: int, tf1: int,
                   low1: float, low2: float, high1: float, high2: float,
                   init_cash: float = 200000.0, init_position: float = 200000.0,
-                  trade_qty: float = 10000.0, scale: float = 1.0) -> dict:
+                  trade_qty: float = 10000.0, scale: float = 1.0,
+                  buy_pct: float = 0.0, sell_pct: float = 0.0,
+                  all_in: bool = False) -> dict:
     """参考引擎 (Engine 全链路) 回放: 输出与 replay_kernel 同构 (全 bar 对齐)"""
     from evtrade.account import Account
     from evtrade.aggregator import BarAggregator
@@ -125,8 +143,10 @@ def replay_engine(bars, period: str, warmup_until: int, tf1: int,
             return s, info
 
     class _RecExec(SimulatedExecutor):
-        def __init__(self, account, qty, scale):
-            super().__init__(account, qty, verbose=False, scale=scale)
+        def __init__(self, account, qty, scale,
+                     buy_pct=0.0, sell_pct=0.0, all_in=False):
+            super().__init__(account, qty, verbose=False, scale=scale,
+                             buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in)
             self.records = []
 
         def trade(self, signal, price, ts):
@@ -140,7 +160,8 @@ def replay_engine(bars, period: str, warmup_until: int, tf1: int,
 
     n = len(bars)
     account = Account(cash=init_cash, position=init_position)
-    executor = _RecExec(account, qty=trade_qty, scale=scale)
+    executor = _RecExec(account, qty=trade_qty, scale=scale,
+                        buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in)
     strategy = _RecStrategy(ChannelDeviationStrategy(low1=low1, low2=low2,
                                                      high1=high1, high2=high2))
     aggregator = BarAggregator(resolve_period_seconds(period), on_bars=None,
@@ -157,8 +178,8 @@ def replay_engine(bars, period: str, warmup_until: int, tf1: int,
     dw = np.full(n, np.nan)
     offset = 0
     if warmup_until:
-        offset = int(np.searchsorted(arr_stime := np.array([int(s) for s in stime]),
-                                     warmup_until))
+        stime_int = np.array([int(s) for s in stime])
+        offset = int(np.searchsorted(stime_int, warmup_until))
     m = len(strategy.sig)
     if m:
         # flush 收尾会多出一条 check 记录 (不产信号), 裁剪到回放段长度
@@ -188,12 +209,15 @@ def reconcile(bars, period: str, warmup_until: int, tf1: int,
               low1: float, low2: float, high1: float, high2: float,
               init_cash: float = 200000.0, init_position: float = 200000.0,
               trade_qty: float = 10000.0, scale: float = 1.0,
+              buy_pct: float = 0.0, sell_pct: float = 0.0, all_in: bool = False,
               verbose: bool = True) -> dict:
     """内核 vs 参考引擎 全面对账: 信号 / 通道值 / 成交 / 终态"""
     k = replay_kernel(bars, period, warmup_until, tf1, low1, low2, high1, high2,
-                      init_cash, init_position, trade_qty, scale)
+                      init_cash, init_position, trade_qty, scale,
+                      buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in)
     r = replay_engine(bars, period, warmup_until, tf1, low1, low2, high1, high2,
-                      init_cash, init_position, trade_qty, scale)
+                      init_cash, init_position, trade_qty, scale,
+                      buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in)
     d_sig = diff_signals(k["sig"], r["sig"])
     trades_ok = (len(k["trades"]) == len(r["trades"]) and all(
         kt["ts"] == rt["ts"] and kt["side"] == rt["side"]

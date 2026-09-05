@@ -1,6 +1,22 @@
 from __future__ import annotations
 """周期桶时间戳计算与分段区间 (自 mysql_analyze_demo.py 原样迁移 + 任意周期支持)
 
+================================================================
+⚠️  冻结层模块  ⚠️
+================================================================
+本文件的 compute_bucket_general 与 evtrade.kernel.bucket_ts_encoded
+是**逐例等价**的两个实现 (tests/test_timeutils.py 锁定)。
+
+对老 7 周期 (1m/5m/15m/30m/1h/4h/1d) 的等价性是回归测试必过项;
+对任意周期 (90m/7m/3d) 是 kbs/04 第 5 节支持的扩展。
+
+任何修改必须**同步**改:
+  - evtrade/timeutils.py (本文件, datetime 字符串版, 给人/参考引擎用)
+  - evtrade/kernel.py bucket_ts_encoded (njit, 整数版, 给内核用)
+  - evtrade/gpu.py _encoded_to_epoch_np / _epoch_to_encoded_np / precompute_ts_mark
+  - kbs/04-周期合并机制.md
+================================================================
+
 两套桶算法:
   * compute_bucket (字符串/字段取整版) —— 原始实现, 仅对 1m/5m/15m/30m/1h/4h/1d
     这类"能对齐日历字段"的周期正确; 保留作为**历史语义基准** (等价性测试用)。

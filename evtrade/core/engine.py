@@ -1,13 +1,31 @@
 from __future__ import annotations
-"""回测/实盘统一引擎 (自 mysql_analyze_demo.py 原样迁移; 参考实现, 差分测试基准)"""
+"""回测/实盘统一引擎 (自 mysql_analyze_demo.py 原样迁移; 参考实现, 差分测试基准)
 
-from .aggregator import BarAggregator
+================================================================
+✅  可改层模块  ✅  (但与 kernel 等价, 改时小心)
+================================================================
+本文件是参考引擎 (与 evtrade.kernel 等价, 由 tests/test_differential.py
+与 tests/test_replay.py 锁定)。可改的部分:
+
+  - print_summary() 输出格式: 任意改, 不影响差分
+  - Engine.on_bars 内追加风控检查 (止损/止盈):
+      在 "if signal:" 之前加 cur.H/L/C 与账户 position 的检查,
+      若不满足风控则置 signal=None。
+
+**不要改**的部分:
+  - _sync_ema 增量推送逻辑 (与 kernel step 第 2 步等价)
+  - mark=0 时只累积指标不驱动策略 (kernel 第 4 步等价)
+  - 成交时点 = 信号当根 close, 价格 = cur["close"]
+================================================================
+"""
+
+from ..frozen.aggregator import BarAggregator
+from ..frozen.incremental_indicators import EMAChannel
+from ..frozen.models import fmt
+from ..frozen.strategy import ChannelDeviationStrategy
+from ..execution.base import Executor
+from ..feeds.base import Feed
 from .config import TF1
-from .execution import Executor
-from .feeds import Feed
-from .indicators import EMAChannel
-from .models import fmt
-from .strategy import ChannelDeviationStrategy
 
 
 # ============ 引擎 (连接 Feed → Aggregator → 策略 → 执行) ============

@@ -1,5 +1,18 @@
 from __future__ import annotations
-"""常量与默认配置 (自 mysql_analyze_demo.py 原样迁移; DB_URL 支持环境变量覆盖)"""
+"""常量与默认配置 (自 mysql_analyze_demo.py 原样迁移; DB_URL 支持环境变量覆盖)
+
+================================================================
+✅  可改层模块  ✅
+================================================================
+本文件定义用户面默认值, 改动**安全**:
+  - INIT_CASH / INIT_POSITION / TRADE_QTY: 改默认资金/持仓/单笔数量
+  - TF1: 改通道轨 EMA 默认周期 (CLI --tf1 可覆盖)
+  - DB_URL: 环境变量 EVTRADE_DB_URL 可覆盖, 避免凭据入仓
+  - PERIODS: 7 个预定义周期; --period 支持任意 m/h/d, PERIODS 仅做默认
+
+⚠️  修改默认值会改变所有未显式传参的回测结果, 注意在 kbs/10 同步。
+================================================================
+"""
 
 import os
 from datetime import timedelta

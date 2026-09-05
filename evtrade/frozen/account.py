@@ -1,5 +1,16 @@
 from __future__ import annotations
-"""资金/持仓记账 (自 mysql_analyze_demo.py 原样迁移)"""
+"""资金/持仓记账 (自 mysql_analyze_demo.py 原样迁移)
+
+================================================================
+⚠️  冻结层模块  ⚠️
+================================================================
+Account 字段被 evtrade.kernel.KernelState 逐字段引用 (init_cash/init_position/
+last_price);apply() 的 BUY/SELL 记账逻辑与 kernel._execute 逐位等价。
+
+如果需要改手续费/滑点模型, 不要改 apply 的现金公式, 而是**在外层
+(Executor/BrokerExecutor)** 扣费后再调 apply。
+================================================================
+"""
 
 
 # ============ 账户 (资金/持仓, 独立于下单方式) ============

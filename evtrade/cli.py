@@ -1,9 +1,31 @@
 from __future__ import annotations
 """命令行入口
 
-  python mysql_analyze_demo.py --period 5m --start 20250101 --end 20260903 --no-sleep
-      等价于 python -m evtrade backtest ... (默认 --engine kernel, 与 ref 逐笔等价)
-  python -m evtrade sweep --grid low1=1.0,1.5,2.0 --grid high2=0.3,0.5,0.8 --split 20260101
+================================================================
+✅  可改层模块  ✅  (用户面的主要修改点)
+================================================================
+本文件定义三个子命令: backtest / sweep / replay, 是用户面的主入口。
+
+常见修改:
+
+  1. 加新参数 (例: --max-position):
+     - 在 build_backtest_parser() / build_sweep_parser() 加 add_argument
+     - 在 _run_kernel / _run_ref 中读取并透传给 make_state 或 executor
+     - 同步给内核加 jitclass 字段 (参照阶段 2 的 buy_pct/sell_pct 加法)
+     - tests/test_xxx.py 加测试锁定
+
+  2. 改输出格式:
+     - _run_kernel() 末尾的 print 段 (汇总 / 信号行)
+     - 保留 "=== 60 字符等号 ===" 包裹风格, 便于日志检索
+
+  3. 加新子命令 (例: live 启动实盘):
+     - 在 main() 的 if/elif 链加一项
+     - 写一个 _run_xxx() 函数, 调用现有 Engine/ChainedFeed/BrokerExecutor
+
+  4. 别忘了:
+     - evtrade/__main__.py 是 `python -m evtrade` 入口, 委托 main()
+     - evtrade/__init__.py 顶层导出符号 (新模块要在此处加 from)
+================================================================
 """
 
 import argparse
@@ -11,8 +33,46 @@ import time
 
 import numpy as np
 
-from .config import INIT_CASH, INIT_POSITION, INTERVAL, TF1, TRADE_QTY
-from .timeutils import resolve_period_seconds
+from .core.config import INIT_CASH, INIT_POSITION, INTERVAL, TF1, TRADE_QTY
+from .frozen.timeutils import resolve_period_seconds
+
+
+def _parse_params(spec: str) -> dict:
+    """'k1:v1;k2:v2' -> dict (类型自动推导: int / float / bool / str)
+
+    用例:
+      --params "low1:1.5;low2:1.0;tf1:21"
+      --params "all_in:true;buy_pct:0.5"
+    """
+    out: dict = {}
+    if not spec:
+        return out
+    for kv in spec.split(";"):
+        kv = kv.strip()
+        if not kv:
+            continue
+        if ":" not in kv:
+            raise ValueError(f"参数格式错误 {kv!r}; 应为 'key:value'")
+        k, _, v = kv.partition(":")
+        k = k.strip()
+        v = v.strip()
+        out[k] = _auto_cast(v)
+    return out
+
+
+def _auto_cast(s: str):
+    """字符串 -> int / float / bool / str"""
+    if s.lower() in ("true", "false"):
+        return s.lower() == "true"
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return s
 
 
 def _period_type(s: str) -> str:
@@ -27,6 +87,12 @@ def build_backtest_parser() -> argparse.ArgumentParser:
         description="minute_bars 周期合并 + 通达信通道轨 (回测/实盘统一)")
     ap.add_argument("--period", default="5m", type=_period_type,
                     help="K线周期, 任意 数字+m/h/d: 5m/7m/15m/30m/90m/2h/4h/6h/1d/3d ...")
+    ap.add_argument("--strategy", default="channel_deviation",
+                    help="策略 key (来自 evtrade.strategies.available_strategies())")
+    ap.add_argument("--params", default="",
+                    help="策略参数 (通用 dict 形式): 'k1:v1;k2:v2' (分号分隔 kv, "
+                         "类型自动推导 int/float/bool/str)。"
+                         "例: --params 'low1:1.5;low2:1.0;high1:1.5;high2:0.5'")
     ap.add_argument("--start", default="20250101", help="策略起始日期 YYYYMMDD")
     ap.add_argument("--end", default="20260903", help="策略结束日期 YYYYMMDD")
     ap.add_argument("--step-days", type=int, default=7, help="[ref] 分段查询天数(闭区间)")
@@ -37,6 +103,15 @@ def build_backtest_parser() -> argparse.ArgumentParser:
     ap.add_argument("--scale", type=float, default=1.0,
                     help="倍投系数: 连续同向信号数量=上次×scale (首次=trade_qty, "
                          "反向重置); 1.0=关闭, 如 2.0")
+    ap.add_argument("--all-in", action="store_true",
+                    help="[阶段 2] 全仓模式: BUY 吃满现金 / SELL 清光持仓 (便捷开关, "
+                         "等价 --buy-pct 1.0 --sell-pct 1.0)")
+    ap.add_argument("--buy-pct", type=float, default=0.0,
+                    help="[阶段 2] BUY 时按当前现金的该比例下注 (0=关闭走 --trade-qty, "
+                         "0.5=半仓, 1.0=全仓)")
+    ap.add_argument("--sell-pct", type=float, default=0.0,
+                    help="[阶段 2] SELL 时按当前持仓的该比例卖 (0=关闭走 --trade-qty, "
+                         "1.0=清仓)")
     ap.add_argument("--code", default="159992.SZ", help="证券代码 (如 159992.SZ / 513120.SH)")
     ap.add_argument("--low1", type=float, default=1.5, help="下轨极端偏离阈值(百分比)")
     ap.add_argument("--low2", type=float, default=1.0, help="下轨回撤触发阈值(百分比)")
@@ -66,9 +141,21 @@ def _f4(v) -> str:
 
 
 def _run_kernel(args):
-    from .data import load_bars
-    from .kernel import (bucket_table, make_state, run_backtest,
-                         run_backtest_trace, summarize, trades_to_list)
+    # 策略参数 (--params 字典形式优先, 旧 kwargs 兜底)
+    if args.params:
+        strategy_params = _parse_params(args.params)
+    else:
+        strategy_params = {}
+    if not strategy_params and args.strategy == "channel_deviation":
+        # 兼容旧 CLI: --low1/--low2/--high1/--high2 当未传 --params 时
+        strategy_params = {
+            "low1": args.low1, "low2": args.low2,
+            "high1": args.high1, "high2": args.high2,
+        }
+
+    from .core.data import load_bars
+    from .core.kernel import (bucket_table, make_state, run_backtest,
+                               run_backtest_trace, summarize, trades_to_list)
 
     bars = load_bars(args.code, args.start, args.end,
                      warmup_days=args.warmup_days, cache_dir=args.data_cache)
@@ -77,14 +164,21 @@ def _run_kernel(args):
     print(f"证券: {args.code}  周期: {args.period}  策略日期: {args.start}~{args.end}  "
           f"预热: {args.warmup_days}天  TF1={args.tf1}  "
           f"low1/low2={args.low1}/{args.low2} high1/high2={args.high1}/{args.high2}  "
-          f"scale={args.scale}  引擎: kernel (numba)\n", flush=True)
+          f"scale={args.scale}  "
+          f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}  "
+          f"引擎: kernel (numba)\n", flush=True)
 
     st = make_state(period=args.period, warmup_until=int(args.start) * 1_000_000,
                     tf1=args.tf1, low1=args.low1, low2=args.low2,
                     high1=args.high1, high2=args.high2,
                     init_cash=INIT_CASH, init_position=INIT_POSITION,
                     trade_qty=args.trade_qty, scale=args.scale,
+                    buy_pct=args.buy_pct, sell_pct=args.sell_pct,
+                    all_in=args.all_in,
                     record_trades=True, trade_cap=n)
+    if args.strategy != "channel_deviation":
+        print(f"[警告] kernel 引擎仅支持 channel_deviation (参数写死在 jitclass); "
+              f"策略 {args.strategy!r} 请用 --engine ref")
     t0 = time.perf_counter()
     if show_bars:
         sig_out = np.zeros(n, np.int8)
@@ -130,7 +224,14 @@ def _run_kernel(args):
     print(f"不操作基线 (资金+市值) : {s['baseline']:.2f}")
     print(f"盈亏差额 (策略-基线)   : {s['excess']:+.2f}")
     print(f"盈亏比例              : {s['excess_pct']:+.2f}%")
+    print(f"年化超额 (择时贡献)   : {s['ann_excess_pct']:+.2f}%/年")
+    print(f"年化复合 CAGR         : {s['cagr']:+.2f}%/年")
+    print(f"超额 Sharpe           : {s['sharpe_excess']:+.3f}")
+    print(f"超额 Sortino          : {s['sortino_excess']:+.3f}")
+    print(f"Calmar (年化/回撤)    : {s['calmar']:+.3f}")
     print(f"最大回撤 (逐bar盯市)   : {s['max_drawdown']:.2%}")
+    print(f"最大回撤持续天数       : {s['max_dd_days']:.1f} 天  (恢复={s['max_dd_recovered']})")
+    print(f"超额曲线最大回撤       : {s['x_mdd']:.2%}")
     print(f"成交额合计            : {s['turnover']:.0f}")
     print(f"内核耗时              : {dt * 1000:.1f} ms ({n} 根 1m bar)")
     print("=" * 60)
@@ -166,28 +267,44 @@ def _run_kernel(args):
 
 def _run_ref(args):
     """原 Python 实现路径 (保留逐根 sleep / 分段拉数的原始行为)"""
-    from .account import Account
-    from .aggregator import BarAggregator
-    from .engine import Engine
-    from .execution import SimulatedExecutor
-    from .feeds import MySQLBacktestFeed
-    from .strategy import ChannelDeviationStrategy
+    from .frozen.account import Account
+    from .frozen.aggregator import BarAggregator
+    from .core.engine import Engine
+    from .execution.base import SimulatedExecutor
+    from .feeds.mysql_history import MySQLBacktestFeed
+    from .strategies import get_strategy
+    from .strategies import get_strategy as _gs
 
     delay = 0 if args.no_sleep else INTERVAL
     feed = MySQLBacktestFeed(code=args.code, start_ymd=args.start, end_ymd=args.end,
                              step_days=args.step_days, delay=delay, verbose=True)
     account = Account(cash=INIT_CASH, position=INIT_POSITION)
     executor = SimulatedExecutor(account, qty=args.trade_qty, verbose=True,
-                                 scale=args.scale)
+                                 scale=args.scale,
+                                 buy_pct=args.buy_pct, sell_pct=args.sell_pct,
+                                 all_in=args.all_in)
     aggregator = BarAggregator(resolve_period_seconds(args.period), on_bars=None,
                                warmup_until=feed.warmup_until)
-    strategy = ChannelDeviationStrategy(low1=args.low1, low2=args.low2,
-                                        high1=args.high1, high2=args.high2)
+    # 策略参数: --params (字典) 优先, 其次低/高/旧 kwargs 兼容
+    if args.params:
+        strategy_params = _parse_params(args.params)
+    else:
+        strategy_params = {}
+    # 旧式 kwargs 兼容 (当未传 --params 时)
+    if not strategy_params:
+        strategy_params = {
+            "low1": args.low1, "low2": args.low2,
+            "high1": args.high1, "high2": args.high2,
+        }
+    strategy = _gs(args.strategy, params=strategy_params)
     engine = Engine(feed, aggregator, strategy, executor, tf1=args.tf1, verbose=True)
-    print(f"证券: {args.code}  周期: {args.period}  策略日期: {args.start}~{args.end}  "
+    print(f"证券: {args.code}  周期: {args.period}  策略: {args.strategy}  "
+          f"策略日期: {args.start}~{args.end}  "
           f"预热起点: {feed.warmup_start}  分段: {args.step_days}天/段(闭区间)  "
           f"TF1={args.tf1}  sleep={'OFF' if args.no_sleep else 'ON'}  "
           f"low1/low2={args.low1}/{args.low2} high1/high2={args.high1}/{args.high2}  "
+          f"scale={args.scale}  "
+          f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}  "
           f"引擎: ref  Ctrl+C 停止\n")
     engine.run()
     engine.print_summary()
@@ -205,6 +322,10 @@ def backtest_main(argv=None):
 
 def build_sweep_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="参数并发扫描 (numba 内核, 线程池并行)")
+    ap.add_argument("--strategy", default="channel_deviation",
+                    help="策略 key (来自 evtrade.strategies.available_strategies())")
+    ap.add_argument("--params", default="",
+                    help="基础策略参数: 'k1:v1;k2:v2' (与 --grid 笛卡尔积叠加)")
     ap.add_argument("--code", default="159992.SZ")
     ap.add_argument("--start", default="20250101", help="策略起始日期 (预热另计)")
     ap.add_argument("--end", default="20260903")
@@ -218,6 +339,12 @@ def build_sweep_parser() -> argparse.ArgumentParser:
     ap.add_argument("--trade-qty", type=float, default=TRADE_QTY)
     ap.add_argument("--scale", type=float, default=1.0,
                     help="倍投系数 (连续同向信号数量累乘, 反向重置; 1.0=关闭)")
+    ap.add_argument("--all-in", action="store_true",
+                    help="全仓模式 (等价 --buy-pct 1.0 --sell-pct 1.0)")
+    ap.add_argument("--buy-pct", type=float, default=0.0,
+                    help="BUY 时按当前现金的该比例下注 (0=关闭)")
+    ap.add_argument("--sell-pct", type=float, default=0.0,
+                    help="SELL 时按当前持仓的该比例卖 (0=关闭)")
     ap.add_argument("--grid", action="append", default=[],
                     help="参数网格, 可多次: --grid low1=1.0,1.5,2.0 "
                          "(支持 low1/low2/high1/high2/tf1/period/trade_qty)")
@@ -268,11 +395,25 @@ def sweep_main(argv=None):
         bars = load_bars(args.code, args.start, args.end,
                          warmup_days=args.warmup_days, cache_dir=args.data_cache)
 
+    # 基础策略参数 (--params 字典形式优先, 旧低/高/旧 kwargs 兜底)
+    if args.params:
+        base_params = _parse_params(args.params)
+    else:
+        base_params = {}
+    if not base_params and args.strategy == "channel_deviation":
+        base_params = {
+            "low1": args.low1, "low2": args.low2,
+            "high1": args.high1, "high2": args.high2,
+        }
+
     base = {"start": args.start, "period": args.period, "tf1": args.tf1,
             "low1": args.low1, "low2": args.low2, "high1": args.high1,
             "high2": args.high2, "trade_qty": args.trade_qty,
             "scale": args.scale,
-            "init_cash": INIT_CASH, "init_position": INIT_POSITION}
+            "buy_pct": args.buy_pct, "sell_pct": args.sell_pct,
+            "all_in": args.all_in,
+            "init_cash": INIT_CASH, "init_position": INIT_POSITION,
+            "params": base_params}
     combos = parse_grid(args.grid) or [{}]
     splits = [s.strip() for s in args.splits.split(",") if s.strip()] if args.splits else None
     if splits:
@@ -283,12 +424,14 @@ def sweep_main(argv=None):
     df = run_sweep(bars, base, combos, split_ymd=args.split,
                    n_workers=args.workers, device=args.device,
                    splits=splits, fee_bp=args.fee_bp, lam=args.score_lambda,
-                   min_trades=args.min_trades, max_mdd=args.max_mdd)
+                   min_trades=args.min_trades, max_mdd=args.max_mdd,
+                   strategy_name=args.strategy)
     df.to_csv(args.out, index=False, encoding="utf-8-sig")
     cols = [c for c in df.columns]
     show = [c for c in df.columns
             if c in ("score", "ann_net_min", "ann_net_mean", "pos_ratio",
-                     "sharpe_min", "x_mdd_max", "S", "pareto", "filter_pass")
+                     "sharpe_min", "sortino_min", "calmar_max", "cagr_max",
+                     "max_dd_days_max", "x_mdd_max", "S", "pareto", "filter_pass")
             or c in GRID_KEYS]
     print(df[show].head(args.top).to_string(index=False))
     print(f"\n全部结果已保存: {args.out} ({len(df)} 行; 列: {cols})")
@@ -325,6 +468,10 @@ def build_replay_parser() -> argparse.ArgumentParser:
     ap.add_argument("--high1", type=float, default=1.5)
     ap.add_argument("--high2", type=float, default=0.5)
     ap.add_argument("--scale", type=float, default=1.0)
+    ap.add_argument("--all-in", action="store_true",
+                    help="全仓模式 (等价 buy_pct=sell_pct=1)")
+    ap.add_argument("--buy-pct", type=float, default=0.0)
+    ap.add_argument("--sell-pct", type=float, default=0.0)
     ap.add_argument("--warmup-until", default=None,
                     help="预热阈值 YYYYMMDD (可选; 日志从更早开始时用于只回放策略期)")
     ap.add_argument("--against-ref", action="store_true",
@@ -344,10 +491,13 @@ def replay_main(argv=None):
     print(f"回放: {len(bars)} 根 bar [{bars[0].stime} ~ {bars[-1].stime}]  "
           f"period={args.period} tf1={args.tf1} "
           f"low1/low2={args.low1}/{args.low2} high1/high2={args.high1}/{args.high2} "
-          f"scale={args.scale}\n", flush=True)
+          f"scale={args.scale}  "
+          f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}\n",
+          flush=True)
 
     k = replay_kernel(bars, args.period, warm, args.tf1, args.low1, args.low2,
-                      args.high1, args.high2, scale=args.scale)
+                      args.high1, args.high2, scale=args.scale,
+                      buy_pct=args.buy_pct, sell_pct=args.sell_pct, all_in=args.all_in)
     s = k["summary"]
     print(f"信号 {int((k['sig'] != 0).sum())} 个 (BUY {s['n_buy']} / SELL {s['n_sell']}), "
           f"成交 {s['n_trades']} 笔, 期末总资产 {s['final_equity']:,.2f} "
@@ -364,7 +514,8 @@ def replay_main(argv=None):
     if args.against_ref:
         print()
         reconcile(bars, args.period, warm, args.tf1, args.low1, args.low2,
-                  args.high1, args.high2, scale=args.scale)
+                  args.high1, args.high2, scale=args.scale,
+                  buy_pct=args.buy_pct, sell_pct=args.sell_pct, all_in=args.all_in)
 
 
 def main(argv=None):

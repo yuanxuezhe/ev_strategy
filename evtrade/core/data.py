@@ -1,10 +1,20 @@
 from __future__ import annotations
 """行情加载: MySQL 单次全量拉取 + 本地 npz 缓存 + 合成数据生成器
 
-内核路径 (engine=kernel / sweep) 的数据来源:
-  * load_bars:      MySQL 一次性拉取 [start-warmup_days, end] 全量 1m 行情,
-                    落地 npz 缓存; 重复回测/扫描零数据库开销 (L0 缓存层)。
-  * synthetic_bars: 无库环境 (测试/演示/参数扫描体验) 的确定性合成行情。
+================================================================
+✅  可改层模块  ✅
+================================================================
+本文件是内核路径的数据加载层 (与参考引擎的 MySQLBacktestFeed 平行):
+
+  - load_bars(code, start, end): MySQL 拉数 + npz 缓存 (默认开 cache)
+      缓存键 = (code, warmup_start, end); 命中后零数据库开销
+  - synthetic_bars(days, start_ymd, seed): 确定性合成数据 (无库体验/测试)
+
+新增数据源 (Tushare / AkShare / CSV / Parquet):
+  1. 实现 fetch_xxx() 返回 numpy 数组 {stime, open, high, low, close, volume}
+  2. 在 load_bars 里加分支 (例如 if source == 'tushare': ...)
+  3. CLI 加 --data-source 参数
+================================================================
 """
 
 import os
@@ -13,7 +23,7 @@ from datetime import datetime, timedelta
 import numpy as np
 
 from .config import DB_URL, TABLE
-from .models import Bar
+from ..frozen.models import Bar
 
 BAR_KEYS = ("stime", "open", "high", "low", "close", "volume")
 

@@ -1,5 +1,26 @@
 from __future__ import annotations
-"""EMA 与通道轨指标 (自 mysql_analyze_demo.py 原样迁移)"""
+"""EMA 与通道轨指标 (增量状态机版, 旧 indicators.py)
+
+================================================================
+⚠️  冻结层模块 (重命名为 _incremental_indicators.py)  ⚠️
+================================================================
+本文件原名 indicators.py, 因新增 indicators/ 子包 (纯函数库),
+被重命名为下划线前缀以避免命名冲突。
+
+本文件定义的 IncrementalEMA / EMAChannel 是**热路径用** (numba njit 友好),
+evtrade.kernel._ema_push / _ema_current 与之**逐位等价**,
+由 tests/test_differential.py + tests/test_kernel_unit.py 锁定。
+
+任何修改必须**同步**改以下位置:
+  - evtrade/_incremental_indicators.py (本文件)
+  - evtrade/kernel.py 的 _ema_push / _ema_current
+  - evtrade/gpu.py CUDA source 的对应段
+  - kbs/05-指标计算-EMA通道.md
+
+新增指标请在 indicators/ 子包写纯函数版 (jupyter 友好);
+不要在本文件加新类 (会破坏 numba 流式内核的对账)。
+================================================================
+"""
 
 
 # ============ 指标 (纯函数) ============

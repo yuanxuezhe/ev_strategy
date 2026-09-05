@@ -1,6 +1,28 @@
 from __future__ import annotations
 """numba 流式决策内核 —— 与参考实现逐行等价 (差分测试锁定)
 
+================================================================
+⚠️⚠️⚠️  冻结层核心模块  ⚠️⚠️⚠️
+================================================================
+本文件是**最核心、最不可动**的文件:
+  - 56 项差分测试锁定 (test_differential.py + test_kernel_unit.py)
+  - 浮点表达式与 4 个参考实现 (indicators / strategy / aggregator / execution) 逐位等价
+  - 与 evtrade/gpu.py CUDA kernel 同步 (差分锁定)
+
+修改本文件**前**请读 kbs/12-重构与性能内核.md 第 2 节"流式内核"。
+任何对 step() / _ema_push / _strategy_check / _execute / summarize 的改动
+都会让 tests 全红, 必须同步改:
+  1. evtrade/gpu.py CUDA source 对应段 (且重新编译 PTX)
+  2. 参考实现对应函数 (indicators / strategy / aggregator / execution)
+  3. kbs/05/06/07/13 中相应章节的文档
+  4. tests/test_differential.py 中的等价性测试 (确认它仍 PASS)
+
+新增字段时: 同时改 _STATE_SPEC + KernelState.__init__ + 所有调用的 CPU 函数
++ GPU kernel 的 register 声明 + Python 侧输出数组分配与汇总。
+================================================================
+
+设计要点:
+
 设计要点:
   * "流式"是语义属性, 不是实现属性: 内核逐根处理 bar, 决策只依赖截至当前 bar 的
     数据与状态递推, 绝不使用未来数据。回测只是把整段数组灌进同一个 step() 循环。
@@ -101,8 +123,8 @@ def bucket_ts_encoded(t: int64, period_seconds: int64) -> int64:
 
 
 def resolve_period_seconds(period: str) -> int:
-    """周期字符串 -> 秒数 (委托 timeutils, 带格式校验)"""
-    from .timeutils import resolve_period_seconds as _resolve
+    """周期字符串 -> 秒数 (委托 frozen.timeutils, 带格式校验)"""
+    from ..frozen.timeutils import resolve_period_seconds as _resolve
     return _resolve(period)
 
 
@@ -147,9 +169,20 @@ _STATE_SPEC = [
     # -- 周期/策略/资金 配置 --
     ("period_seconds", int64),
     ("warmup_until", int64), ("tf1", int64),
+    # 通用策略参数 (按 params_spec 顺序; p0..p15, 任意策略用)
+    ("p0", float64), ("p1", float64), ("p2", float64), ("p3", float64),
+    ("p4", float64), ("p5", float64), ("p6", float64), ("p7", float64),
+    ("p8", float64), ("p9", float64), ("p10", float64), ("p11", float64),
+    ("p12", float64), ("p13", float64), ("p14", float64), ("p15", float64),
+    # 向后兼容别名: low1=st.p0, low2=st.p1, high1=st.p2, high2=st.p3
+    # (channel_deviation 旧字段; _strategy_check 内部用 st.p0..p3)
     ("low1", float64), ("low2", float64), ("high1", float64), ("high2", float64),
     ("init_cash", float64), ("init_position", float64), ("trade_qty", float64),
     ("scale", float64), ("last_side", int64), ("cur_qty", float64),
+    # -- 资金模式 (阶段 2: --all-in / --buy-pct / --sell-pct) --
+    #   buy_pct, sell_pct ∈ [0, 1]; 0 表示关闭 (保持旧 fixed-qty 行为)
+    #   all_in=True 时: BUY 吃满 cash, SELL 清光 position (兼容旧简写)
+    ("buy_pct", float64), ("sell_pct", float64), ("all_in", boolean),
     # -- 聚合器: 当前桶 (闭合桶无需保存, 只在其切换时喂 EMA) --
     ("has_cur", boolean), ("cur_ts", int64),
     ("cur_open", float64), ("cur_high", float64), ("cur_low", float64),
@@ -168,12 +201,15 @@ _STATE_SPEC = [
     ("n_trades", int64), ("n_buy", int64), ("n_sell", int64),
     ("turnover", float64),
     ("peak_equity", float64), ("max_drawdown", float64),
+    ("peak_eq_ts", int64), ("valley_eq_ts", int64), ("recovered", boolean),
     # -- 绩效统计: 超额曲线 (相对基线, 见 summarize/13号文档) --
     ("cur_day", int64), ("day_init", boolean),
     ("x_day_end", float64), ("x_day_end_prev", float64), ("day_end_init", boolean),
     ("d_sum", float64), ("d_sum2", float64), ("d_n", int64),
+    ("d_neg_sum2", float64), ("d_neg_n", int64),       # Sortino: 仅下行日二阶距 / 计数
     ("x_peak", float64), ("x_mdd", float64),
     ("first_ts", int64), ("last_ts", int64), ("first_ts_set", boolean),
+    ("init_equity", float64),                           # 期初权益 (供 CAGR)
     # -- 成交记录 (可选) --
     ("record_trades", boolean),
     ("trade_ts", int64[:]), ("trade_side", int8[:]), ("trade_qty_a", float64[:]),
@@ -183,15 +219,36 @@ _STATE_SPEC = [
 
 @jitclass(_STATE_SPEC)
 class KernelState:
-    """单次回测/实盘会话的全部状态 (每线程独立, 天然并发安全)"""
+    """单次回测/实盘会话的全部状态 (每线程独立, 天然并发安全)
+
+    p0..p15: 通用策略参数 (按 params_spec 顺序填入)
+    low1..high2: 别名, 仅用于 channel_deviation (== p0..p3)
+    """
 
     def __init__(self, period_seconds, warmup_until, tf1,
                  low1, low2, high1, high2,
                  init_cash, init_position, trade_qty, scale,
-                 record_trades, trade_cap):
+                 buy_pct, sell_pct, all_in,
+                 record_trades, trade_cap,
+                 p0=0.0, p1=0.0, p2=0.0, p3=0.0,
+                 p4=0.0, p5=0.0, p6=0.0, p7=0.0,
+                 p8=0.0, p9=0.0, p10=0.0, p11=0.0,
+                 p12=0.0, p13=0.0, p14=0.0, p15=0.0):
         self.period_seconds = period_seconds
         self.warmup_until = warmup_until
         self.tf1 = tf1
+        # p0..p3 默认映射到 low1..high2 (向后兼容)
+        if p0 == 0.0 and p1 == 0.0 and p2 == 0.0 and p3 == 0.0:
+            p0 = low1; p1 = low2; p2 = high1; p3 = high2
+        self.p0, self.p1, self.p2, self.p3 = p0, p1, p2, p3
+        self.p4, self.p5, self.p6, self.p7 = p4, p5, p6, p7
+        self.p8, self.p9, self.p10, self.p11 = p8, p9, p10, p11
+        self.p12, self.p13, self.p14, self.p15 = p12, p13, p14, p15
+        # 向后兼容别名 (channel_deviation 历史)
+        self.low1 = self.p0
+        self.low2 = self.p1
+        self.high1 = self.p2
+        self.high2 = self.p3
         self.low1 = low1
         self.low2 = low2
         self.high1 = high1
@@ -202,6 +259,9 @@ class KernelState:
         self.scale = scale
         self.last_side = 0            # 上一信号方向: 0=无 1=BUY -1=SELL
         self.cur_qty = trade_qty      # 下一次同向信号的基础数量 (倍投累乘)
+        self.buy_pct = buy_pct
+        self.sell_pct = sell_pct
+        self.all_in = all_in
         self.has_cur = False
         self.cur_ts = 0
         self.cur_open = 0.0
@@ -232,6 +292,9 @@ class KernelState:
         self.turnover = 0.0
         self.peak_equity = 0.0
         self.max_drawdown = 0.0
+        self.peak_eq_ts = 0
+        self.valley_eq_ts = 0
+        self.recovered = True
         self.cur_day = 0
         self.day_init = False
         self.x_day_end = 0.0
@@ -240,11 +303,14 @@ class KernelState:
         self.d_sum = 0.0
         self.d_sum2 = 0.0
         self.d_n = 0
+        self.d_neg_sum2 = 0.0
+        self.d_neg_n = 0
         self.x_peak = -1.0e18
         self.x_mdd = 0.0
         self.first_ts = 0
         self.last_ts = 0
         self.first_ts_set = False
+        self.init_equity = init_cash + init_position * 0.0  # 占位,step() 首根前重算
         self.record_trades = record_trades
         self.trade_ts = np.empty(trade_cap, np.int64)
         self.trade_side = np.empty(trade_cap, np.int8)
@@ -258,27 +324,50 @@ def make_state(period: str = "5m", warmup_until: int64 = 0, tf1: int = 21,
                high1: float = 1.5, high2: float = 0.5,
                init_cash: float = 200000.0, init_position: float = 200000.0,
                trade_qty: float = 10000.0, scale: float = 1.0,
-               record_trades: bool = False, trade_cap: int = 0) -> KernelState:
+               buy_pct: float = 0.0, sell_pct: float = 0.0, all_in: bool = False,
+               record_trades: bool = False, trade_cap: int = 0,
+               p0: float = 0.0, p1: float = 0.0, p2: float = 0.0, p3: float = 0.0,
+               p4: float = 0.0, p5: float = 0.0, p6: float = 0.0, p7: float = 0.0,
+               p8: float = 0.0, p9: float = 0.0, p10: float = 0.0, p11: float = 0.0,
+               p12: float = 0.0, p13: float = 0.0, p14: float = 0.0, p15: float = 0.0) -> KernelState:
     """构造内核状态 (纯 Python 工厂; 参数用关键字传入)
 
     scale: 倍投系数。连续同方向信号时, 下一次交易数量 = 上一次 × scale
     (首次为基础数量 trade_qty); 方向翻转即重置为基础数量。1.0 = 关闭倍投。
+
+    资金模式 (阶段 2 新增):
+      buy_pct  ∈ [0, 1]: BUY 时按当前 cash 的该比例计算目标市值; 0 表示关闭 (走 trade_qty 路径)
+      sell_pct ∈ [0, 1]: SELL 时按当前 position 的该比例卖; 0 表示关闭
+      all_in=True: 等价于 buy_pct=1.0 且 sell_pct=1.0 (便捷开关)
+      三者优先级: --all-in 最低, 显式 --buy-pct/--sell-pct 优先于 --all-in
+
+    策略参数 (步骤 2):
+      low1..high2 与 p0..p3 互通 (旧 channel_deviation 兼容)
+      新策略用 p0..p15 (按 params_spec 顺序填入)
     """
     period_seconds = resolve_period_seconds(period)
+    if all_in:
+        buy_pct = max(buy_pct, 1.0)
+        sell_pct = max(sell_pct, 1.0)
     return KernelState(period_seconds, warmup_until, tf1,
                        low1, low2, high1, high2,
                        init_cash, init_position, trade_qty, scale,
-                       bool(record_trades), int(trade_cap))
+                       float(buy_pct), float(sell_pct), bool(all_in),
+                       bool(record_trades), int(trade_cap),
+                       float(p0), float(p1), float(p2), float(p3),
+                       float(p4), float(p5), float(p6), float(p7),
+                       float(p8), float(p9), float(p10), float(p11),
+                       float(p12), float(p13), float(p14), float(p15))
 
 
 # ============ 策略状态机 (与 ChannelDeviationStrategy.check 逐行等价) ============
 
 @njit(nogil=True)
 def _strategy_check(st, up: float64, dw: float64) -> int64:
-    """返回 0=无信号 / 1=BUY / -1=SELL
+    """通用策略检查 (步骤 2): 渲染 strategies/channel_deviation DSL
 
-    注意: up/dw 无效 (NaN<->None, 或 0) 时提前返回, 且不做桶锁重置 —— 与参考实现
-    的提前 return 位置一致 (锁重置在有效性检查之后)。
+    返回 0=无信号 / 1=BUY / -1=SELL
+    字段: ctx.p0..p3 = 策略参数 (channel_deviation 用 low1/low2/high1/high2 别名)
     """
     if up != up or dw != dw or up == 0.0 or dw == 0.0:   # NaN 或 0 -> 无效
         return 0
@@ -297,23 +386,27 @@ def _strategy_check(st, up: float64, dw: float64) -> int64:
     high_dev_l = (cur_l - up) / up * 100       # SELL 触发用: L vs UP
 
     signal = 0
-    # 信号触发 + 解除锁存 (基于上一根遗留的 hit 标记, 本桶未操作过才触发)
-    if st.low_hit and low_dev_h < st.low2 and not st.low_acted:
+    # ===== 策略段: DSL 渲染 (channel_deviation 别名 p0/p1/p2/p3 = low1/low2/high1/high2) =====
+    # ctx.p0 = st.p0 (low1)
+    # ctx.p1 = st.p1 (low2)
+    # ctx.p2 = st.p2 (high1)
+    # ctx.p3 = st.p3 (high2)
+    if st.low_hit and low_dev_h < st.p1 and not st.low_acted:
         signal = 1
         st.low_hit = False
         st.low_acted = True
-    elif st.high_hit and high_dev_l < st.high2 and not st.high_acted:
+    elif st.high_hit and high_dev_l < st.p3 and not st.high_acted:
         signal = -1
         st.high_hit = False
         st.high_acted = True
 
-    # 进入极端偏离: 置位 (本桶已触发信号则不再置位)
-    if low_dev > st.low1 and not st.low_acted:
+    if low_dev > st.p0 and not st.low_acted:
         st.low_hit = True
         st.low_acted = True
-    if high_dev > st.high1 and not st.high_acted:
+    if high_dev > st.p2 and not st.high_acted:
         st.high_hit = True
         st.high_acted = True
+    # ===== 策略段结束 =====
     return signal
 
 
@@ -330,8 +423,16 @@ def _execute(st, signal: int64, price: float64, ts: int64):
         st.last_side = signal
 
     if signal == 1:                                        # BUY
-        if price > 0:
-            q = min(st.cur_qty, st.cash / price)
+        if price > 0.0:
+            max_by_cash = st.cash / price
+            if st.buy_pct > 0.0:
+                # 比例模式: 按当前现金的 buy_pct 算目标, 与资金上限取小;
+                # 比例本身就是按当下资金算的, 不再被 trade_qty 上限截断
+                target = st.buy_pct * max_by_cash
+                q = target if target < max_by_cash else max_by_cash
+            else:
+                # 固定数量模式: min(trade_qty 倍投, 资金上限)
+                q = st.cur_qty if st.cur_qty < max_by_cash else max_by_cash
         else:
             q = 0.0
         if q <= 0:
@@ -342,7 +443,13 @@ def _execute(st, signal: int64, price: float64, ts: int64):
         st.n_buy += 1
         st.turnover += q * price
     else:                                                  # SELL
-        q = min(st.cur_qty, st.position)
+        if st.sell_pct > 0.0:
+            # 比例模式: 按当前持仓的 sell_pct 算目标, 与持仓上限取小
+            target = st.sell_pct * st.position
+            q = target if target < st.position else st.position
+        else:
+            # 固定数量模式: min(trade_qty 倍投, 持仓上限)
+            q = st.cur_qty if st.cur_qty < st.position else st.position
         if q <= 0:
             return
         st.cash += q * price
@@ -433,10 +540,18 @@ def step(st, stime: int64, o: float64, h: float64, l: float64,
     eq = st.cash + st.position * st.last_price
     if eq > st.peak_equity:
         st.peak_equity = eq
+        st.peak_eq_ts = stime
+        st.recovered = True
     if st.peak_equity > 0.0:
         dd = (st.peak_equity - eq) / st.peak_equity
         if dd > st.max_drawdown:
             st.max_drawdown = dd
+            st.valley_eq_ts = stime
+            st.recovered = False
+
+    # 期初权益锚定 (策略期首根 bar 才设;供 CAGR)
+    if st.init_equity == 0.0:
+        st.init_equity = st.init_cash + st.init_position * st.last_price
 
     # 超额率 x_t = (策略权益 - 基线权益) / 基线权益; 基线 = 期初资金 + 期初持仓×现价
     base = st.init_cash + st.init_position * st.last_price
@@ -457,6 +572,9 @@ def step(st, stime: int64, o: float64, h: float64, l: float64,
             st.d_sum += d
             st.d_sum2 += d * d
             st.d_n += 1
+            if d < 0.0:
+                st.d_neg_sum2 += d * d
+                st.d_neg_n += 1
         st.x_day_end_prev = st.x_day_end
         st.day_end_init = True
         st.cur_day = day
@@ -568,13 +686,21 @@ def summarize(st: KernelState) -> dict:
     """终态 -> 绩效字典 (口径与 Engine.print_summary 一致; 其余为选参新增, 见 kbs/13)
 
     超额口径定义: x_t = (策略权益 - 基线权益)/基线权益, 基线 = 期初资金 + 期初持仓×现价。
-      years          策略期年数 (首末策略期 bar 的自然日差 / 365.25)
-      ann_excess_pct 年化超额% (未扣费; 扣费在 sweep 层: turnover×费率)
-      sharpe_excess  超额 Sharpe = mean(日Δx)/std(日Δx) × √252 (只衡量择时贡献的平稳性)
-      x_mdd          超额率曲线最大回撤 (择时懊悔深度; 与权益 max_drawdown 分工不同)
+      years           策略期年数 (首末策略期 bar 的自然日差 / 365.25)
+      ann_excess_pct  年化超额% (未扣费; 扣费在 sweep 层: turnover×费率)
+      sharpe_excess   超额 Sharpe = mean(日Δx)/std(日Δx) × √252 (只衡量择时贡献的平稳性)
+      x_mdd           超额率曲线最大回撤 (择时懊悔深度; 与权益 max_drawdown 分工不同)
+
+    业界通用绩效口径 (新增, 2026-09-05):
+      cagr            年化复合收益率% = (终值/初值)^(1/年) - 1 (绝对, 含底仓 β)
+      sortino_excess  超额 Sortino = mean(日Δx) / std(下行日Δx) × √252 (只罚下行, 更稳健)
+      calmar          ann_excess_pct / max_drawdown (年化收益承受多少回撤; 0 表示无回撤或负)
+      max_dd_days     最大回撤持续天数 (peak_ts 到 valley_ts; 未恢复则记到期末; 实盘心态指标)
+      max_dd_recovered 回撤是否恢复 (False = 当前仍处历史最深回撤谷底)
     """
     baseline = st.init_cash + st.init_position * st.last_price
     equity = st.cash + st.position * st.last_price
+    init_eq = st.init_equity if st.init_equity > 0.0 else (st.init_cash + st.init_position * st.last_price)
     diff = equity - baseline
     pct = (diff / baseline * 100) if baseline else 0
 
@@ -591,6 +717,33 @@ def summarize(st: KernelState) -> dict:
         if var_d > 0.0:
             sharpe_excess = mean_d / var_d ** 0.5 * 252.0 ** 0.5
 
+    sortino_excess = 0.0
+    if st.d_neg_n >= 1 and st.d_n >= 1:
+        mean_d = st.d_sum / st.d_n
+        # 下行二阶距 (sum d^2, d<0) -> 下行波动
+        dn_var = st.d_neg_sum2 / st.d_neg_n
+        if dn_var > 0.0:
+            sortino_excess = mean_d / dn_var ** 0.5 * 252.0 ** 0.5
+
+    # CAGR: 终值/期初权益, 仅在 init_eq>0 且 years>0 时有意义
+    cagr = 0.0
+    if init_eq > 0.0 and years > 0.0:
+        ratio = equity / init_eq
+        if ratio > 0.0:
+            cagr = (ratio ** (1.0 / years) - 1.0) * 100.0
+
+    # Calmar: ann_excess_pct / max_drawdown (无回撤 -> 0 避免除零; 回撤>100% 不常见, 截 0)
+    calmar = 0.0
+    if st.max_drawdown > 1e-9:
+        calmar = ann_excess_pct / (st.max_drawdown * 100.0)
+
+    # 最大回撤持续天数 (peak_ts 到 valley_ts; 未恢复用最后 ts)
+    max_dd_days = 0.0
+    if st.peak_eq_ts > 0 and st.valley_eq_ts > 0 and st.valley_eq_ts >= st.peak_eq_ts:
+        end_ts = st.last_ts if not st.recovered else st.valley_eq_ts
+        if end_ts >= st.peak_eq_ts:
+            max_dd_days = (encoded_to_epoch(end_ts) - encoded_to_epoch(st.peak_eq_ts)) / 86400.0
+
     return {
         "final_price": st.last_price,
         "n_trades": int(st.n_trades),
@@ -605,6 +758,11 @@ def summarize(st: KernelState) -> dict:
         "years": years,
         "ann_excess_pct": ann_excess_pct,
         "sharpe_excess": sharpe_excess,
+        "sortino_excess": sortino_excess,
+        "cagr": cagr,
+        "calmar": calmar,
+        "max_dd_days": max_dd_days,
+        "max_dd_recovered": bool(st.recovered),
         "x_mdd": st.x_mdd,
         "max_drawdown": st.max_drawdown,
         "turnover": st.turnover,

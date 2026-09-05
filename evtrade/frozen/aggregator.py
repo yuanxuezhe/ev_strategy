@@ -1,5 +1,22 @@
 from __future__ import annotations
-"""增量周期合并器 (自 mysql_analyze_demo.py 原样迁移 + 任意周期支持)"""
+"""增量周期合并器 (自 mysql_analyze_demo.py 原样迁移 + 任意周期支持)
+
+================================================================
+⚠️  冻结层模块  ⚠️
+================================================================
+本文件的 BarAggregator.update 与 evtrade.kernel.step 的桶合并段
+是**逐例等价**的两个实现 (tests/test_differential.py + test_timeutils.py 锁定)。
+
+任何修改必须**同步**改以下位置:
+  - evtrade/aggregator.py (本文件)
+  - evtrade/kernel.py step() 的 "桶切换 + 新桶初始化 + 同桶合并" 段
+  - evtrade/gpu.py CUDA source 的对应段 (has_cur / cur_ts / cur_high 等)
+  - kbs/04-周期合并机制.md
+
+桶 ts 始终是右端点 (前开后闭区间);mark 始终跟随最新一根 1m bar;
+warmup_until 是 stime 字符串阈值,字典序 == 时间序。
+================================================================
+"""
 
 from typing import Optional, Union
 
