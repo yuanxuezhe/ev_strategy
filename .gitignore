@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 行情缓存 / 扫描输出 / 回放日志
+cache/
+tmp_cache/
+tmp_*.csv
+*.log
+signals.csv
+sweep_results.csv
+results_robust*.csv
