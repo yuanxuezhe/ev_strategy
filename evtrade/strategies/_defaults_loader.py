@@ -130,3 +130,200 @@ def _auto_cast(s: str):
     except ValueError:
         pass
     return s
+
+
+# ============================================================
+# sweep 自动选最优并落盘 (含原因 + 自动 git commit)
+# ============================================================
+
+import subprocess  # noqa: E402  放在 save() 之后保持模块可读
+
+
+def pick_best_row(df, strategy_name: str):
+    """从 sweep 结果 DataFrame 选最优行 + 选参原因
+
+    策略 (高 -> 低优先级):
+      1. filter_pass=True 且 score 最高 (含可解释的 mdd / n_trades 约束)
+      2. 否则按 score 降序第一行
+
+    返回 (chosen_row, reason_dict):
+      - chosen_row: pandas Series (整行)
+      - reason_dict: 含 sort_key / rank / score / ann_net_min / S /
+        filter_pass / 次优差距 (与 rank 2 的 score 差, 若有) /
+        chosen_params / candidate_total
+    """
+    import pandas as _pd
+    if df is None or len(df) == 0:
+        return None, {"error": "empty DataFrame"}
+    work = df.reset_index(drop=True)
+    has_filter_col = "filter_pass" in work.columns
+    passed = work[work["filter_pass"] == True] if has_filter_col else work
+    if has_filter_col and len(passed) > 0:
+        chosen_idx = int(passed["score"].astype(float).idxmax())
+        sort_key = "filter_pass=True 且 score 最高"
+    elif has_filter_col:
+        chosen_idx = int(work["score"].astype(float).idxmax())
+        sort_key = "filter_pass 全 False, 按 score 最高"
+    else:
+        chosen_idx = int(work["score"].astype(float).idxmax())
+        sort_key = "无 filter_pass 列, 按 score 最高"
+
+    chosen = work.iloc[chosen_idx]
+    # 与次优对比
+    runner_up = None
+    runner_up_gap = None
+    if len(work) > 1 and chosen_idx + 1 < len(work):
+        # 找次优 (排名 != chosen_idx 的最高 score)
+        for i, s in work.iterrows():
+            if i == chosen_idx:
+                continue
+            runner_up = s
+            runner_up_gap = float(chosen["score"]) - float(s["score"])
+            break
+
+    reason = {
+        "sort_key": sort_key,
+        "rank": int(chosen_idx) + 1,
+        "score": float(chosen["score"]),
+        "ann_net_min": float(chosen.get("ann_net_min", 0.0)),
+        "S": float(chosen.get("S", 0.0)),
+        "filter_pass": bool(chosen.get("filter_pass", False)),
+        "candidate_total": int(len(work)),
+        "chosen_params": {k: chosen[k] for k in chosen.index
+                          if k in {"low1", "low2", "high1", "high2",
+                                   "lookback", "breakout_pct",
+                                   "entry_dev", "exit_dev"}
+                          or _is_strategy_param(k, strategy_name)},
+    }
+    if runner_up is not None:
+        reason["runner_up_score"] = float(runner_up["score"])
+        reason["runner_up_gap"] = runner_up_gap
+    return chosen, reason
+
+
+def _is_strategy_param(key: str, strategy_name: str) -> bool:
+    """key 是否是 strategy_name 的 params_spec 字段"""
+    try:
+        from . import get_strategy_param_spec
+        spec = get_strategy_param_spec(strategy_name)
+        return key in spec
+    except Exception:
+        return False
+
+
+def save_best_from_sweep(df, strategy_name: str, csv_path: str):
+    """选最优 + 落盘 + 尝试 git commit + 返回 (chosen_row, reason, saved_path, commit_ok)
+
+    与 pick_best_row + save + _commit_defaults_file 的串联入口。
+    """
+    chosen, reason = pick_best_row(df, strategy_name)
+    if chosen is None:
+        return None, reason, None, False
+    params = dict(reason["chosen_params"])
+    if not params:
+        return None, {**reason, "error": "未抽到任何 params 字段"}, None, False
+
+    source = {
+        "kind": "from_sweep",
+        "csv": csv_path,
+        "rank": reason["rank"],
+        "score": reason["score"],
+        "ann_net_min": reason["ann_net_min"],
+        "S": reason["S"],
+        "filter_pass": reason["filter_pass"],
+        "sort_key": reason["sort_key"],
+        "candidate_total": reason["candidate_total"],
+        "runner_up_score": reason.get("runner_up_score"),
+        "runner_up_gap": reason.get("runner_up_gap"),
+    }
+    p = save(strategy_name, params, source=source)
+    commit_ok = _commit_defaults_file(p, strategy_name, reason)
+    return chosen, reason, p, commit_ok
+
+
+def _commit_defaults_file(path: Path, strategy_name: str,
+                           reason: dict) -> bool:
+    """对默认参数 JSON 单独 git add + commit (中文 message 含选择原因)
+
+    返回是否成功 (失败仅 log warning, 不抛异常)。
+    """
+    rel = path.as_posix()
+    rel_unix = rel.replace("\\", "/")
+    try:
+        # 1. git add
+        r = subprocess.run(["git", "add", "--", rel_unix],
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            print(f"[警告] git add 失败: {r.stderr.strip()}", flush=True)
+            return False
+        # 2. 检查是否有差异 (空 commit 不必做)
+        r = subprocess.run(["git", "diff", "--cached", "--name-only"],
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        if r.returncode != 0 or not r.stdout.strip():
+            print(f"[跳过] {rel_unix} 无差异, 不 commit", flush=True)
+            return False
+        # 3. 构造中文 commit message
+        msg = (
+            f"参数(自动选): {strategy_name} -> score={reason.get('score', 0):.4f}, "
+            f"rank={reason.get('rank', '?')}/{reason.get('candidate_total', '?')}\n\n"
+            f"原因: {reason.get('sort_key', '?')}\n"
+            f"  ann_net_min = {reason.get('ann_net_min', 0):+.4f}\n"
+            f"  S (邻域衰减) = {reason.get('S', 0):.4f}\n"
+            f"  filter_pass  = {reason.get('filter_pass', False)}\n"
+            f"  score        = {reason.get('score', 0):+.4f}\n"
+        )
+        if reason.get("runner_up_score") is not None:
+            gap = reason.get("runner_up_gap", 0.0)
+            msg += (f"  runner_up score = {reason['runner_up_score']:+.4f} "
+                    f"(与次优差距 {gap:+.4f})\n")
+        msg += (f"\nchosen params: "
+                + ", ".join(f"{k}={v!r}" for k, v in
+                            (reason.get("chosen_params") or {}).items())
+                + f"\n\n来源: 自动从 sweep 结果挑选 (CSV={reason.get('csv', '?')})")
+        r = subprocess.run(["git", "commit", "-m", msg],
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            print(f"[警告] git commit 失败: {r.stderr.strip()}",
+                  flush=True)
+            return False
+        print(f"[已 commit] {rel_unix}", flush=True)
+        return True
+    except FileNotFoundError:
+        print("[跳过] git 不在 PATH, 不 commit", flush=True)
+        return False
+
+
+def format_reason_log(strategy_name: str, reason: dict,
+                       saved_path, commit_ok: bool) -> str:
+    """打印"最优参数选择原因"块 (多行)"""
+    lines = [
+        "",
+        "=" * 60,
+        f"  最优参数选择原因 (策略: {strategy_name})",
+        "=" * 60,
+        f"  候选总数  : {reason.get('candidate_total', '?')}",
+        f"  选择依据  : {reason.get('sort_key', '?')}",
+        f"  选中排名  : {reason.get('rank', '?')}",
+        f"  score     : {reason.get('score', 0):+.4f}",
+        f"  ann_net_min: {reason.get('ann_net_min', 0):+.4f} "
+        "(test 段年化超额最低值)",
+        f"  S (邻域衰减): {reason.get('S', 0):.4f}",
+        f"  filter_pass: {reason.get('filter_pass', False)}",
+    ]
+    if reason.get("runner_up_score") is not None:
+        lines.append(
+            f"  次优 score : {reason['runner_up_score']:+.4f} "
+            f"(差距 {reason.get('runner_up_gap', 0):+.4f})")
+    params = reason.get("chosen_params") or {}
+    if params:
+        lines.append("  选中参数  :")
+        for k, v in params.items():
+            lines.append(f"    {k} = {v!r}")
+    if saved_path is not None:
+        lines.append(f"  落盘文件  : {saved_path}")
+        lines.append(f"  git commit: {'已 commit' if commit_ok else '跳过/失败 (见日志)'}")
+    lines.append("=" * 60)
+    return "\n".join(lines)

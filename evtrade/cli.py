@@ -411,6 +411,14 @@ def build_sweep_parser() -> argparse.ArgumentParser:
                          "应覆盖预热需求")
     ap.add_argument("--out", default="sweep_results.csv", help="结果 CSV 路径")
     ap.add_argument("--top", type=int, default=20, help="控制台展示前 N 组")
+    ap.add_argument("--save-defaults", action="store_true", default=False,
+                    help="扫描后自动选最优 (filter_pass 优先 / 否则 score 第一行), "
+                         "写入 evtrade/strategies/_defaults/<strategy>.json, "
+                         "并尝试单独 git commit (中文 message 含选择原因)。"
+                         "不传本参数 = 仅写 CSV, 不动默认参数文件。")
+    ap.add_argument("--no-save-defaults", dest="save_defaults",
+                    action="store_false",
+                    help="明确跳过默认参数落盘 (与不传 --save-defaults 等价)。")
     return ap
 
 
@@ -471,6 +479,21 @@ def sweep_main(argv=None):
             or c in GRID_KEYS or c in spec_keys]
     print(df[show].head(args.top).to_string(index=False))
     print(f"\n全部结果已保存: {args.out} ({len(df)} 行; 列: {cols})")
+
+    # ---- 自动选最优 + 落盘 + 单独 git commit (--save-defaults) ----
+    if args.save_defaults:
+        from .strategies._defaults_loader import (
+            save_best_from_sweep, format_reason_log,
+        )
+        chosen, reason, saved_path, commit_ok = save_best_from_sweep(
+            df, args.strategy, csv_path=args.out)
+        if chosen is None:
+            print(f"[警告] sweep 自动选最优失败: {reason.get('error', '?')}",
+                  flush=True)
+        else:
+            print(format_reason_log(args.strategy, reason,
+                                    saved_path, commit_ok),
+                  flush=True)
 
     if args.mc > 0:
         from .permutation import permutation_test
