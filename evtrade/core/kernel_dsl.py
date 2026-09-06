@@ -34,6 +34,7 @@ GPU 对应端: gpu.py::_CUDA_SOURCE_GENERIC_TEMPLATE + render_cuda_device_functi
 ================================================================
 """
 import functools
+import hashlib
 import inspect
 import sys
 import textwrap
@@ -47,6 +48,17 @@ _SPLICE_END = "# ==== DSL-STRATEGY-END"
 
 _EMPTY_SIG = np.empty(0, np.int8)
 _EMPTY_F = np.empty(0, np.float64)
+
+# 渲染器版本: 任一变更 (render_numba_state_body / 字段映射 / 拼接逻辑)
+# 都应 bump 此版本号, 让旧缓存产物失效。
+RENDERER_VERSION = "v1"
+
+
+def _source_hash(strategy_cls) -> str:
+    """compute_signal.__doc__ 的 sha1 (用于 cache key, 让 DSL 修改能失效缓存)"""
+    method = getattr(strategy_cls, "compute_signal", None)
+    doc = getattr(method, "__doc__", None) or ""
+    return hashlib.sha1(doc.encode("utf-8")).hexdigest()
 
 
 def strategy_has_dsl(strategy_name: str) -> bool:
@@ -64,14 +76,31 @@ def strategy_has_dsl(strategy_name: str) -> bool:
         return False
 
 
-@functools.lru_cache(maxsize=None)
-def build_dsl_kernel(strategy_name: str):
-    """DSL -> 该策略专用的 numba 内核模块 (splice kernel.py 策略段后 exec)
+# 缓存: key=(strategy_name, source_hash, RENDERER_VERSION), value=module
+# 用 dict 替换 functools.lru_cache:
+#   - 三元 key 支持 DSL 改动 / 渲染器版本升级时正确失效缓存
+#   - 可暴露 invalidate_dsl_cache() 给测试与 dev reload
+#   - 避免 lru_cache 在并发首 miss 时多次重复 splice+exec 竞态 sys.modules
+_KERNEL_DSL_CACHE: dict = {}
 
-    与冻结 kernel 的唯一差异: _strategy_check 函数体来自该策略 DSL 渲染。
-    本函数只做字符串拼接 + exec (numba 编译惰性, 首次回测时触发);
-    同策略进程内只构建一次 (lru_cache)。
+
+def invalidate_dsl_cache(strategy_name: str | None = None) -> int:
+    """清除 DSL 内核缓存; strategy_name=None 时清空全部
+
+    返回清除的条目数, 方便测试断言与日志。
     """
+    if strategy_name is None:
+        n = len(_KERNEL_DSL_CACHE)
+        _KERNEL_DSL_CACHE.clear()
+        return n
+    keys = [k for k in _KERNEL_DSL_CACHE if k[0] == strategy_name]
+    for k in keys:
+        _KERNEL_DSL_CACHE.pop(k, None)
+    return len(keys)
+
+
+def _build_dsl_kernel_impl(strategy_name: str, source_hash: str):
+    """实际 splice + exec; 由 build_dsl_kernel 持有单飞锁调用"""
     from . import kernel
     from ..strategies import get_strategy_class
     from ..strategies.dsl import render_numba_state_body
@@ -86,7 +115,8 @@ def build_dsl_kernel(strategy_name: str):
     # exec 源没有真实文件可作 numba 磁盘缓存键 -> 去掉 cache=True
     src = src.replace("@njit(cache=True)", "@njit()")
 
-    mod = types.ModuleType(f"evtrade.core._kernel_dsl[{strategy_name}]")
+    mod_name = f"evtrade.core._kernel_dsl[{strategy_name}:{source_hash[:8]}:{RENDERER_VERSION}]"
+    mod = types.ModuleType(mod_name)
     mod.__file__ = kernel.__file__
     mod.__package__ = "evtrade.core"     # 供 kernel.resolve_period_seconds 的相对导入
     # numba jitclass 注册时会按 __module__ 回查 sys.modules, 必须先挂进去
@@ -95,7 +125,36 @@ def build_dsl_kernel(strategy_name: str):
     return mod
 
 
-@functools.lru_cache(maxsize=None)
+# 单飞锁: 并发首 miss 时, 同一 key 只有第一个线程进 _build_dsl_kernel_impl,
+# 其它线程拿到它的结果, 避免重复 splice+exec 与 sys.modules 竞态。
+_BUILD_LOCKS: dict = {}
+_BUILD_LOCKS_GUARD = functools.lru_cache(maxsize=None)(lambda: __import__("threading").RLock())
+
+
+def build_dsl_kernel(strategy_name: str):
+    """DSL -> 该策略专用的 numba 内核模块 (splice kernel.py 策略段后 exec)
+
+    缓存键: (strategy_name, source_hash, RENDERER_VERSION)。
+    任一变更 (DSL docstring 修改 / 渲染器逻辑升级) 会自动失效旧缓存。
+    """
+    from ..strategies import get_strategy_class
+    cls = get_strategy_class(strategy_name)
+    src_hash = _source_hash(cls)
+    key = (strategy_name, src_hash, RENDERER_VERSION)
+    mod = _KERNEL_DSL_CACHE.get(key)
+    if mod is not None:
+        return mod
+    # 单飞: 同 key 的并发首 miss 串行化
+    lock = _BUILD_LOCKS_GUARD()
+    with lock:
+        mod = _KERNEL_DSL_CACHE.get(key)
+        if mod is not None:
+            return mod
+        mod = _build_dsl_kernel_impl(strategy_name, src_hash)
+        _KERNEL_DSL_CACHE[key] = mod
+        return mod
+
+
 def dsl_kernel(strategy_name: str):
     """策略 -> numba 内核模块; channel_deviation 返回冻结 kernel 本尊"""
     if strategy_name == "channel_deviation":
