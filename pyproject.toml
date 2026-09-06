@@ -66,8 +66,11 @@ markers = [
 # uv run python -m evtrade sweep ...: 启动 CLI
 [tool.uv]
 managed = true
-# dev-dependencies (uv sync 包含 dev 组)
-dev-dependencies = [
+
+# dev 依赖组: uv sync --group dev / uv run --group dev pytest
+# (PEP 735, uv 0.4.7+ 推荐写法)
+[dependency-groups]
+dev = [
     "pytest>=7.0",
     "pytest-xdist>=3.0; platform_system != 'Windows'",
 ]

@@ -18,3 +18,8 @@ champion_bars.csv
 evtrade/strategies/_defaults/*
 !evtrade/strategies/_defaults/.gitkeep
 !evtrade/strategies/_defaults/*.json
+
+# uv 元数据与虚拟环境
+.venv/
+uv.lock
+.python-version

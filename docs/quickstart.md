@@ -118,3 +118,19 @@ python -m evtrade sweep ...
 
 `pyproject.toml` 是单一事实源, pip + setuptools 也能用 (装 wheel); uv 是
 速度更快、依赖解析更准确的现代选择。
+
+## uv.lock 与团队协作
+
+`uv.lock` 默认**不入仓库** (`.gitignore` 已排除):
+- 每位开发者本地 `uv lock` 生成自己的 lockfile, 跨平台 lockfile 差异小
+  (uv 锁平台无关的包版本, 仅 hash 与 binary 分开发散)
+- CI / 实盘机可直接 `uv sync` 而无需 lockfile (从 `pyproject.toml` 解析)
+
+如需锁定全员一致的版本:
+
+```bash
+git add -f uv.lock
+git commit -m "构建: 锁定依赖 uv.lock (团队一致)"
+```
+
+注意 lockfile 较大 (~ 300 KB), 包含所有平台 hash。
