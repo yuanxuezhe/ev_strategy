@@ -319,10 +319,19 @@ def sweep(bars: dict, base: dict, combos: list[dict],
         wins = [("full", None, start)]
 
     def window_bars(end_ymd):
+        """按 end_ymd 截取 bars (numpy slice, 一次 searchsorted + 视图切片,
+        避免对每个 key 都做一次 Python boolean mask 拷贝)。
+
+        end_ymd=None 时返回原 bars 引用 (上游只在 wfo=单窗时用一次, 拷贝无意义)。
+        """
         if end_ymd is None:
             return bars
-        mask = bars["stime"] < int(end_ymd) * 1_000_000
-        return {k: v[mask] for k, v in bars.items()}
+        cutoff = int(end_ymd) * 1_000_000
+        # np.searchsorted(side='left') 找第一个 >= cutoff 的下标, 与原语义
+        # 'stime < cutoff' 等价; 但 searchsorted 是 C 实现的 O(log n) 标量,
+        # 然后用 slice 拿到原数组的视图 (no copy)
+        idx = int(np.searchsorted(bars["stime"], cutoff, side="left"))
+        return {k: v[:idx] for k, v in bars.items()}
 
     win_data = [(nm, window_bars(e), int(w) * 1_000_000) for nm, e, w in wins]
 
@@ -341,10 +350,10 @@ def sweep(bars: dict, base: dict, combos: list[dict],
     params_list = [{**base, **c} for c in combos]
 
     t0 = time.perf_counter()
-    metrics = [None] * len(win_data)
     use_general = (strategy_name != "channel_deviation")
     # DSL 策略 -> numba/CUDA 快路径; 无 DSL -> 参考引擎兜底
     dsl_fast = use_general and strategy_has_dsl(strategy_name)
+    metrics = [None] * len(win_data)
     if device == "gpu" and not use_general:
         from .gpu import cuda_sweep_window
         for wi, (nm, wb, warm) in enumerate(win_data):
@@ -387,12 +396,16 @@ def sweep(bars: dict, base: dict, combos: list[dict],
                 logging.getLogger("evtrade.sweep").warning(
                     "numba kernel warm-up 失败 (将走冷启动): %s", _e)
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            futs = {}
+            # 把 (wi, ci) 全部 flatten 一次性提交, 让窗口切片与 kernel 执行
+            # 真正重叠; 用 as_completed 流式收集到预分配 metrics 缓冲,
+            # 哪个先完先写对应槽位 —— 不再按 wi 顺序 barrier 等待整窗完成。
+            metrics = [[None] * len(params_list) for _ in win_data]
+            futures = {}
             for wi, (nm, wb, warm) in enumerate(win_data):
                 for ci, p in enumerate(params_list):
                     if use_general and dsl_fast:
                         # DSL 策略: DSL 特化 numba 内核 (与 run_one 同口径)
-                        futs[(wi, ci)] = ex.submit(
+                        fut = ex.submit(
                             run_one_dsl, wb, p["period"], warm,
                             p["init_cash"], p["init_position"], p["trade_qty"],
                             p.get("tf1", 21),
@@ -404,7 +417,7 @@ def sweep(bars: dict, base: dict, combos: list[dict],
                     elif use_general:
                         # 无 DSL 策略: 走参考引擎, 不依赖 low1/low2/... 等固定参数
                         sp = p.get("params", {})
-                        futs[(wi, ci)] = ex.submit(
+                        fut = ex.submit(
                             run_one_general, wb, p["period"], warm,
                             p["init_cash"], p["init_position"], p["trade_qty"],
                             p.get("scale", 1.0),
@@ -413,10 +426,15 @@ def sweep(bars: dict, base: dict, combos: list[dict],
                             strategy_name=strategy_name,
                             strategy_params=sp)
                     else:
-                        futs[(wi, ci)] = ex.submit(_run_window, wb, p, warm)
-            for wi in range(len(win_data)):
-                metrics[wi] = [futs[(wi, ci)].result()
-                               for ci in range(len(params_list))]
+                        fut = ex.submit(_run_window, wb, p, warm)
+                    futures[fut] = (wi, ci)
+
+            # 流式收集: as_completed 按完成顺序返回; 立即写 metrics[wi][ci]
+            # 这样无需等待整窗; 异常也会立刻 re-raise。
+            from concurrent.futures import as_completed
+            for fut in as_completed(futures):
+                wi, ci = futures[fut]
+                metrics[wi][ci] = fut.result()
     dt = time.perf_counter() - t0
 
     # ---- 行装配: 每窗原始指标 (单窗 full 不加前缀, 兼容旧输出) + 年化扣费 ----
