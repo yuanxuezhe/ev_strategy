@@ -1,13 +1,9 @@
 from __future__ import annotations
 """core 子包: 主调度层
 
-公开 API:
-  main(argv)  统一 CLI 入口 (委托 evtrade.cli.main)
+公开模块:
+  kernel / kernel_dsl / engine / sweep / replay / permutation / gpu / capability / data
 
-未来扩展方向:
-  - 把 kernel / engine / sweep / replay / permutation 整体迁入
-  - 提供统一的 run(feed, strategy, executor, params) -> Result 接口
+历史: 早期 __init__ re-export 一个 `main` (指向 .runner.main, 实际为
+..cli.main 跳板), 2026-09 重构后删掉 .runner, 直接用 `evtrade.cli.main`。
 """
-from .runner import main
-
-__all__ = ["main"]

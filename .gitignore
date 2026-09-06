@@ -10,3 +10,5 @@ tmp_*.csv
 signals.csv
 sweep_results.csv
 results_robust*.csv
+results*.csv
+champion_bars.csv
