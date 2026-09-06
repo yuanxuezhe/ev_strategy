@@ -355,6 +355,37 @@ def sweep(bars: dict, base: dict, combos: list[dict],
             metrics[wi] = cuda_sweep_window_generic(wb, params_list, warm,
                                                     strategy_name=strategy_name)
     else:
+        # 主线程预热: 把首次 numba specialization 串行化在主线程, 避免并发
+        # worker 同时第一次调用 dsl_kernel(name).run_backtest 时各自触发
+        # numba type specialization, 浪费 CPU 且扭曲冷启动延迟。
+        # 仅 DSL 路径需要预热; 无 DSL / use_general 走纯 Python, 无 numba 编译。
+        if use_general and dsl_fast:
+            try:
+                from .kernel_dsl import _EMPTY_F, _EMPTY_SIG, dsl_kernel, make_state_general
+                _first_p = params_list[0]
+                _kmod = dsl_kernel(strategy_name)
+                _probe_st = make_state_general(
+                    strategy_name, _first_p["period"], warmup_until=0,
+                    tf1=_first_p.get("tf1", 21),
+                    init_cash=_first_p["init_cash"],
+                    init_position=_first_p["init_position"],
+                    trade_qty=_first_p["trade_qty"],
+                    strategy_params=_first_p.get("params", {}))
+                # 取第一窗口前 32 个 bar 当探针 (覆盖 warmup 即可, 避免预热开销)
+                _wb = win_data[0][1]
+                _n = min(32, len(_wb["stime"]))
+                _kmod.run_backtest(_probe_st,
+                                   _wb["stime"][:_n], _wb["open"][:_n],
+                                   _wb["high"][:_n], _wb["low"][:_n],
+                                   _wb["close"][:_n], _wb["volume"][:_n],
+                                   _EMPTY_SIG, _EMPTY_F, _EMPTY_F)
+                _kmod.summarize(_probe_st)
+            except Exception as _e:
+                # 预热失败不应中断 sweep —— 后面的 run_one_dsl 会再次触发
+                # 并给出原始错误; 这里只 log warning 让用户感知
+                import logging
+                logging.getLogger("evtrade.sweep").warning(
+                    "numba kernel warm-up 失败 (将走冷启动): %s", _e)
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
             futs = {}
             for wi, (nm, wb, warm) in enumerate(win_data):
