@@ -134,21 +134,12 @@ def run_one_general(bars: dict, period: str, warmup_until: int,
     """
     from ..frozen.account import Account
     from ..frozen.aggregator import BarAggregator
-    from ..frozen.models import Bar
     from .engine import Engine
     from ..execution.base import SimulatedExecutor
     from ..strategies import get_strategy
+    from ._harness import NumpyDictFeed
 
-    class _ArrFeed:
-        def __init__(s, bs): s.bs = bs
-        def stream(s):
-            for i in range(len(s.bs["stime"])):
-                yield Bar(stime=str(int(s.bs["stime"][i])), code="SYN",
-                          open=float(s.bs["open"][i]),
-                          high=float(s.bs["high"][i]),
-                          low=float(s.bs["low"][i]),
-                          close=float(s.bs["close"][i]),
-                          volume=int(s.bs["volume"][i]))
+    feed = NumpyDictFeed(bars)
 
     account = Account(cash=init_cash, position=init_position)
     executor = SimulatedExecutor(account, qty=trade_qty, verbose=False,
@@ -162,7 +153,7 @@ def run_one_general(bars: dict, period: str, warmup_until: int,
         warmup_until=str(warmup_until) if warmup_until else None,
     )
     tf1 = (strategy_params or {}).get("tf1", 21)
-    eng = Engine(_ArrFeed(bars), aggregator, strategy, executor, tf1=tf1, verbose=False)
+    eng = Engine(feed, aggregator, strategy, executor, tf1=tf1, verbose=False)
     # 空数据安全 (sweep 单窗可能给到空 bars, 已知 flush 会 IndexError, 跳过即可)
     if len(bars["stime"]) == 0:
         return _empty_metrics(init_cash, init_position)

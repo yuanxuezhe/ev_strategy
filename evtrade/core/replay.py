@@ -120,13 +120,9 @@ def replay_engine(bars, period: str, warmup_until: int, tf1: int,
     from evtrade.engine import Engine
     from evtrade.execution import SimulatedExecutor
     from evtrade.strategy import ChannelDeviationStrategy
+    from ._harness import ListBarFeed
 
-    class _Feed:
-        def __init__(self, bs):
-            self.bs = bs
-
-        def stream(self):
-            yield from self.bs
+    feed = ListBarFeed(bars)
 
     class _RecStrategy:
         def __init__(self, inner):
@@ -166,7 +162,7 @@ def replay_engine(bars, period: str, warmup_until: int, tf1: int,
                                                      high1=high1, high2=high2))
     aggregator = BarAggregator(resolve_period_seconds(period), on_bars=None,
                                warmup_until=str(warmup_until) if warmup_until else None)
-    engine = Engine(_Feed(bars), aggregator, strategy, executor, tf1=tf1,
+    engine = Engine(feed, aggregator, strategy, executor, tf1=tf1,
                     verbose=False)
     engine.run()
 
