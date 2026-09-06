@@ -104,5 +104,29 @@ def params_from_csv_row(row: dict, param_keys: list[str]) -> dict:
 
     用于 'params save --from-csv <csv> --rank N': 取第 N 行 (1-based, 1=score 最高),
     抽出 param_keys 里的字段作为 params dict。
+
+    类型: CSV 全字符串读入, 这里用 _auto_cast 把数字 / bool 转回 Python 原生类型,
+    与 CLI --params 的 _auto_cast 保持一致。
     """
-    return {k: row[k] for k in param_keys if k in row}
+    out: dict = {}
+    for k in param_keys:
+        if k not in row:
+            continue
+        v = row[k]
+        out[k] = _auto_cast(v) if isinstance(v, str) else v
+    return out
+
+
+def _auto_cast(s: str):
+    """字符串 -> int / float / bool / str (与 cli._auto_cast 行为一致)"""
+    if s.lower() in ("true", "false"):
+        return s.lower() == "true"
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return s

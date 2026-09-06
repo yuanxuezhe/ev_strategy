@@ -541,6 +541,108 @@ def replay_main(argv=None):
                   buy_pct=args.buy_pct, sell_pct=args.sell_pct, all_in=args.all_in)
 
 
+# ============ params 子命令 (默认参数落盘) ============
+
+def build_params_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="evtrade params",
+        description="策略默认参数管理 (落盘 evtrade/strategies/_defaults/<name>.json)")
+    sub = ap.add_subparsers(dest="params_cmd", required=True)
+
+    # save
+    p_save = sub.add_parser("save", help="保存最优参数到默认目录")
+    p_save.add_argument("strategy", help="策略 key (来自 available_strategies())")
+    src = p_save.add_mutually_exclusive_group(required=True)
+    src.add_argument("--params", default="",
+                    help="'k1:v1;k2:v2' (类型自动推导, 同 backtest)")
+    src.add_argument("--from-csv", default=None,
+                    help="sweep 结果 CSV 路径; 与 --rank 配合取第 N 行")
+    p_save.add_argument("--rank", type=int, default=1,
+                    help="--from-csv 时取第 N 行 (1=最高 score, 默认 1)")
+
+    # show
+    p_show = sub.add_parser("show", help="打印策略当前默认参数")
+    p_show.add_argument("strategy", help="策略 key")
+
+    # list
+    p_list = sub.add_parser("list", help="列出所有已有默认参数的策略")
+    return ap
+
+
+def params_main(argv=None):
+    args = build_params_parser().parse_args(argv)
+
+    if args.params_cmd == "list":
+        from .strategies._defaults_loader import list_defaulted
+        names = list_defaulted()
+        if not names:
+            print("(无默认参数文件; evtrade/strategies/_defaults/ 为空)")
+            return
+        print("已落盘默认参数的策略:")
+        for n in names:
+            print(f"  - {n}")
+        return
+
+    if args.params_cmd == "show":
+        from .strategies._defaults_loader import load
+        try:
+            data = load(args.strategy)
+        except FileNotFoundError as e:
+            print(f"[错误] {e}", flush=True)
+            return 1
+        print(f"策略: {data.get('strategy', args.strategy)}")
+        print(f"落盘: {data.get('saved_at', '?')}")
+        print("参数:")
+        for k, v in (data.get("params") or {}).items():
+            print(f"  {k} = {v!r}")
+        src = data.get("source") or {}
+        if src:
+            print(f"来源: {src}")
+        return
+
+    if args.params_cmd == "save":
+        from .strategies._defaults_loader import save, params_from_csv_row, path_for
+        if args.from_csv:
+            import csv as _csv
+            with open(args.from_csv, "r", encoding="utf-8-sig", newline="") as f:
+                rows = list(_csv.DictReader(f))
+            if not rows:
+                print(f"[错误] {args.from_csv} 为空", flush=True)
+                return 1
+            idx = args.rank - 1
+            if not (0 <= idx < len(rows)):
+                print(f"[错误] --rank {args.rank} 越界 (共 {len(rows)} 行)",
+                      flush=True)
+                return 1
+            row = rows[idx]
+            # param_keys 顺序来自策略的 params_spec; 让 _defaults_loader 按已知
+            # 字段抽出; 缺则退回到 row 全部键 (含 tf1 等引擎参数, 但 _defaults
+            # 的 params 仅策略参数, 故用 specs 约束)。
+            from .strategies import get_strategy_param_spec
+            spec = get_strategy_param_spec(args.strategy)
+            param_keys = list(spec.keys())
+            params = params_from_csv_row(row, param_keys)
+            if not params:
+                print(f"[警告] CSV 行 {args.rank} 没有命中策略 params_spec "
+                      f"({param_keys}); 不落盘", flush=True)
+                return 1
+            source = {"kind": "from_csv", "csv": args.from_csv,
+                      "rank": args.rank}
+        else:
+            params = _parse_params(args.params)
+            if not params:
+                print("[错误] --params 为空或解析失败", flush=True)
+                return 1
+            source = {"kind": "from_params"}
+
+        p = save(args.strategy, params, source=source)
+        print(f"[已落盘] {p}")
+        print("参数:")
+        for k, v in params.items():
+            print(f"  {k} = {v!r}")
+        return
+
+
 def build_root_parser():
     """根 parser: 用 add_subparsers 让 backtest/sweep/replay 各自独立 --help
 
@@ -557,7 +659,8 @@ def build_root_parser():
     # _actions 嫁接到子 parser 上, 避免重复定义参数。
     for name, builder in (("backtest", build_backtest_parser),
                           ("sweep", build_sweep_parser),
-                          ("replay", build_replay_parser)):
+                          ("replay", build_replay_parser),
+                          ("params", build_params_parser)):
         sub_p = sub.add_parser(name, help=f"{name} 子命令 (见 {name} -h)",
                                add_help=False)
         for action in builder()._actions:
@@ -570,7 +673,8 @@ def main(argv=None):
     import sys
     raw = sys.argv[1:] if argv is None else argv
     # 默认行为: 无子命令 = backtest (向后兼容, 不破坏现有脚本调用)
-    if not raw or raw[0] not in ("backtest", "sweep", "replay", "-h", "--help"):
+    if not raw or raw[0] not in ("backtest", "sweep", "replay", "params",
+                                 "-h", "--help"):
         if raw and raw[0].startswith("-"):
             # 形如 -h / --help 等根选项, 走 root parser 展示帮助
             return build_root_parser().parse_args(raw)
@@ -581,12 +685,9 @@ def main(argv=None):
         build_root_parser().print_help()
         return None
     args = build_root_parser().parse_args(raw)
-    if args.cmd == "sweep":
-        # sweep / replay 的 main 期望 list[argv], 重建
-        return {"sweep": sweep_main, "replay": replay_main,
-                "backtest": backtest_main}[args.cmd](raw[1:])
-    return {"sweep": sweep_main, "replay": replay_main,
-            "backtest": backtest_main}[args.cmd](raw[1:])
+    handlers = {"backtest": backtest_main, "sweep": sweep_main,
+                "replay": replay_main, "params": params_main}
+    return handlers[args.cmd](raw[1:])
 
 
 if __name__ == "__main__":
