@@ -288,6 +288,19 @@ def sweep(bars: dict, base: dict, combos: list[dict],
     """
     import pandas as pd
 
+    # 能力探测: requested device + 策略参数上限 + gpu_available
+    # auto 模式下 gpu 不可用或策略不兼容时, 降级到 cpu 并 warn
+    from .capability import gpu_available, select_device
+    import logging
+    _log = logging.getLogger("evtrade.sweep")
+    gpu_ok = gpu_available()
+    if device == "gpu" and not gpu_ok:
+        raise ValueError("请求 device='gpu' 但环境无可用 cupy/CUDA")
+    resolved = select_device(strategy_name, device, gpu_ok)
+    if device == "auto" and resolved != device:
+        _log.warning("device=auto 降级: 请求 %s -> 实际 %s", device, resolved)
+    device = resolved  # 后续分支统一用 device (cpu/gpu)
+
     if split_ymd and not splits:
         splits = [split_ymd]
     start = base["start"]

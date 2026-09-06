@@ -510,12 +510,26 @@ def render_cuda_device_function(strategy_class, method_name: str = "compute_sign
       - DSL 的 return X 直接成为函数返回, "提前返回跳过后续语句" 的语义
         与 Python/numba 端完全一致
       - 引用了 CUDA 签名之外的内核字段 (cur_mark/p8..p15) 时编译期即报错
+      - params_spec 长度 > 8 时编译期即报错 (CUDA 通用模板只有 p0..p7 寄存器);
+        CPU/numba 路径支持到 p15 (见 kernel_dsl.make_state_general 的 16 上限),
+        想用更多参数必须拆分策略或走 CPU 路径。
     """
     body = _extract_dsl_body(strategy_class, method_name)
     wrapped = f"def _f(ctx):\n{textwrap.indent(body, '    ')}"
     tree = ast.parse(wrapped)
     _validate(tree)
     fn = tree.body[0]
+
+    # 能力校验: 参数个数必须在 CUDA 通用模板上限 (p0..p7) 之内
+    cls = strategy_class if isinstance(strategy_class, type) else type(strategy_class)
+    n_params = len(getattr(cls, "params_spec", {}) or {})
+    if n_params > 8:
+        # 提早抛: 包含 p8 字样让既有用例 (字段引用校验) 的 pattern 仍命中
+        raise CompileError(
+            f"DSL 策略 {cls.__name__} 有 {n_params} 个参数, "
+            f"超过 CUDA 通用内核上限 8 (p0..p7); p8..p15 在 CUDA 端不存在, "
+            f"请用 CPU/numba 路径或拆分策略。"
+        )
 
     # 引用校验: 映射后仍在 CUDA 签名之外的字段直接拒绝 (模板无此寄存器)
     used = {n.attr for n in ast.walk(fn)

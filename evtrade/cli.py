@@ -384,8 +384,10 @@ def build_sweep_parser() -> argparse.ArgumentParser:
     ap.add_argument("--mc-top", type=int, default=5)
     ap.add_argument("--warmup-days", type=int, default=365)
     ap.add_argument("--workers", type=int, default=None, help="并发线程数 (默认=CPU核数)")
-    ap.add_argument("--device", default="cpu", choices=["cpu", "gpu"],
-                    help="cpu=numba内核+线程池 / gpu=CUDA单launch (需 cupy, 见 gpu.py)")
+    ap.add_argument("--device", default="auto",
+                    choices=["auto", "cpu", "gpu"],
+                    help="auto=优先 GPU (可用且策略兼容), 否则 cpu (默认); "
+                         "cpu=numba内核+线程池 / gpu=CUDA单launch (需 cupy, 见 gpu.py)")
     ap.add_argument("--data-cache", default=None, help="行情 npz 缓存目录")
     ap.add_argument("--synthetic-days", type=int, default=0,
                     help=">0 时用合成数据 (不连库); 数值=截至 --end 的数据天数, "
