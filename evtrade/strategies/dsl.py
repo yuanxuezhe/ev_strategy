@@ -25,6 +25,7 @@ from __future__ import annotations
   ✅ 属性读写: ctx.x, self.x (限制字段)
   ✅ return signal
   ❌ 字符串 / 列表 / 字典 / 调用外部函数 / 循环 (除受控 for)
+  ⚠️  调用仅允许白名单内建: min / max / abs (三端一致)
   ❌ 异常处理 / with / yield / lambda
 
 不满足 -> 编译期抛 CompileError, 列出不支持的节点。
@@ -57,9 +58,9 @@ class CompileError(Exception):
 
 
 # numba/CUDA 不支持的关键字 / 类型
+# 注: ast.Call 不在此处 —— _validate 单独处理 (仅允许白名单 min/max/abs)
 _FORBIDDEN_NODES = (
     ast.List, ast.Dict, ast.Set, ast.Tuple,
-    ast.Call,           # 限制: 仅允许白名单内的内建 (min/max/abs)
     ast.Lambda,
     ast.Yield, ast.YieldFrom,
     ast.Try, ast.With, ast.AsyncFor, ast.AsyncWith,
@@ -69,19 +70,32 @@ _FORBIDDEN_NODES = (
 )
 
 
+# DSL 允许的函数调用白名单 (仅此三者, 三端一致)
+_CALL_WHITELIST = frozenset({"min", "max", "abs"})
+
+
 def _validate(tree: ast.Module) -> None:
-    """白名单校验; 不通过抛 CompileError"""
+    """白名单校验; 不通过抛 CompileError
+
+    所有未识别的 ast 节点会被末尾的兜底分支拒绝, 而不是被静默放行
+    (静默放行会导致 Python exec 执行它们, 而 numba/CUDA 渲染器稍后报错,
+    错误信息错位, 调试困难)。
+    """
     for node in ast.walk(tree):
         if isinstance(node, _FORBIDDEN_NODES):
             raise CompileError(f"DSL 不支持节点: {type(node).__name__} "
                                f"(行 {getattr(node, 'lineno', '?')})")
         if isinstance(node, ast.Call):
-            # 仅允许白名单内建
-            if isinstance(node.func, ast.Name) and node.func.id in ("min", "max", "abs"):
+            # 仅允许白名单内建; 不接受关键字参数 (min/max/abs 都是单参数或双位置参数)
+            if (isinstance(node.func, ast.Name)
+                    and node.func.id in _CALL_WHITELIST
+                    and not node.keywords):
                 continue
             raise CompileError(
-                f"DSL 不支持调用: {ast.unparse(node.func)} "
-                f"(仅允许 min/max/abs)")
+                f"DSL 不支持调用: "
+                f"{ast.unparse(node.func) if hasattr(ast, 'unparse') else type(node.func).__name__} "
+                f"(仅允许 min/max/abs, 且必须位置参数)"
+            )
         if isinstance(node, ast.Name) and node.id in ("True", "False", "None"):
             continue
         if isinstance(node, ast.Constant):
@@ -105,6 +119,16 @@ def _validate(tree: ast.Module) -> None:
             continue
         if isinstance(node, (ast.Module, ast.FunctionDef, ast.arguments, ast.arg)):
             continue
+        # ctx=Load/Store/Del 是 Name/Attribute 的访问方式标记, 不是独立节点
+        if isinstance(node, (ast.Load, ast.Store, ast.Del)):
+            continue
+        # BinOp/Compare/BoolOp 的 op 字段是 operator 子类 (ast.Add/Sub/...), 不是独立节点
+        if isinstance(node, (ast.operator, ast.unaryop, ast.cmpop, ast.boolop)):
+            continue
+        # 兜底: 未识别的 ast 节点 (IfExp / Subscript / Slice / Starred / Match* /
+        # keyword / AugAssign 等) 一律拒绝, 避免 Python exec 静默执行它们
+        raise CompileError(f"DSL 不支持节点: {type(node).__name__} "
+                           f"(行 {getattr(node, 'lineno', '?')})")
 
 
 def _extract_dsl_body(strategy_class, method_name: str = "compute_signal") -> str:
@@ -117,14 +141,23 @@ def _extract_dsl_body(strategy_class, method_name: str = "compute_signal") -> st
 
 
 def make_python_runner(strategy_class, method_name: str = "compute_signal"):
-    """返回 (fn, init_state_dict); fn(ctx) -> signal
+    """返回 fn(ctx) -> signal
 
     Python 直接解释执行 DSL, 不经 AST -> 字符串 -> 编译的往返,
     以保留原始浮点表达式顺序 (避免任何重渲染漂移)。
+
+    为安全起见, exec 之前先 parse+validate 一遍: 验证不通过立刻抛 CompileError,
+    验证通过后才 exec 原 body (原 body 与解析树等价, 无重渲染漂移)。
     """
     body = _extract_dsl_body(strategy_class, method_name)
+    wrapped = f"def _f(ctx):\n{textwrap.indent(body, '    ')}"
+    try:
+        tree = ast.parse(wrapped)
+    except SyntaxError as e:
+        raise CompileError(f"DSL 语法错误: {e}") from e
+    _validate(tree)
     namespace: dict = {}
-    # 用 exec 直接定义 _f 函数
+    # 用 exec 直接定义 _f 函数 (保留原 body 不经渲染, 避免漂移)
     exec("def _f(ctx):\n" + textwrap.indent(body, "    "), namespace)
     return namespace["_f"]
 
@@ -181,6 +214,13 @@ def _unparse_expr(node) -> str:
     if isinstance(node, ast.Attribute):
         # ctx.xxx -> ctx.xxx (numba 用 . 访问 jitclass)
         return f"{_unparse_expr(node.value)}.{node.attr}"
+    if isinstance(node, ast.Call):
+        # 白名单 (min/max/abs) 已由 _validate 校验; 这里只负责文本生成
+        if not (isinstance(node.func, ast.Name)
+                and node.func.id in _CALL_WHITELIST):
+            raise CompileError(f"无法 unparse expr Call {ast.dump(node)}")
+        args = ", ".join(_unparse_expr(a) for a in node.args)
+        return f"{node.func.id}({args})"
     if isinstance(node, ast.BinOp):
         op_map = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*",
                   ast.Div: "/", ast.Mod: "%", ast.Pow: "**"}
@@ -304,6 +344,20 @@ def _c99_expr(node) -> str:
         return node.id
     if isinstance(node, ast.Attribute):
         return _c99_attr(node)
+    if isinstance(node, ast.Call):
+        # 白名单 (min/max/abs); _validate 已拒绝关键字参数
+        if not (isinstance(node.func, ast.Name)
+                and node.func.id in _CALL_WHITELIST):
+            raise CompileError(f"CUDA DSL 不支持调用 {type(node.func).__name__}")
+        if node.func.id == "abs" and len(node.args) == 1:
+            x = _c99_expr(node.args[0])
+            return f"(({x}) < 0 ? -({x}) : ({x}))"
+        if node.func.id in ("min", "max") and len(node.args) == 2:
+            a = _c99_expr(node.args[0])
+            b = _c99_expr(node.args[1])
+            op = "<" if node.func.id == "min" else ">"
+            return f"(({a}) {op} ({b}) ? ({a}) : ({b}))"
+        raise CompileError(f"CUDA DSL 仅支持 min(a,b) / max(a,b) / abs(a)")
     if isinstance(node, ast.BinOp):
         op = node.op
         op_map = {
