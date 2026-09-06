@@ -541,16 +541,52 @@ def replay_main(argv=None):
                   buy_pct=args.buy_pct, sell_pct=args.sell_pct, all_in=args.all_in)
 
 
+def build_root_parser():
+    """根 parser: 用 add_subparsers 让 backtest/sweep/replay 各自独立 --help
+
+    子命令的 build_*_parser 提供各自参数; 子命令分发通过 cmd 字段决定
+    调用哪个 main。
+    """
+    ap = argparse.ArgumentParser(
+        prog="evtrade",
+        description="evtrade CLI: 策略回测 / 参数扫描 / 行情回放",
+    )
+    sub = ap.add_subparsers(dest="cmd", help="子命令")
+
+    # 复用各子命令的 build_*_parser: 它们返回 ArgumentParser, 我们拿它的
+    # _actions 嫁接到子 parser 上, 避免重复定义参数。
+    for name, builder in (("backtest", build_backtest_parser),
+                          ("sweep", build_sweep_parser),
+                          ("replay", build_replay_parser)):
+        sub_p = sub.add_parser(name, help=f"{name} 子命令 (见 {name} -h)",
+                               add_help=False)
+        for action in builder()._actions:
+            # 把所有 action 复制过来 (add_argument 已在各 builder 里)
+            sub_p._add_action(action)
+    return ap
+
+
 def main(argv=None):
     import sys
-    args = list(sys.argv[1:] if argv is None else argv)
-    if args and args[0] in ("backtest", "sweep", "replay"):
-        cmd = args.pop(0)
-        if cmd == "sweep":
-            return sweep_main(args)
-        if cmd == "replay":
-            return replay_main(args)
-    return backtest_main(args)
+    raw = sys.argv[1:] if argv is None else argv
+    # 默认行为: 无子命令 = backtest (向后兼容, 不破坏现有脚本调用)
+    if not raw or raw[0] not in ("backtest", "sweep", "replay", "-h", "--help"):
+        if raw and raw[0].startswith("-"):
+            # 形如 -h / --help 等根选项, 走 root parser 展示帮助
+            return build_root_parser().parse_args(raw)
+        if raw:
+            # 把第一个位置参数当 backtest 的策略名等看待, 走 backtest 子命令
+            return backtest_main(raw)
+        # 完全无参数: 显示 root help
+        build_root_parser().print_help()
+        return None
+    args = build_root_parser().parse_args(raw)
+    if args.cmd == "sweep":
+        # sweep / replay 的 main 期望 list[argv], 重建
+        return {"sweep": sweep_main, "replay": replay_main,
+                "backtest": backtest_main}[args.cmd](raw[1:])
+    return {"sweep": sweep_main, "replay": replay_main,
+            "backtest": backtest_main}[args.cmd](raw[1:])
 
 
 if __name__ == "__main__":
