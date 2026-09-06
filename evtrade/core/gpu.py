@@ -45,6 +45,7 @@ CUDA toolkit; 经 pip 的 nvidia-cuda-*-cu12 轮子提供 DLL, NVRTC 编译 PTX 
 import os
 import shutil
 import subprocess
+from collections import OrderedDict
 
 import numpy as np
 
@@ -614,11 +615,34 @@ def _epoch_to_encoded_np(e: np.ndarray) -> np.ndarray:
     return ((((y2 * 100 + m) * 100 + d) * 100 + h) * 100 + mi) * 100 + s
 
 
+# precompute_ts_mark 的 LRU 缓存: key=(id(bars), len(stime), period, warmup)
+# 同 (bars, period, warmup_until) 重复调用直接返回缓存结果, 省掉 epoch
+# 转换与桶对齐的开销 (WFO 多窗口扫描时尤其显著)。
+# 注意: id(bars) 在 dict 复用场景下不严格; 用 (id, len) 作为组合键,
+# 且缓存容量有界防止内存泄漏。
+_PRECOMPUTE_TS_MARK_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_PRECOMPUTE_TS_MARK_MAXSIZE = 32
+
+
+def _precompute_cache_key(bars: dict, period: str, warmup_until: int):
+    """缓存键: 用 id+bars 长度避免 dict 复用错命中"""
+    return (id(bars), len(bars.get("stime", ())), period, int(warmup_until))
+
+
 def precompute_ts_mark(bars: dict, period: str, warmup_until: int):
     """(周期, 预热阈值) -> (ts int64[n], mark int8[n]); 与策略参数无关, 每组共享
 
     桶算法与 kernel.bucket_ts_encoded 同式 (本地锚定 epoch 取整, 任意 m/h/d 周期)。
+
+    缓存: 同一 (id(bars), len(stime), period, warmup_until) 重复调用直接
+    返回缓存结果; WFO 多窗口扫描时省掉 epoch 转换与桶对齐的开销。
     """
+    key = _precompute_cache_key(bars, period, warmup_until)
+    cached = _PRECOMPUTE_TS_MARK_CACHE.get(key)
+    if cached is not None:
+        # LRU 触尾
+        _PRECOMPUTE_TS_MARK_CACHE.move_to_end(key)
+        return cached
     stime = bars["stime"]
     P = resolve_period_seconds(period)
     e = _encoded_to_epoch_np(stime)
@@ -628,7 +652,19 @@ def precompute_ts_mark(bars: dict, period: str, warmup_until: int):
                   _epoch_to_encoded_np(e0),
                   _epoch_to_encoded_np(e0 + P))
     mark = np.where(stime < warmup_until, 0, 1).astype(np.int8)
-    return ts.astype(np.int64), mark
+    out = (ts.astype(np.int64), mark)
+    _PRECOMPUTE_TS_MARK_CACHE[key] = out
+    # 容量控制
+    while len(_PRECOMPUTE_TS_MARK_CACHE) > _PRECOMPUTE_TS_MARK_MAXSIZE:
+        _PRECOMPUTE_TS_MARK_CACHE.popitem(last=False)
+    return out
+
+
+def invalidate_precompute_cache() -> int:
+    """清除 precompute_ts_mark 缓存; 返回清除的条目数"""
+    n = len(_PRECOMPUTE_TS_MARK_CACHE)
+    _PRECOMPUTE_TS_MARK_CACHE.clear()
+    return n
 
 
 def gpu_info() -> dict:
