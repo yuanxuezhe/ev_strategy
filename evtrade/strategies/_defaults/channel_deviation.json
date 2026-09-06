@@ -1,0 +1,21 @@
+{
+  "params": {
+    "low1": 1.0,
+    "low2": 1.5
+  },
+  "saved_at": "2026-09-06T17:05:33+00:00",
+  "source": {
+    "S": 0.6353268594013348,
+    "ann_net_min": 6.252366462773476,
+    "candidate_total": 9,
+    "csv": "sweep_results.csv",
+    "filter_pass": true,
+    "kind": "from_sweep",
+    "rank": 1,
+    "runner_up_gap": 1.4166544569734167,
+    "runner_up_score": 2.406658556464374,
+    "score": 3.8233130134377906,
+    "sort_key": "filter_pass=True 且 score 最高"
+  },
+  "strategy": "channel_deviation"
+}
