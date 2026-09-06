@@ -80,6 +80,35 @@ def _period_type(s: str) -> str:
     return s
 
 
+def _resolve_strategy_params(strategy_name: str, params_arg: str,
+                              legacy_low1: float | None = None,
+                              legacy_low2: float | None = None,
+                              legacy_high1: float | None = None,
+                              legacy_high2: float | None = None) -> dict:
+    """解析策略参数, 优先级 (高 -> 低):
+      1. CLI --params 显式传入 (params_arg 非空)
+      2. evtrade/strategies/_defaults/<strategy_name>.json 落盘默认
+      3. 旧 CLI kwargs (low1/low2/high1/high2) — channel_deviation 兼容
+      4. 空 dict (后续 StrategyBase 用 params_spec 默认值)
+
+    返回 dict; 顶层键与 StrategyBase.params_spec 对齐。
+    """
+    # 1. CLI --params 显式
+    if params_arg:
+        return _parse_params(params_arg)
+    # 2. 默认参数落盘
+    from .strategies._defaults_loader import exists, load
+    if exists(strategy_name):
+        data = load(strategy_name)
+        return dict(data.get("params") or {})
+    # 3. 旧 CLI kwargs 兼容 (channel_deviation 历史接口)
+    if strategy_name == "channel_deviation" and legacy_low1 is not None:
+        return {"low1": legacy_low1, "low2": legacy_low2,
+                "high1": legacy_high1, "high2": legacy_high2}
+    # 4. 空
+    return {}
+
+
 # ============ backtest 子命令 ============
 
 def build_backtest_parser() -> argparse.ArgumentParser:
@@ -141,17 +170,11 @@ def _f4(v) -> str:
 
 
 def _run_kernel(args):
-    # 策略参数 (--params 字典形式优先, 旧 kwargs 兜底)
-    if args.params:
-        strategy_params = _parse_params(args.params)
-    else:
-        strategy_params = {}
-    if not strategy_params and args.strategy == "channel_deviation":
-        # 兼容旧 CLI: --low1/--low2/--high1/--high2 当未传 --params 时
-        strategy_params = {
-            "low1": args.low1, "low2": args.low2,
-            "high1": args.high1, "high2": args.high2,
-        }
+    # 策略参数: --params 显式 > _defaults 落盘 > 旧 CLI kwargs 兼容
+    strategy_params = _resolve_strategy_params(
+        args.strategy, args.params,
+        legacy_low1=args.low1, legacy_low2=args.low2,
+        legacy_high1=args.high1, legacy_high2=args.high2)
 
     from .core.data import load_bars
     from .core.kernel import bucket_table, make_state
@@ -302,17 +325,11 @@ def _run_ref(args):
                                  all_in=args.all_in)
     aggregator = BarAggregator(resolve_period_seconds(args.period), on_bars=None,
                                warmup_until=feed.warmup_until)
-    # 策略参数: --params (字典) 优先, 其次低/高/旧 kwargs 兼容
-    if args.params:
-        strategy_params = _parse_params(args.params)
-    else:
-        strategy_params = {}
-    # 旧式 kwargs 兼容 (当未传 --params 时)
-    if not strategy_params:
-        strategy_params = {
-            "low1": args.low1, "low2": args.low2,
-            "high1": args.high1, "high2": args.high2,
-        }
+    # 策略参数: --params 显式 > _defaults 落盘 > 旧 CLI kwargs 兼容
+    strategy_params = _resolve_strategy_params(
+        args.strategy, args.params,
+        legacy_low1=args.low1, legacy_low2=args.low2,
+        legacy_high1=args.high1, legacy_high2=args.high2)
     strategy = _gs(args.strategy, params=strategy_params)
     engine = Engine(feed, aggregator, strategy, executor, tf1=args.tf1, verbose=True)
     print(f"证券: {args.code}  周期: {args.period}  策略: {args.strategy}  "
@@ -418,14 +435,10 @@ def sweep_main(argv=None):
 
     # 基础策略参数 (--params 字典形式优先, 旧低/高/旧 kwargs 兜底)
     if args.params:
-        base_params = _parse_params(args.params)
-    else:
-        base_params = {}
-    if not base_params and args.strategy == "channel_deviation":
-        base_params = {
-            "low1": args.low1, "low2": args.low2,
-            "high1": args.high1, "high2": args.high2,
-        }
+        base_params = _resolve_strategy_params(
+            args.strategy, args.params,
+            legacy_low1=args.low1, legacy_low2=args.low2,
+            legacy_high1=args.high1, legacy_high2=args.high2)
 
     base = {"start": args.start, "period": args.period, "tf1": args.tf1,
             "low1": args.low1, "low2": args.low2, "high1": args.high1,
