@@ -140,6 +140,38 @@ def _extract_dsl_body(strategy_class, method_name: str = "compute_signal") -> st
     return textwrap.dedent(method.__doc__)
 
 
+# 模块级 runner 缓存: key=(cls, method_name, source_hash) -> runner fn
+# 同一类 + 同方法 + 同源码 -> 同一 runner; 新建实例时直接复用, 避免每次
+# __init__ 都 exec 一次原 DSL body。
+# source_hash 与 core/kernel_dsl._source_hash 同源思路, 让 docstring 改动能
+# 自动失效旧 runner。
+_RUNNER_BY_KEY: dict = {}
+
+
+def _runner_source_hash(strategy_class, method_name: str) -> str:
+    import hashlib
+    cls = strategy_class if isinstance(strategy_class, type) else type(strategy_class)
+    method = getattr(cls, method_name, None)
+    doc = getattr(method, "__doc__", None) or ""
+    return hashlib.sha1(doc.encode("utf-8")).hexdigest()
+
+
+def invalidate_runner_cache(strategy_class=None) -> int:
+    """清除模块级 runner 缓存; strategy_class=None 时清空全部
+
+    返回清除的条目数, 供测试断言与 dev reload 工具用。
+    """
+    if strategy_class is None:
+        n = len(_RUNNER_BY_KEY)
+        _RUNNER_BY_KEY.clear()
+        return n
+    cls = strategy_class if isinstance(strategy_class, type) else type(strategy_class)
+    keys = [k for k in _RUNNER_BY_KEY if k[0] is cls]
+    for k in keys:
+        _RUNNER_BY_KEY.pop(k, None)
+    return len(keys)
+
+
 def make_python_runner(strategy_class, method_name: str = "compute_signal"):
     """返回 fn(ctx) -> signal
 
@@ -148,8 +180,17 @@ def make_python_runner(strategy_class, method_name: str = "compute_signal"):
 
     为安全起见, exec 之前先 parse+validate 一遍: 验证不通过立刻抛 CompileError,
     验证通过后才 exec 原 body (原 body 与解析树等价, 无重渲染漂移)。
+
+    缓存: 同一 (cls, method_name, source_hash) 只 exec 一次, 后续直接复用
+    runner 函数 (fn 本身是无状态闭包, 可安全共享)。
     """
-    body = _extract_dsl_body(strategy_class, method_name)
+    cls = strategy_class if isinstance(strategy_class, type) else type(strategy_class)
+    src_hash = _runner_source_hash(cls, method_name)
+    key = (cls, method_name, src_hash)
+    runner = _RUNNER_BY_KEY.get(key)
+    if runner is not None:
+        return runner
+    body = _extract_dsl_body(cls, method_name)
     wrapped = f"def _f(ctx):\n{textwrap.indent(body, '    ')}"
     try:
         tree = ast.parse(wrapped)
@@ -159,7 +200,9 @@ def make_python_runner(strategy_class, method_name: str = "compute_signal"):
     namespace: dict = {}
     # 用 exec 直接定义 _f 函数 (保留原 body 不经渲染, 避免漂移)
     exec("def _f(ctx):\n" + textwrap.indent(body, "    "), namespace)
-    return namespace["_f"]
+    runner = namespace["_f"]
+    _RUNNER_BY_KEY[key] = runner
+    return runner
 
 
 def render_numba_body(strategy_class, method_name: str = "compute_signal") -> str:
