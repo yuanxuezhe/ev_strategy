@@ -50,11 +50,15 @@ _EMPTY_F = np.empty(0, np.float64)
 
 
 def strategy_has_dsl(strategy_name: str) -> bool:
-    """策略是否带可渲染的 DSL compute_signal docstring (未知策略抛 ValueError)"""
-    from ..strategies import get_strategy
+    """策略是否带可渲染的 DSL compute_signal docstring (未知策略抛 ValueError)
+
+    仅做编译期探针: 取类不实例化, 避免触发 channel_deviation.__init__
+    内的 make_python_runner/exec。
+    """
+    from ..strategies import get_strategy_class
     from ..strategies.dsl import CompileError, render_numba_body
     try:
-        render_numba_body(get_strategy(strategy_name))
+        render_numba_body(get_strategy_class(strategy_name))
         return True
     except CompileError:
         return False
@@ -69,10 +73,10 @@ def build_dsl_kernel(strategy_name: str):
     同策略进程内只构建一次 (lru_cache)。
     """
     from . import kernel
-    from ..strategies import get_strategy
+    from ..strategies import get_strategy_class
     from ..strategies.dsl import render_numba_state_body
 
-    body = render_numba_state_body(get_strategy(strategy_name)).strip("\n")
+    body = render_numba_state_body(get_strategy_class(strategy_name)).strip("\n")
     src = inspect.getsource(kernel)
     i0 = src.index(_SPLICE_BEGIN)
     i1 = src.index(_SPLICE_END)

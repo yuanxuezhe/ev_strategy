@@ -70,9 +70,10 @@ class ChannelDeviationStrategy(StrategyBase):
         self._bucket_ts = None
         self._low_acted = False
         self._high_acted = False
-        # DSL 编译一次
+        # runner 走类级缓存 (make_python_runner 内部按 (cls, source_hash) 复用);
+        # 避免每次 __init__ 都 exec 一次原 DSL body。
         from .dsl import make_python_runner
-        self._runner = make_python_runner(self, "compute_signal")
+        self._runner = make_python_runner(type(self), "compute_signal")
 
     def compute_signal(self, ctx):
         """DSL 主逻辑 (channel_deviation)"""

@@ -140,6 +140,19 @@ def get_strategy(name: str, params: dict[str, Any] | None = None, **kwargs) -> S
     return _STRATEGIES[name](params=params, **kwargs)
 
 
+def get_strategy_class(name: str) -> type[StrategyBase]:
+    """按 key 拿注册过的策略类 (不实例化)
+
+    用于编译期探针 / DSL 渲染 / 类元数据查询 —— 任何不需要 self 的地方都
+    应优先使用本函数, 避免 get_strategy() 实例化触发的副作用
+    (channel_deviation.__init__ 等会在构造时执行 make_python_runner/exec)。
+    未知策略抛 ValueError。
+    """
+    if name not in _STRATEGIES:
+        raise ValueError(f"未知策略 {name!r}; 可用: {list(_STRATEGIES)}")
+    return _STRATEGIES[name]
+
+
 def get_strategy_param_spec(name: str) -> dict[str, dict[str, Any]]:
     """查策略的 params_spec (CLI / jupyter 用)"""
     if name not in _STRATEGIES:
