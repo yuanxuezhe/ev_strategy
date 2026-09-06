@@ -456,7 +456,35 @@ extern "C" __global__ void sweep_kernel_generic(
 
 _cp = None
 _kernel_cache = {}
-_generic_kernel_cache = {}
+
+# GPU 缓存键: (strategy_name, source_hash, compute_capability, RENDERER_VERSION)
+# 三元 key 让 DSL docstring 改动 / 渲染器版本升级 / 换 GPU 算力时自动失效旧缓存。
+# 与 core/kernel_dsl.py 同源思路 (避免旧 GPU kernel 在运行时被静默复用)。
+_GENERIC_KERNEL_CACHE: dict = {}
+GPU_RENDERER_VERSION = "v1"
+
+
+def _source_hash_gpu(strategy_cls) -> str:
+    """compute_signal.__doc__ 的 sha1 (与 kernel_dsl._source_hash 同源)"""
+    import hashlib
+    method = getattr(strategy_cls, "compute_signal", None)
+    doc = getattr(method, "__doc__", None) or ""
+    return hashlib.sha1(doc.encode("utf-8")).hexdigest()
+
+
+def invalidate_gpu_cache(strategy_name: str | None = None) -> int:
+    """清除 GPU kernel 缓存; strategy_name=None 时清空全部
+
+    返回清除的条目数, 供测试断言与 dev reload 工具用。
+    """
+    if strategy_name is None:
+        n = len(_GENERIC_KERNEL_CACHE)
+        _GENERIC_KERNEL_CACHE.clear()
+        return n
+    keys = [k for k in _GENERIC_KERNEL_CACHE if k[0] == strategy_name]
+    for k in keys:
+        _GENERIC_KERNEL_CACHE.pop(k, None)
+    return len(keys)
 
 
 def _compile_generic_kernel(strategy_name: str):
@@ -464,32 +492,40 @@ def _compile_generic_kernel(strategy_name: str):
 
     策略段 = strategies.dsl.render_cuda_device_function 生成的
     __device__ int strategy_check(...) 整函数 (ctx 字段按内核状态契约映射,
-    局部变量自动声明), 编译结果缓存到 _generic_kernel_cache。
+    局部变量自动声明), 编译结果缓存到 _GENERIC_KERNEL_CACHE。
     """
-    from ..strategies import get_strategy
+    from ..strategies import get_strategy_class
     from ..strategies.dsl import CompileError, render_cuda_device_function
-    cls = get_strategy(strategy_name)
+    cls = get_strategy_class(strategy_name)
     if not (hasattr(cls, "compute_signal") and cls.compute_signal.__doc__):
         # 纯 Python 策略: 没 DSL docstring; CUDA 不可用
         raise ValueError(
             f"策略 {strategy_name!r} 没有 compute_signal DSL docstring; "
             f"GPU 扫描只支持 DSL 路径 (在 compute_signal 写 docstring)")
+    cp = _ensure_cupy()
+    cc_raw = cp.cuda.device.get_compute_capability()
+    cc = f"{cc_raw[0]}{cc_raw[1]}" if isinstance(cc_raw, (tuple, list)) else "default"
+    src_hash = _source_hash_gpu(cls)
+    cache_key = (strategy_name, src_hash, cc, GPU_RENDERER_VERSION)
+    cached = _GENERIC_KERNEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     try:
         strategy_func = render_cuda_device_function(cls)
     except CompileError as e:
         raise ValueError(f"策略 {strategy_name!r} 无法渲染到 CUDA: {e}") from e
     src = _CUDA_SOURCE_GENERIC_TEMPLATE.replace("{STRATEGY_BODY}", strategy_func)
-    cp = _ensure_cupy()
-    cc = cp.cuda.device.get_compute_capability()
-    if isinstance(cc, (tuple, list)):
-        archs = [f"compute_{cc[0]}{cc[1]}", "compute_90"]
+    if isinstance(cc_raw, (tuple, list)):
+        archs = [f"compute_{cc_raw[0]}{cc_raw[1]}", "compute_90"]
     else:
         archs = ["compute_90"]
     last_err = None
     for arch in archs:
         try:
-            return cp.RawKernel(src, "sweep_kernel_generic",
+            kern = cp.RawKernel(src, "sweep_kernel_generic",
                                 options=(f"--gpu-architecture={arch}", "--fmad=false"))
+            _GENERIC_KERNEL_CACHE[cache_key] = kern
+            return kern
         except Exception as e:
             last_err = e
     raise last_err
@@ -840,10 +876,7 @@ def cuda_sweep_window_generic(bars: dict, params_list: list[dict],
     if not strategy_name:
         raise ValueError("cuda_sweep_window_generic: 缺 strategy_name")
 
-    kernel = _generic_kernel_cache.get(strategy_name)
-    if kernel is None:
-        kernel = _compile_generic_kernel(strategy_name)
-        _generic_kernel_cache[strategy_name] = kernel
+    kernel = _compile_generic_kernel(strategy_name)
 
     # 提取策略参数 spec 顺序
     spec = get_strategy_param_spec(strategy_name)
