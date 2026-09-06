@@ -128,8 +128,12 @@ from .core.kernel import (
     bucket_table, summarize, trades_to_list, bars_to_arrays,
     bucket_ts_encoded, encoded_to_epoch, epoch_to_encoded, _days_from_civil,
 )
+from .core.kernel_dsl import (
+    build_dsl_kernel, dsl_kernel, make_state_general, run_one_dsl,
+    strategy_has_dsl,
+)
 from .core.engine import Engine
-from .core.gpu import gpu_info, cuda_sweep_window
+from .core.gpu import gpu_info, cuda_sweep_window, cuda_sweep_window_generic
 from .core.sweep import sweep, parse_grid, GRID_KEYS
 from .core.replay import replay_kernel, replay_engine, reconcile, append_bar, read_bars_log, write_bars_log
 from .core.permutation import permutation_test
@@ -146,6 +150,7 @@ from .feeds import (
 from .strategies import (
     StrategyBase,
     get_strategy, available_strategies, register_strategy,
+    render_numba_state_body, render_cuda_device_function, DSLCtx, dsl_check,
 )
 from .indicators import (
     ema as ema_fn, atr, rsi, bollinger, sma, true_range,
@@ -172,13 +177,17 @@ __all__ = [
     "get_feed", "available_feeds", "register_feed",
     # 策略目录
     "StrategyBase", "get_strategy", "available_strategies", "register_strategy",
+    "render_numba_state_body", "render_cuda_device_function", "DSLCtx", "dsl_check",
     # 引擎 / 内核
     "Engine",
     "KernelState", "make_state", "run_backtest", "run_backtest_trace", "step",
     "bucket_table", "summarize", "trades_to_list", "bars_to_arrays",
     "bucket_ts_encoded", "encoded_to_epoch", "epoch_to_encoded", "_days_from_civil",
+    # DSL 特化内核 (任意 DSL 策略的 numba/CUDA 路径)
+    "build_dsl_kernel", "dsl_kernel", "make_state_general", "run_one_dsl",
+    "strategy_has_dsl",
     # GPU
-    "gpu_info", "cuda_sweep_window",
+    "gpu_info", "cuda_sweep_window", "cuda_sweep_window_generic",
     # 扫描 / 评分
     "sweep", "parse_grid", "GRID_KEYS",
     # 回放 / 置换

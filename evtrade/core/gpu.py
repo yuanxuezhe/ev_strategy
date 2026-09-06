@@ -251,18 +251,24 @@ extern "C" __global__ void sweep_kernel(
 """
 
 
-# ============ 通用 CUDA kernel: 策略段由 DSL 注入 (步骤 1) ============
-# 接受 N 个 double 参数 (params 数组), 策略段用 render_cuda_body 注入;
+# ============ 通用 CUDA kernel: 策略段由 DSL 注入 (步骤 1/2) ============
+# 接受 N 个 double 参数 (params 数组); 策略段是 render_cuda_device_function
+# 生成的 __device__ int strategy_check(...) 整函数, 编译期注入 {STRATEGY_BODY}。
+# device 函数形态的意义: DSL 里的 return X 直接成为函数返回,
+# "提前返回跳过后续语句" 的语义与 Python/numba 端完全一致 (内联块做不到)。
 # 与 _CUDA_SOURCE (旧 kernel) 的区别:
-#   - params 不再写死 low1/low2/high1/high2; 改用 params_arr 索引
-#   - 策略段 (render_cuda_body 输出) 替换 _CUDA_SOURCE 第 152-170 行的硬编码
-#   - 状态变量 (low_hit/high_hit/low_acted/high_acted/...) 仍用 double 0/1
-#     (与 Python 表达式字面等价, 浮点路径一致)
+#   - params 不再写死 low1/low2/high1/high2; 改用 params_arr 索引 (p0..p7)
+#   - 桶切换重置锁直接用 lock_ts != cur_ts 判断 (与 DSL 语义同式)
 _CUDA_SOURCE_GENERIC_TEMPLATE = r"""
+// ==== 策略段: DSL 渲染的 __device__ 函数 (编译期注入, 见 strategies/dsl.py) ====
+{STRATEGY_BODY}
+// ============================================================================
+
 extern "C" __global__ void sweep_kernel_generic(
     const long long* __restrict__ ts_arr,
     const signed char* __restrict__ mark_arr,
     const int* __restrict__ day_id,
+    const long long* __restrict__ stime_arr,
     const double* __restrict__ o, const double* __restrict__ h,
     const double* __restrict__ l, const double* __restrict__ c,
     const double* __restrict__ v,
@@ -289,20 +295,20 @@ extern "C" __global__ void sweep_kernel_generic(
     double k_ema = 2.0 / ((double)tf1 + 1.0);
     double nan_bits = __longlong_as_double((long long)0x7ff8000000000000ULL);
 
-    // ---- 状态 (寄存器): 与 _CUDA_SOURCE 保持字段同名 ----
+    // ---- 状态 (寄存器), 与 KernelState 字段一一对应 ----
     int has_cur = 0; long long cur_ts = 0;
-    double cur_high = 0.0, cur_low = 0.0, cur_close = 0.0, cur_vol = 0.0;
+    double cur_open = 0.0, cur_high = 0.0, cur_low = 0.0, cur_close = 0.0, cur_vol = 0.0;
     long long cur_count = 0, cur_mark = 1;
     double up_sum = 0.0, dw_sum = 0.0, up_ema = nan_bits, dw_ema = nan_bits;
     long long up_count = 0, dw_count = 0;
-    int low_hit = 0, high_hit = 0, lock_init = 0;
-    int low_acted = 0, high_acted = 0;
+    int low_hit = 0, high_hit = 0, low_acted = 0, high_acted = 0;
     long long lock_ts = 0;
     double cash = init_cash, position = init_position, last_price = 0.0;
     long long n_trades = 0, n_buy = 0, n_sell = 0;
     double turnover = 0.0, peak = 0.0, mdd = 0.0;
     long long peak_ts = 0, valley_ts = 0; int recovered = 1;
-    long long last_side = 0; double cur_qty = trade_qty;
+    long long last_side = 0; double cur_qty = trade_qty;   // 倍投状态
+    // 超额曲线 (与 kernel.step 同式)
     int day_init = 0, day_end_init = 0, cur_day = -1;
     double x_day_end = 0.0, x_day_end_prev = nan_bits;
     double d_sum = 0.0, d_sum2 = 0.0, x_peak = -1.0e18, x_mdd = 0.0;
@@ -310,7 +316,7 @@ extern "C" __global__ void sweep_kernel_generic(
     double d_neg_sum2 = 0.0; long long d_neg_n = 0;
     double init_equity = 0.0;
 
-    // ---- 从 params_arr 索引 (num_params 个 double, 按策略 spec 顺序) ----
+    // ---- 从 params_arr 索引 (num_params 个 double, 按策略 params_spec 顺序) ----
     double p0 = num_params > 0 ? params_arr[tid * num_params + 0] : 0.0;
     double p1 = num_params > 1 ? params_arr[tid * num_params + 1] : 0.0;
     double p2 = num_params > 2 ? params_arr[tid * num_params + 2] : 0.0;
@@ -319,8 +325,6 @@ extern "C" __global__ void sweep_kernel_generic(
     double p5 = num_params > 5 ? params_arr[tid * num_params + 5] : 0.0;
     double p6 = num_params > 6 ? params_arr[tid * num_params + 6] : 0.0;
     double p7 = num_params > 7 ? params_arr[tid * num_params + 7] : 0.0;
-    // 注: DSL 渲染时 ctx.xxx 字段必须映射到 p0..p7 中
-    // (sweep 端负责按 params_spec 顺序填 params_arr)
 
     for (long long i = 0; i < n; ++i) {
         long long ts = ts_arr[i];
@@ -343,7 +347,7 @@ extern "C" __global__ void sweep_kernel_generic(
             has_cur = 0;
         }
         if (!has_cur) {
-            has_cur = 1; cur_ts = ts; cur_high = h[i]; cur_low = l[i];
+            has_cur = 1; cur_ts = ts; cur_open = o[i]; cur_high = h[i]; cur_low = l[i];
             cur_close = c[i]; cur_vol = v[i]; cur_count = 1; cur_mark = mark;
         } else {
             if (h[i] > cur_high) cur_high = h[i];
@@ -366,10 +370,12 @@ extern "C" __global__ void sweep_kernel_generic(
         else if (dw_count == tf1 - 1) dw = (dw_sum + cur_low) / (double)tf1;
         else dw = cur_low * k_ema + dw_ema * (1.0 - k_ema);
 
-        // ============ 策略段 (DSL 注入) ============
-        int signal = 0;
-        {STRATEGY_BODY}
-        // ==========================================
+        // ============ 策略段 (DSL device 函数; return 语义与 DSL 一致) ============
+        int signal = strategy_check(low_hit, high_hit, low_acted, high_acted,
+                                    lock_ts, cur_ts, cur_open, cur_high, cur_low,
+                                    cur_close, cur_vol, up, dw,
+                                    p0, p1, p2, p3, p4, p5, p6, p7);
+        // =========================================================================
 
         // ---- 模拟成交 (与 _CUDA_SOURCE 同式, 含倍投与比例模式) ----
         if (signal != 0) {
@@ -408,12 +414,14 @@ extern "C" __global__ void sweep_kernel_generic(
             }
         }
 
-        // ---- 权益回撤 + 超额曲线 (与 _CUDA_SOURCE 同式) ----
+        // ---- 权益回撤 + 超额曲线 (与 _CUDA_SOURCE 同式; 回撤时间戳用 1m bar
+        //      stime, 与 CPU kernel.step 的 peak_eq_ts/valley_eq_ts 同口径) ----
         double eq = cash + position * last_price;
-        if (eq > peak) { peak = eq; peak_ts = ts; recovered = 1; }
+        long long stime_i = stime_arr[i];
+        if (eq > peak) { peak = eq; peak_ts = stime_i; recovered = 1; }
         if (peak > 0.0) {
             double dd = (peak - eq) / peak;
-            if (dd > mdd) { mdd = dd; valley_ts = ts; recovered = 0; }
+            if (dd > mdd) { mdd = dd; valley_ts = stime_i; recovered = 0; }
         }
         if (init_equity == 0.0) init_equity = init_cash + init_position * last_price;
         double base_eq = init_cash + init_position * last_price;
@@ -452,23 +460,25 @@ _generic_kernel_cache = {}
 
 
 def _compile_generic_kernel(strategy_name: str):
-    """编译通用 CUDA kernel (步骤 1)
+    """编译通用 CUDA kernel (步骤 1/2)
 
-    接受任意 strategies/ 子包的策略, 把 DSL 渲染成 C99 注入模板。
-    编译结果缓存到 _generic_kernel_cache (同 NVRTC 启动慢的代价只付一次)。
+    策略段 = strategies.dsl.render_cuda_device_function 生成的
+    __device__ int strategy_check(...) 整函数 (ctx 字段按内核状态契约映射,
+    局部变量自动声明), 编译结果缓存到 _generic_kernel_cache。
     """
-    from ..strategies.dsl import render_cuda_body
     from ..strategies import get_strategy
+    from ..strategies.dsl import CompileError, render_cuda_device_function
     cls = get_strategy(strategy_name)
-    if hasattr(cls, "compute_signal"):
-        strategy_body = render_cuda_body(cls)
-    else:
+    if not (hasattr(cls, "compute_signal") and cls.compute_signal.__doc__):
         # 纯 Python 策略: 没 DSL docstring; CUDA 不可用
         raise ValueError(
             f"策略 {strategy_name!r} 没有 compute_signal DSL docstring; "
-            f"GPU 扫描只支持 DSL 路径 (在 compute_signal 写 docstring)"
-        )
-    src = _CUDA_SOURCE_GENERIC_TEMPLATE.replace("{STRATEGY_BODY}", strategy_body)
+            f"GPU 扫描只支持 DSL 路径 (在 compute_signal 写 docstring)")
+    try:
+        strategy_func = render_cuda_device_function(cls)
+    except CompileError as e:
+        raise ValueError(f"策略 {strategy_name!r} 无法渲染到 CUDA: {e}") from e
+    src = _CUDA_SOURCE_GENERIC_TEMPLATE.replace("{STRATEGY_BODY}", strategy_func)
     cp = _ensure_cupy()
     cc = cp.cuda.device.get_compute_capability()
     if isinstance(cc, (tuple, list)):
@@ -809,22 +819,24 @@ def cuda_sweep_window(bars: dict, params_list: list[dict],
 # ctx 字段约定: p0..p7 是策略参数 (按 params_spec 顺序); 其余字段与 _CUDA_SOURCE 相同
 
 def cuda_sweep_window_generic(bars: dict, params_list: list[dict],
-                                warmup_until: int) -> list[dict]:
-    """GPU 批量回测 (任意策略; 步骤 1 通用 kernel)
+                                warmup_until: int,
+                                strategy_name: str = None) -> list[dict]:
+    """GPU 批量回测 (任意 DSL 策略; 步骤 1/2 通用 kernel)
 
     与 cuda_sweep_window 区别:
       - params 不再写死 low1/low2/high1/high2; 改用 params["params"] dict
-      - 策略段用 DSL 注入 (render_cuda_body)
-      - ctx 字段 p0..p7 是策略参数 (按 params_spec 顺序); 字段名必须
-        在 DSL docstring 中用 ctx.p0..ctx.p7 引用
+        (按策略 params_spec 声明顺序映射到内核 p0..p7)
+      - 策略段用 DSL 注入 (render_cuda_device_function)
+    strategy_name: 策略 key; 缺省时取 params_list[0]["strategy_name"]。
     """
-    from ..strategies import get_strategy, get_strategy_param_spec
+    from ..strategies import get_strategy_param_spec
 
     if not params_list:
         return []
 
     cp = _ensure_cupy()
-    strategy_name = params_list[0].get("strategy_name")
+    if not strategy_name:
+        strategy_name = params_list[0].get("strategy_name")
     if not strategy_name:
         raise ValueError("cuda_sweep_window_generic: 缺 strategy_name")
 
@@ -852,6 +864,7 @@ def cuda_sweep_window_generic(bars: dict, params_list: list[dict],
     day = bars["stime"] // 1_000_000
     _, day_inv = np.unique(day, return_inverse=True)
     d_day = cp.asarray(day_inv.astype(np.int32))
+    d_stime = cp.asarray(bars["stime"])          # 回撤时间戳 (与 CPU 同口径)
     n = cp.int64(len(bars["stime"]))
 
     results: list = [None] * len(params_list)
@@ -907,7 +920,7 @@ def cuda_sweep_window_generic(bars: dict, params_list: list[dict],
             _buy_pct = max(_buy_pct, 1.0)
             _sell_pct = max(_sell_pct, 1.0)
         kernel((blocks,), (threads,), (
-            d_ts, d_mark, d_day, d_o, d_h, d_l, d_c, d_v,
+            d_ts, d_mark, d_day, d_stime, d_o, d_h, d_l, d_c, d_v,
             n, cp.int32(m),
             cp.float64(float(first.get("init_cash", 200000.0))),
             cp.float64(float(first.get("init_position", 200000.0))),

@@ -174,7 +174,7 @@ _STATE_SPEC = [
     ("p4", float64), ("p5", float64), ("p6", float64), ("p7", float64),
     ("p8", float64), ("p9", float64), ("p10", float64), ("p11", float64),
     ("p12", float64), ("p13", float64), ("p14", float64), ("p15", float64),
-    # 向后兼容别名: low1=st.p0, low2=st.p1, high1=st.p2, high2=st.p3
+    # 向后兼容别名: 显式传 pN (非零) 时 low1..high2 跟随 p0..p3, 否则保留构造值
     # (channel_deviation 旧字段; _strategy_check 内部用 st.p0..p3)
     ("low1", float64), ("low2", float64), ("high1", float64), ("high2", float64),
     ("init_cash", float64), ("init_position", float64), ("trade_qty", float64),
@@ -244,15 +244,12 @@ class KernelState:
         self.p4, self.p5, self.p6, self.p7 = p4, p5, p6, p7
         self.p8, self.p9, self.p10, self.p11 = p8, p9, p10, p11
         self.p12, self.p13, self.p14, self.p15 = p12, p13, p14, p15
-        # 向后兼容别名 (channel_deviation 历史)
-        self.low1 = self.p0
-        self.low2 = self.p1
-        self.high1 = self.p2
-        self.high2 = self.p3
-        self.low1 = low1
-        self.low2 = low2
-        self.high1 = high1
-        self.high2 = high2
+        # 向后兼容别名 (channel_deviation 历史): 显式传 pN (非零) 时别名跟随 pN,
+        # 否则保留构造参数值 (tests/test_kernel_dsl.py 锁定)
+        self.low1 = self.p0 if self.p0 != 0.0 else low1
+        self.low2 = self.p1 if self.p1 != 0.0 else low2
+        self.high1 = self.p2 if self.p2 != 0.0 else high1
+        self.high2 = self.p3 if self.p3 != 0.0 else high2
         self.init_cash = init_cash
         self.init_position = init_position
         self.trade_qty = trade_qty
@@ -310,7 +307,7 @@ class KernelState:
         self.first_ts = 0
         self.last_ts = 0
         self.first_ts_set = False
-        self.init_equity = init_cash + init_position * 0.0  # 占位,step() 首根前重算
+        self.init_equity = 0.0                              # 占位 0, 首根策略期 bar 锚定
         self.record_trades = record_trades
         self.trade_ts = np.empty(trade_cap, np.int64)
         self.trade_side = np.empty(trade_cap, np.int8)
@@ -364,11 +361,15 @@ def make_state(period: str = "5m", warmup_until: int64 = 0, tf1: int = 21,
 
 @njit(nogil=True)
 def _strategy_check(st, up: float64, dw: float64) -> int64:
-    """通用策略检查 (步骤 2): 渲染 strategies/channel_deviation DSL
+    """策略检查: 返回 0=无信号 / 1=BUY / -1=SELL
 
-    返回 0=无信号 / 1=BUY / -1=SELL
-    字段: ctx.p0..p3 = 策略参数 (channel_deviation 用 low1/low2/high1/high2 别名)
+    本函数体是 strategies/channel_deviation.py DSL 的手写 st 形式 (与冻结版
+    frozen/strategy.py 逐位锁定)。kernel_dsl.build_dsl_kernel 会把
+    DSL-STRATEGY-BEGIN/END 标记之间的**整段函数体**替换成任意策略 DSL 渲染出的
+    同形代码 (ctx.X -> st.X / 函数参数 up,dw / 局部变量), 生成该策略专用的
+    内核模块 —— 一个内核源, N 个策略特化, 语义全部同源于 DSL。
     """
+    # ==== DSL-STRATEGY-BEGIN (kernel_dsl.py 按此标记整段替换) ====
     if up != up or dw != dw or up == 0.0 or dw == 0.0:   # NaN 或 0 -> 无效
         return 0
     # 桶切换: 重置本桶操作锁
@@ -408,6 +409,7 @@ def _strategy_check(st, up: float64, dw: float64) -> int64:
         st.high_acted = True
     # ===== 策略段结束 =====
     return signal
+    # ==== DSL-STRATEGY-END ====
 
 
 # ============ 模拟成交 (与 SimulatedExecutor.trade + Account.apply 逐行等价) ============

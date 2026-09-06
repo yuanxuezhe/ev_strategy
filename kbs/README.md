@@ -28,12 +28,14 @@
 | [11-扩展指南.md](11-扩展指南.md) | 新增行情源 / 执行器 / 策略 / 周期的做法 | 二次开发者 |
 | [12-重构与性能内核.md](12-重构与性能内核.md) | evtrade 包结构、numba 流式内核、差分测试、并发扫描、基准实测、GPU 路线 | 所有人（先读 01 再读这个） |
 | [13-绩效评估与鲁棒选参框架.md](13-绩效评估与鲁棒选参框架.md) | 超额曲线口径、滚动 WFO、邻域衰减 S、复合 score、帕累托、蒙特卡洛置换检验 | 选参/实盘前必读 |
+| [14-策略DSL与三端转译.md](14-策略DSL与三端转译.md) | 策略 DSL 写法、ctx 字段契约、Python/numba/CUDA 三端转译、kernel_dsl 特化内核、通用 CUDA kernel、新策略三步法 | 新策略开发必读 |
+| [使用说明.md](使用说明.md) | **所有参数意思 + 完整命令行 + 网格扫参 + 资金模式 (阶段 2)** + 输出解读 | 操作手册, 跑前/看结果前查这个 |
 
 ## 建议阅读路径
 
 - **新人上手**：01 → 02 → 10（跑起来）→ 06（理解策略）
 - **修改/排查合并逻辑**：03 → 04 → 09
-- **改策略或调参**：05 → 06 → 10
+- **改策略或调参**：05 → 06 → 10 → 14（让新策略三端可用）
 - **接实盘**：02 → 07 → 08 → 11
 
 ## 源码地图
@@ -52,8 +54,10 @@
 | `evtrade/feeds.py` | Feed 三实现 | 08 |
 | `evtrade/engine.py` | Engine | 09 |
 | `evtrade/kernel.py` | ★ numba 流式决策内核 | 12 |
+| `evtrade/kernel_dsl.py` | DSL 按策略特化内核 (ctx→st 渲染 + splice) | 14 |
 | `evtrade/data.py` | MySQL 拉取 + npz 缓存 + 合成数据 | 12 |
-| `evtrade/sweep.py` / `evtrade/cli.py` / `evtrade/gpu.py` | 扫描 / CLI / GPU 档 | 12 |
+| `evtrade/sweep.py` / `evtrade/cli.py` / `evtrade/gpu.py` | 扫描 / CLI / GPU 档 | 12、14 |
+| `evtrade/strategies/dsl.py` | 策略 DSL 转译器 (三端) | 14 |
 | `tests/`、`scripts/benchmark.py` | 差分测试套件、基准脚本 | 12 |
 
 `mysql_analyze_demo.py` 现为兼容入口（委托 `evtrade.cli`）；

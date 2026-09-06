@@ -33,6 +33,18 @@ def test_parse_grid_tf1_and_period():
     assert combos[-1] == {"tf1": 21, "period": "1h"}
 
 
+def test_parse_grid_funding_keys():
+    """阶段 2: all_in / buy_pct / sell_pct 作为网格维度"""
+    combos = parse_grid(["all_in=true,false", "buy_pct=0.3,0.5,1.0"])
+    assert len(combos) == 6
+    assert combos[0]["all_in"] is True
+    assert combos[0]["buy_pct"] == 0.3
+    assert combos[1]["all_in"] is True
+    assert combos[1]["buy_pct"] == 0.5
+    assert combos[3]["all_in"] is False
+    assert combos[5] == {"all_in": False, "buy_pct": 1.0}
+
+
 def test_parse_grid_rejects_unknown():
     import pytest
     with pytest.raises(ValueError):
@@ -48,6 +60,11 @@ def test_sweep_small_grid():
                 "years", "ann_excess_pct", "sharpe_excess", "x_mdd",
                 "ann_net", "ann_net_min", "ann_net_mean", "pos_ratio",
                 "sharpe_min", "S", "score", "pareto", "filter_pass"):
+        assert col in df.columns, col
+    # 阶段 1 新增列
+    for col in ("sortino_excess", "cagr", "calmar", "max_dd_days",
+                "max_dd_recovered", "sortino_min", "calmar_max",
+                "cagr_max", "max_dd_days_max"):
         assert col in df.columns, col
     assert df["score"].is_monotonic_decreasing
     # 抽一组与直接调用核对 (原始指标 + 年化扣费口径)

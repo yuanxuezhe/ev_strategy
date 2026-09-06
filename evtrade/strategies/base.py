@@ -21,9 +21,9 @@ from __future__ import annotations
   4. CLI 自动可用 --strategy my_strategy --params "..."
 
 当前实现限制 (2026-09-06):
-  - 策略仅走参考引擎路径
-  - numba 内核 + GPU kernel 仍硬编码 channel_deviation (low1/low2/high1/high2)
-  - 未来: 做 AST 转译器, 让策略主逻辑一份 Python 自动派生 numba/CUDA
+  - 带 DSL docstring 的策略: 三端同源 (参考引擎 + numba 内核 + CUDA, 见 dsl.py
+    与 core/kernel_dsl.py); 无 DSL 的策略仅参考引擎路径 (慢约 500x)
+  - DSL 状态契约固定 (low_hit/high_hit/_bucket_ts/... + p0..p15), 见 dsl._CTX_TO_KERNEL
 ================================================================
 """
 from typing import Any, Callable, Type

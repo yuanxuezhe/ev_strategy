@@ -12,6 +12,8 @@ from .base import StrategyBase, register_strategy
 
 
 # DSL 主逻辑 (白名单: 算术/比较/布尔/标量赋值/return)
+# 语义与 frozen/strategy.py (signal 变量形式) 逐位一致: 信号只赋值不提前 return,
+# 让随后的极端偏离锁存在本桶仍生效 —— 三端 (Python/numba/CUDA) 同源同语义。
 _CHANNEL_DEVIATION_DSL = """
 if ctx.up != ctx.up or ctx.dw != ctx.dw or ctx.up == 0 or ctx.dw == 0:
     return 0
@@ -24,21 +26,22 @@ ctx.high_dev = (ctx.cur_high - ctx.up) / ctx.up * 100
 ctx.low_dev_h = (ctx.dw - ctx.cur_high) / ctx.dw * 100
 ctx.high_dev_l = (ctx.cur_low - ctx.up) / ctx.up * 100
 # 参数访问: 按 params_spec 顺序 p0=low1, p1=low2, p2=high1, p3=high2
+signal = 0
 if ctx.low_hit and ctx.low_dev_h < ctx.p1 and not ctx._low_acted:
+    signal = 1
     ctx.low_hit = False
     ctx._low_acted = True
-    return 1
-if ctx.high_hit and ctx.high_dev_l < ctx.p3 and not ctx._high_acted:
+elif ctx.high_hit and ctx.high_dev_l < ctx.p3 and not ctx._high_acted:
+    signal = -1
     ctx.high_hit = False
     ctx._high_acted = True
-    return -1
 if ctx.low_dev > ctx.p0 and not ctx._low_acted:
     ctx.low_hit = True
     ctx._low_acted = True
 if ctx.high_dev > ctx.p2 and not ctx._high_acted:
     ctx.high_hit = True
     ctx._high_acted = True
-return 0
+return signal
 """
 
 

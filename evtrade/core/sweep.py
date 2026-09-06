@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 from .kernel import make_state, run_backtest, summarize
+from .kernel_dsl import run_one_dsl, strategy_has_dsl
 from ..frozen.timeutils import resolve_period_seconds as period_seconds
 
 GRID_KEYS = ("low1", "low2", "high1", "high2", "tf1", "period", "trade_qty", "scale",
@@ -279,8 +280,11 @@ def sweep(bars: dict, base: dict, combos: list[dict],
     splits:  滚动 WFO 分割日列表 ["20260101","20260401"]; 1 个时窗口名为 train/test
              (兼容旧 --split), 多个时为 train/test1..testK。None=单窗 (列名无前缀)。
 
-    strategy_name: 策略 key (默认 channel_deviation)。其他策略走 run_one_general
-                    (参考引擎, 慢约 500x; 不能用 GPU)。
+    strategy_name: 策略 key (默认 channel_deviation)。路径选择 (步骤 3 通用化):
+      - channel_deviation                  -> 冻结 numba 内核 (_run_window)
+      - 其他带 DSL docstring 的策略        -> DSL 特化 numba 内核 (run_one_dsl);
+            device="gpu" 时走通用 CUDA kernel (cuda_sweep_window_generic)
+      - 无 DSL 的策略 (如 breakout)        -> 参考引擎 (run_one_general, 慢约 500x)
     """
     import pandas as pd
 
@@ -326,17 +330,35 @@ def sweep(bars: dict, base: dict, combos: list[dict],
     t0 = time.perf_counter()
     metrics = [None] * len(win_data)
     use_general = (strategy_name != "channel_deviation")
+    # DSL 策略 -> numba/CUDA 快路径; 无 DSL -> 参考引擎兜底
+    dsl_fast = use_general and strategy_has_dsl(strategy_name)
     if device == "gpu" and not use_general:
         from .gpu import cuda_sweep_window
         for wi, (nm, wb, warm) in enumerate(win_data):
             metrics[wi] = cuda_sweep_window(wb, params_list, warm)
+    elif device == "gpu" and dsl_fast:
+        from .gpu import cuda_sweep_window_generic
+        for wi, (nm, wb, warm) in enumerate(win_data):
+            metrics[wi] = cuda_sweep_window_generic(wb, params_list, warm,
+                                                    strategy_name=strategy_name)
     else:
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
             futs = {}
             for wi, (nm, wb, warm) in enumerate(win_data):
                 for ci, p in enumerate(params_list):
-                    if use_general:
-                        # 通用策略: 走参考引擎, 不依赖 low1/low2/... 等固定参数
+                    if use_general and dsl_fast:
+                        # DSL 策略: DSL 特化 numba 内核 (与 run_one 同口径)
+                        futs[(wi, ci)] = ex.submit(
+                            run_one_dsl, wb, p["period"], warm,
+                            p["init_cash"], p["init_position"], p["trade_qty"],
+                            p.get("tf1", 21),
+                            p.get("scale", 1.0),
+                            p.get("buy_pct", 0.0), p.get("sell_pct", 0.0),
+                            p.get("all_in", False),
+                            strategy_name=strategy_name,
+                            strategy_params=p.get("params", {}))
+                    elif use_general:
+                        # 无 DSL 策略: 走参考引擎, 不依赖 low1/low2/... 等固定参数
                         sp = p.get("params", {})
                         futs[(wi, ci)] = ex.submit(
                             run_one_general, wb, p["period"], warm,

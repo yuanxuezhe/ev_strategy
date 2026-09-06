@@ -154,8 +154,14 @@ def _run_kernel(args):
         }
 
     from .core.data import load_bars
-    from .core.kernel import (bucket_table, make_state, run_backtest,
-                               run_backtest_trace, summarize, trades_to_list)
+    from .core.kernel import bucket_table, make_state
+    from .core.kernel_dsl import dsl_kernel, make_state_general, strategy_has_dsl
+
+    # 无 DSL docstring 的策略不能进内核路径 (numba/CUDA 都由 DSL 渲染)
+    if args.strategy != "channel_deviation" and not strategy_has_dsl(args.strategy):
+        print(f"[警告] 策略 {args.strategy!r} 没有 DSL compute_signal docstring; "
+              f"kernel 引擎不可用, 请用 --engine ref")
+        return
 
     bars = load_bars(args.code, args.start, args.end,
                      warmup_days=args.warmup_days, cache_dir=args.data_cache)
@@ -163,22 +169,33 @@ def _run_kernel(args):
     show_bars = args.show_bars or args.bars_out
     print(f"证券: {args.code}  周期: {args.period}  策略日期: {args.start}~{args.end}  "
           f"预热: {args.warmup_days}天  TF1={args.tf1}  "
-          f"low1/low2={args.low1}/{args.low2} high1/high2={args.high1}/{args.high2}  "
+          f"策略: {args.strategy}  "
           f"scale={args.scale}  "
           f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}  "
           f"引擎: kernel (numba)\n", flush=True)
 
-    st = make_state(period=args.period, warmup_until=int(args.start) * 1_000_000,
-                    tf1=args.tf1, low1=args.low1, low2=args.low2,
-                    high1=args.high1, high2=args.high2,
-                    init_cash=INIT_CASH, init_position=INIT_POSITION,
-                    trade_qty=args.trade_qty, scale=args.scale,
-                    buy_pct=args.buy_pct, sell_pct=args.sell_pct,
-                    all_in=args.all_in,
-                    record_trades=True, trade_cap=n)
-    if args.strategy != "channel_deviation":
-        print(f"[警告] kernel 引擎仅支持 channel_deviation (参数写死在 jitclass); "
-              f"策略 {args.strategy!r} 请用 --engine ref")
+    if args.strategy == "channel_deviation":
+        # 冻结内核路径 (low1..high2 别名; 72 项差分锁定)
+        st = make_state(period=args.period, warmup_until=int(args.start) * 1_000_000,
+                        tf1=args.tf1, low1=args.low1, low2=args.low2,
+                        high1=args.high1, high2=args.high2,
+                        init_cash=INIT_CASH, init_position=INIT_POSITION,
+                        trade_qty=args.trade_qty, scale=args.scale,
+                        buy_pct=args.buy_pct, sell_pct=args.sell_pct,
+                        all_in=args.all_in,
+                        record_trades=True, trade_cap=n)
+    else:
+        # DSL 策略: 按策略 params_spec 顺序填 p0..pN, 内核段由 DSL 渲染
+        st = make_state_general(args.strategy, period=args.period,
+                                warmup_until=int(args.start) * 1_000_000,
+                                tf1=args.tf1, init_cash=INIT_CASH,
+                                init_position=INIT_POSITION,
+                                trade_qty=args.trade_qty, scale=args.scale,
+                                buy_pct=args.buy_pct, sell_pct=args.sell_pct,
+                                all_in=args.all_in,
+                                strategy_params=strategy_params,
+                                record_trades=True, trade_cap=n)
+    kmod = dsl_kernel(args.strategy)   # channel_deviation -> 冻结 kernel 本尊
     t0 = time.perf_counter()
     if show_bars:
         sig_out = np.zeros(n, np.int8)
@@ -190,28 +207,28 @@ def _run_kernel(args):
         l_out = np.zeros(n)
         c_out = np.zeros(n)
         v_out = np.zeros(n)
-        run_backtest_trace(st, bars["stime"], bars["open"], bars["high"],
-                           bars["low"], bars["close"], bars["volume"],
-                           sig_out, up_out, dw_out,
-                           ts_out, o_out, h_out, l_out, c_out, v_out)
+        kmod.run_backtest_trace(st, bars["stime"], bars["open"], bars["high"],
+                                bars["low"], bars["close"], bars["volume"],
+                                sig_out, up_out, dw_out,
+                                ts_out, o_out, h_out, l_out, c_out, v_out)
         tab = bucket_table(bars["stime"], sig_out, up_out, dw_out,
                            ts_out, o_out, h_out, l_out, c_out, v_out)
         # 只保留策略期 (--start 起) 的桶; 预热期仅用于指标准备, 不输出
         mask = tab["ts"] >= int(args.start) * 1_000_000
         tab = {k: v[mask] for k, v in tab.items()}
     else:
-        run_backtest(st, bars["stime"], bars["open"], bars["high"], bars["low"],
-                     bars["close"], bars["volume"],
-                     np.empty(0, np.int8), np.empty(0), np.empty(0))
+        kmod.run_backtest(st, bars["stime"], bars["open"], bars["high"],
+                          bars["low"], bars["close"], bars["volume"],
+                          np.empty(0, np.int8), np.empty(0), np.empty(0))
     dt = time.perf_counter() - t0
 
-    for t in trades_to_list(st):
+    for t in kmod.trades_to_list(st):
         side = "BUY " if t["side"] == "BUY" else "SELL"
         arrow = ">>" if t["side"] == "BUY" else ">>"
         print(f"        {arrow} {side} {t['qty']:.0f}股 @ {t['price']:.4f}  "
               f"[{t['ts']}]  剩余资金 {t['cash_after']:.2f}", flush=True)
 
-    s = summarize(st)
+    s = kmod.summarize(st)
     print("\n" + "=" * 60)
     print("回测盈亏汇总")
     print("=" * 60)
@@ -347,7 +364,8 @@ def build_sweep_parser() -> argparse.ArgumentParser:
                     help="SELL 时按当前持仓的该比例卖 (0=关闭)")
     ap.add_argument("--grid", action="append", default=[],
                     help="参数网格, 可多次: --grid low1=1.0,1.5,2.0 "
-                         "(支持 low1/low2/high1/high2/tf1/period/trade_qty)")
+                         "(支持 low1/low2/high1/high2/tf1/period/trade_qty, "
+                         "及该策略 params_spec 声明的参数名)")
     ap.add_argument("--split", default=None,
                     help="单分割日 YYYYMMDD (等价 --splits 该值; 窗口名 train/test)")
     ap.add_argument("--splits", default=None,
@@ -382,6 +400,7 @@ def sweep_main(argv=None):
     from .data import load_bars, synthetic_bars
     from .kernel import bars_to_arrays
     from .sweep import GRID_KEYS, parse_grid, sweep as run_sweep
+    from .strategies import get_strategy_param_spec
 
     if args.synthetic_days > 0:
         from datetime import datetime, timedelta
@@ -414,7 +433,9 @@ def sweep_main(argv=None):
             "all_in": args.all_in,
             "init_cash": INIT_CASH, "init_position": INIT_POSITION,
             "params": base_params}
-    combos = parse_grid(args.grid) or [{}]
+    # 网格 key = 内置 GRID_KEYS + 该策略 params_spec 的参数名 (--grid lookback=10,20)
+    spec_keys = set(get_strategy_param_spec(args.strategy))
+    combos = parse_grid(args.grid, extra_keys=spec_keys) or [{}]
     splits = [s.strip() for s in args.splits.split(",") if s.strip()] if args.splits else None
     if splits:
         print(f"扫描 {len(combos)} 组参数 (滚动 WFO {len(splits)} 窗: "
@@ -432,7 +453,7 @@ def sweep_main(argv=None):
             if c in ("score", "ann_net_min", "ann_net_mean", "pos_ratio",
                      "sharpe_min", "sortino_min", "calmar_max", "cagr_max",
                      "max_dd_days_max", "x_mdd_max", "S", "pareto", "filter_pass")
-            or c in GRID_KEYS]
+            or c in GRID_KEYS or c in spec_keys]
     print(df[show].head(args.top).to_string(index=False))
     print(f"\n全部结果已保存: {args.out} ({len(df)} 行; 列: {cols})")
 
