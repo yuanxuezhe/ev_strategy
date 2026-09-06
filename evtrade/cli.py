@@ -441,12 +441,11 @@ def sweep_main(argv=None):
         bars = load_bars(args.code, args.start, args.end,
                          warmup_days=args.warmup_days, cache_dir=args.data_cache)
 
-    # 基础策略参数 (--params 字典形式优先, 旧低/高/旧 kwargs 兜底)
-    if args.params:
-        base_params = _resolve_strategy_params(
-            args.strategy, args.params,
-            legacy_low1=args.low1, legacy_low2=args.low2,
-            legacy_high1=args.high1, legacy_high2=args.high2)
+    # 基础策略参数: --params 显式 > _defaults 落盘 > 旧 CLI kwargs 兼容 > 空
+    base_params = _resolve_strategy_params(
+        args.strategy, args.params,
+        legacy_low1=args.low1, legacy_low2=args.low2,
+        legacy_high1=args.high1, legacy_high2=args.high2)
 
     base = {"start": args.start, "period": args.period, "tf1": args.tf1,
             "low1": args.low1, "low2": args.low2, "high1": args.high1,
