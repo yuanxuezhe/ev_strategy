@@ -8,10 +8,13 @@ from __future__ import annotations
   策略作者在 compute_signal(ctx) 方法的 docstring 里写 DSL 代码,
   表达式只允许标量算术/比较/布尔/属性赋值/return signal。
 
-  dsl_compile() 用 ast.parse 解析, 用 ast.unparse 重新生成等价的:
-    - Python 源码 (走参考引擎)
-    - numba @njit 函数体 (走内核)
-    - CUDA kernel 段 (走 GPU; 当前实现 TODO, 后续扩展)
+  DSL 编译三端共用一次 parse+validate, 再各自渲染:
+    - make_python_runner:    原 docstring body 直接 exec, 不经渲染 (避免漂移)
+    - render_numba_body:     手写 AST unparser -> numba @njit 函数体
+    - render_cuda_body:      手写 C99 渲染器 -> CUDA 函数体 (调试视图)
+    - render_cuda_device_function: AST -> __device__ strategy_check 整函数
+                                  (gpu.py 通用模板注入)
+    - compile_all:           一次返回上述三份渲染产物 (调试 / 验证用)
 
 约束 (whitelist):
   ✅ 算术: + - * /
@@ -111,23 +114,6 @@ def _extract_dsl_body(strategy_class, method_name: str = "compute_signal") -> st
     if method is None or method.__doc__ is None:
         raise CompileError(f"{cls.__name__}.{method_name} 缺少 docstring")
     return textwrap.dedent(method.__doc__)
-
-
-def dsl_compile(strategy_class, method_name: str = "compute_signal") -> str:
-    """解析 + 校验 DSL, 返回清洗后的 Python 源码 (与原 docstring 等价)
-
-    返回的源码可直接 exec 在一个含 ctx 的命名空间里。
-    """
-    body = _extract_dsl_body(strategy_class, method_name)
-    # 包成完整函数以 parse
-    wrapped = f"def _f(ctx):\n{textwrap.indent(body, '    ')}"
-    try:
-        tree = ast.parse(wrapped)
-    except SyntaxError as e:
-        raise CompileError(f"DSL 语法错误: {e}") from e
-    _validate(tree)
-    # 校验通过后, 返回函数体 (除 def 头)
-    return body
 
 
 def make_python_runner(strategy_class, method_name: str = "compute_signal"):
