@@ -12,3 +12,9 @@ sweep_results.csv
 results_robust*.csv
 results*.csv
 champion_bars.csv
+
+# 策略默认参数 (evtrade/strategies/_defaults/) 默认跟踪 *.json, 但不跟踪临时文件
+# 用 ! 规则反转: 先忽略 _defaults/ 下所有内容, 再单独放行 .gitkeep 与显式提交的 *.json
+evtrade/strategies/_defaults/*
+!evtrade/strategies/_defaults/.gitkeep
+!evtrade/strategies/_defaults/*.json
