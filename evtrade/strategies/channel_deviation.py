@@ -117,7 +117,7 @@ class ChannelDeviationStrategy(StrategyBase):
 
     def format_signal_line(self, cur, up, dw, signal, info):
         """verbose 引擎的信号行 (原 Engine.on_bars 内联格式, 原样迁入)"""
-        from ..frozen.models import fmt
+        from ..primitives import fmt
         prefix = f"{signal} >>> " if signal else "             "
         return (f"{prefix}[{cur['ts']}] {cur['code']} | O:{cur['open']} H:{cur['high']} "
                 f"L:{cur['low']} C:{cur['close']} | vol:{cur['volume']} x{cur['count']} | "

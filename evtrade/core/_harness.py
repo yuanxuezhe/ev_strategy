@@ -30,7 +30,7 @@ class NumpyDictFeed:
         self.bs = bars
 
     def stream(self) -> Iterator:
-        from ..frozen.models import Bar
+        from ..primitives import Bar
         bs = self.bs
         n = len(bs["stime"])
         for i in range(n):

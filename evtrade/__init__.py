@@ -79,7 +79,7 @@ from __future__ import annotations
 import sys as _sys
 
 # ---- frozen 冻结层 ----
-from .frozen.models import Bar, fmt
+from .primitives import Bar, fmt
 from .frozen.timeutils import compute_bucket, compute_bucket_general, daterange, resolve_period_seconds
 from .frozen.aggregator import BarAggregator
 from .frozen.account import Account
@@ -96,10 +96,10 @@ from .core import sweep as _sweep_mod
 from .core import replay as _replay_mod
 from .core import permutation as _permutation_mod
 from .core import gpu as _gpu_mod
+from . import primitives as _primitives_mod
 from .frozen import (
     aggregator as _aggregator_mod,
     timeutils as _timeutils_mod,
-    models as _models_mod,
     account as _account_mod,
     incremental_indicators as _incr_indicators_mod,
 )
@@ -115,7 +115,8 @@ _sys.modules.setdefault("evtrade.permutation", _permutation_mod)
 _sys.modules.setdefault("evtrade.gpu", _gpu_mod)
 _sys.modules.setdefault("evtrade.aggregator", _aggregator_mod)
 _sys.modules.setdefault("evtrade.timeutils", _timeutils_mod)
-_sys.modules.setdefault("evtrade.models", _models_mod)
+_sys.modules.setdefault("evtrade.primitives", _primitives_mod)
+_sys.modules.setdefault("evtrade.models", _primitives_mod)  # 向后兼容旧路径
 _sys.modules.setdefault("evtrade.account", _account_mod)
 _sys.modules.setdefault("evtrade.strategy", _strategy_mod)
 _sys.modules.setdefault("evtrade.execution", _execution_mod)

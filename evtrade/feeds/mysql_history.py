@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import create_engine
 
 from ..core.config import DB_URL, TABLE
-from ..frozen.models import Bar
+from ..primitives import Bar
 from ..frozen.timeutils import daterange
 from ._registry import register_feed
 from .base import Feed

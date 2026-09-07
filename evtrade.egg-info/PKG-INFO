@@ -1,0 +1,140 @@
+Metadata-Version: 2.4
+Name: evtrade
+Version: 0.1.0
+Summary: evtrade: 策略回测 / 参数扫描 / 行情回放 (DSL 三端转译: Python + numba + CUDA)
+Author: evtrade
+License: Proprietary
+Keywords: backtest,quant,sweep,dsl,numba,cuda
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.20
+Requires-Dist: numba>=0.56
+Requires-Dist: pandas>=1.3
+Requires-Dist: sqlalchemy>=1.4
+Requires-Dist: pymysql>=1.0
+Provides-Extra: gpu
+Requires-Dist: cupy-cuda12x>=12.0; platform_system == "Linux" and extra == "gpu"
+Requires-Dist: cupy-cuda11x>=11.0; platform_system != "Linux" and extra == "gpu"
+Provides-Extra: all
+Requires-Dist: evtrade[gpu]; extra == "all"
+
+# evtrade
+
+策略回测 / 参数扫描 / 行情回放 — DSL 三端转译 (Python + numba + CUDA)。
+
+## 安装 (uv)
+
+```bash
+# CPU 路径 (默认; 不需要 cupy)
+uv sync
+
+# GPU 路径 (Linux 装 cupy-cuda12x, Windows 装 cupy-cuda11x)
+uv sync --extra gpu
+
+# 开发 (含 pytest)
+uv sync --extra dev
+```
+
+`uv` 会自动建虚拟环境、装核心依赖。`pyproject.toml` 列出全部依赖 (numpy / numba / pandas / sqlalchemy / pymysql)。
+
+## 启动
+
+### CLI (三种入口等效)
+
+```bash
+uv run python -m evtrade ...
+uv run python -m evtrade.cli ...
+uv run evtrade ...                      # pyproject.toml [project.scripts] 注册
+```
+
+### 子命令
+
+```bash
+uv run python -m evtrade backtest --strategy channel_deviation --code 159992.SZ \
+  --start 20250101 --end 20260903 --engine kernel
+
+uv run python -m evtrade sweep --strategy channel_deviation --code 159992.SZ \
+  --start 20250101 --end 20260903 \
+  --grid low1=1.0,1.5,2.0 --grid low2=0.5,1.0,1.5 \
+  --device auto --out sweep_results.csv \
+  --save-defaults                        # 跑完自动选最优并落盘 + git commit
+
+uv run python -m evtrade params save channel_deviation \
+  --params "low1:1.5;low2:1.0;high1:1.5;high2:0.5"
+uv run python -m evtrade params show channel_deviation
+uv run python -m evtrade params list
+
+uv run python -m evtrade replay --log bars_log.csvz --against-ref
+```
+
+### 测试
+
+```bash
+uv run pytest                              # 全部 (GPU 测试默认 skip)
+uv run pytest -m "not gpu"                 # 仅 CPU
+uv run pytest -m gpu --gpu                 # GPU 路径 (需 cupy + CUDA)
+```
+
+## 工作流：网格 → 选参 → 落盘 → 单次回测/实盘
+
+```bash
+# 1. 网格扫描
+uv run python -m evtrade sweep --strategy channel_deviation --code 159992.SZ \
+  --start 20250101 --end 20260903 \
+  --grid low1=1.0,1.5,2.0 --grid low2=0.5,1.0,1.5 \
+  --grid high1=1.0,1.5,2.0 --grid high2=0.3,0.5,0.8 \
+  --splits 20250901 20260301 --device auto \
+  --out sweep_results.csv --save-defaults
+
+# 2. (程序自动选最优并落盘 evtrade/strategies/_defaults/channel_deviation.json,
+#    单独 git commit 含中文选择原因)
+
+# 3. 单次回测 (不传参数, 自动读默认)
+uv run python -m evtrade backtest --strategy channel_deviation --code 159992.SZ \
+  --start 20260101 --end 20260903 --engine kernel
+
+# 4. 实盘接入 (live 子命令未实现, 占位: 直接调 loader)
+uv run python -c "
+from evtrade.strategies._defaults_loader import load
+print(load('channel_deviation'))
+"
+```
+
+## 参数解析优先级 (CLI)
+
+`backtest` / `sweep` 子命令解析策略参数时按以下顺序:
+
+1. CLI `--params "k:v;..."` 显式传入 (任意策略, 类型自动推导 int/float/bool/str)
+2. `evtrade/strategies/_defaults/<strategy>.json` 落盘默认
+3. 旧 CLI `--low1/--low2/--high1/--high2` (仅 `channel_deviation` 兼容)
+4. 空 dict → `StrategyBase.params_spec` 的 `default`
+
+实盘/CI 机器用 `EVTRADE_DEFAULTS_DIR` 环境变量切换落盘目录, 不污染仓库:
+
+```bash
+export EVTRADE_DEFAULTS_DIR=/etc/evtrade/defaults
+```
+
+## 仓库结构
+
+```
+evtrade/
+  __init__.py          顶层 re-export + sys.modules 兼容垫片
+  __main__.py          python -m evtrade 入口
+  cli.py               argparse 子命令 (backtest/sweep/replay/params)
+  core/                kernel / engine / sweep / replay / gpu / data
+  strategies/          DSL + StrategyBase + 默认参数 (_defaults/)
+  frozen/              冻结层 (与 kernel.py 逐位锁定)
+  feeds/               行情 feed 注册表
+  execution/           Executor 抽象 (Simulated / Broker)
+  indicators/          纯函数技术指标
+tests/                 113+ pytest 用例
+tools/                 维护工具 (gen_kernel_strategy.py 等)
+docs/                  使用说明
+```
+
+## 详见
+
+- `docs/params-workflow.md` — 四步工作流完整说明
+- `docs/quickstart.md` — 快速开始 (含 uv 详细命令)
+- `kbs/` — 设计文档 (子包化前, 部分行号已过时)

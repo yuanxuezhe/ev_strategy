@@ -20,8 +20,8 @@ warmup_until 是 stime 字符串阈值,字典序 == 时间序。
 
 from typing import Optional, Union
 
-from .models import Bar
-from .timeutils import compute_bucket_general
+from ..primitives import Bar
+from .timeutils import compute_bucket_general  # Phase 3 后改 from .timeutils (搬到 core/ 后)
 
 
 # ============ 聚合器 (独立于指标和策略) ============

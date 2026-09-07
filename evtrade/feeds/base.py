@@ -9,7 +9,7 @@ from __future__ import annotations
 """
 from typing import Iterator
 
-from ..frozen.models import Bar
+from ..primitives import Bar
 
 
 class Feed:

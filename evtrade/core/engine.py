@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from ..frozen.aggregator import BarAggregator
 from ..frozen.incremental_indicators import EMAChannel
-from ..frozen.models import fmt
+from ..primitives import fmt
 from ..execution.base import Executor
 from ..feeds.base import Feed
 from ..strategies.base import StrategyBase

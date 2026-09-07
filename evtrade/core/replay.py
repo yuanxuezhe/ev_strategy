@@ -29,7 +29,7 @@ import numpy as np
 
 from .kernel import (bars_to_arrays, make_state, resolve_period_seconds,
                      run_backtest, summarize, trades_to_list)
-from ..frozen.models import Bar
+from ..primitives import Bar
 
 BAR_HEADER = "stime,code,open,high,low,close,volume"
 

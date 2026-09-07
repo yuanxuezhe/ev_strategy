@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 import numpy as np
 
 from .config import DB_URL, TABLE
-from ..frozen.models import Bar
+from ..primitives import Bar
 
 BAR_KEYS = ("stime", "open", "high", "low", "close", "volume")
 
