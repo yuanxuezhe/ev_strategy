@@ -311,47 +311,6 @@ class KernelState:
         self.trade_cash_after = np.empty(trade_cap, np.float64)
 
 
-def make_state(period: str = "5m", warmup_until: int64 = 0, tf1: int = 21,
-               low1: float = 1.5, low2: float = 1.0,
-               high1: float = 1.5, high2: float = 0.5,
-               init_cash: float = 200000.0, init_position: float = 200000.0,
-               trade_qty: float = 10000.0, scale: float = 1.0,
-               buy_pct: float = 0.0, sell_pct: float = 0.0, all_in: bool = False,
-               record_trades: bool = False, trade_cap: int = 0,
-               p0: float = 0.0, p1: float = 0.0, p2: float = 0.0, p3: float = 0.0,
-               p4: float = 0.0, p5: float = 0.0, p6: float = 0.0, p7: float = 0.0,
-               p8: float = 0.0, p9: float = 0.0, p10: float = 0.0, p11: float = 0.0,
-               p12: float = 0.0, p13: float = 0.0, p14: float = 0.0, p15: float = 0.0) -> KernelState:
-    """构造内核状态 (纯 Python 工厂; 参数用关键字传入)
-
-    scale: 倍投系数。连续同方向信号时, 下一次交易数量 = 上一次 × scale
-    (首次为基础数量 trade_qty); 方向翻转即重置为基础数量。1.0 = 关闭倍投。
-
-    资金模式 (阶段 2 新增):
-      buy_pct  ∈ [0, 1]: BUY 时按当前 cash 的该比例计算目标市值; 0 表示关闭 (走 trade_qty 路径)
-      sell_pct ∈ [0, 1]: SELL 时按当前 position 的该比例卖; 0 表示关闭
-      all_in=True: 等价于 buy_pct=1.0 且 sell_pct=1.0 (便捷开关)
-      三者优先级: --all-in 最低, 显式 --buy-pct/--sell-pct 优先于 --all-in
-
-    策略参数:
-      通用策略按 params_spec 顺序填 p0..p15 (channel_deviation 的 low1..high2
-      作为 p0..p3 的别名, 同名互通, 仅保留供旧 API 路径不报错)
-    """
-    period_seconds = resolve_period_seconds(period)
-    if all_in:
-        buy_pct = max(buy_pct, 1.0)
-        sell_pct = max(sell_pct, 1.0)
-    return KernelState(period_seconds, warmup_until, tf1,
-                       low1, low2, high1, high2,
-                       init_cash, init_position, trade_qty, scale,
-                       float(buy_pct), float(sell_pct), bool(all_in),
-                       bool(record_trades), int(trade_cap),
-                       float(p0), float(p1), float(p2), float(p3),
-                       float(p4), float(p5), float(p6), float(p7),
-                       float(p8), float(p9), float(p10), float(p11),
-                       float(p12), float(p13), float(p14), float(p15))
-
-
 # ============ 策略状态机 (与 ChannelDeviationStrategy.check 逐行等价) ============
 
 @njit(nogil=True)

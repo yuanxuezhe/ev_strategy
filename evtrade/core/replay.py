@@ -27,8 +27,7 @@ bitwise 对账 (tests/test_replay.py 锁定 PASS)。
 
 import numpy as np
 
-from .kernel import (bars_to_arrays, make_state, resolve_period_seconds,
-                     run_backtest, summarize, trades_to_list)
+from .kernel import bars_to_arrays, resolve_period_seconds, summarize, trades_to_list
 from ..primitives import Bar
 
 BAR_HEADER = "stime,code,open,high,low,close,volume"

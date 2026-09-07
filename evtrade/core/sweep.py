@@ -70,41 +70,43 @@ def parse_grid(specs: list, extra_keys: set[str] | None = None) -> list[dict]:
     return combos
 
 
+def run_one_from_dict(bars: dict, p: dict, warmup_until: int,
+                      strategy_name: str = "channel_deviation") -> dict:
+    """单组参数单窗回测 (统一入口, dict 形式)
+
+    p 必含键: period / init_cash / init_position / trade_qty / params
+    可选:    tf1 (默认 21) / scale / buy_pct / sell_pct / all_in
+    """
+    return run_one_dsl(bars, p["period"], warmup_until,
+                       p["init_cash"], p["init_position"], p["trade_qty"],
+                       tf1=p.get("tf1", 21), scale=p.get("scale", 1.0),
+                       buy_pct=p.get("buy_pct", 0.0), sell_pct=p.get("sell_pct", 0.0),
+                       all_in=p.get("all_in", False),
+                       strategy_name=strategy_name,
+                       strategy_params=p.get("params") or {})
+
+
 def run_one(bars: dict, period: str, warmup_until: int, tf1: int,
             low1: float, low2: float, high1: float, high2: float,
             init_cash: float, init_position: float, trade_qty: float,
             scale: float = 1.0,
             buy_pct: float = 0.0, sell_pct: float = 0.0,
             all_in: bool = False) -> dict:
-    """channel_deviation 单组参数单窗回测 (冻结内核语义, 向后兼容 shim)
+    """channel_deviation 单组参数单窗回测 (向后兼容 shim, 顶层 low1..high2 位置参数)
 
-    历史公开 API (顶层 low1..high2 位置参数); 内部统一走 run_one_dsl,
-    两者 bitwise 一致 (见 test_run_one_dsl_channel_deviation_matches_run_one)。
-    新代码请直接用 run_one_dsl(strategy_name="channel_deviation", ...)。
+    历史公开 API; 内部转 dict 走 run_one_from_dict。
+    新代码请直接用 run_one_dsl(strategy_name="channel_deviation", strategy_params={...})。
     """
-    return run_one_dsl(bars, period, warmup_until,
-                       init_cash, init_position, trade_qty,
-                       tf1=tf1, scale=scale,
-                       buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in,
-                       strategy_name="channel_deviation",
-                       strategy_params={"low1": low1, "low2": low2,
-                                        "high1": high1, "high2": high2})
-
-
-def _run_window(bars: dict, p: dict, warmup_until: int) -> dict:
-    """channel_deviation 单组参数单窗回测 (冻结内核语义, 统一走 run_one_dsl)
-
-    参数优先级: 顶层 low1..high2 (CLI 旗标/网格/旧 API) > p["params"] 基础值。
-    permutation / benchmark 等调用方沿用本 API; sweep 内部已统一走 run_one_dsl。
-    """
-    sp = {k: p[k] for k in ("low1", "low2", "high1", "high2") if k in p}
-    sp.update({k: v for k, v in (p.get("params") or {}).items() if k not in sp})
-    return run_one_dsl(bars, p["period"], warmup_until,
-                       p["init_cash"], p["init_position"], p["trade_qty"],
-                       tf1=p.get("tf1", 21), scale=p.get("scale", 1.0),
-                       buy_pct=p.get("buy_pct", 0.0), sell_pct=p.get("sell_pct", 0.0),
-                       all_in=p.get("all_in", False),
-                       strategy_name="channel_deviation", strategy_params=sp)
+    return run_one_from_dict(
+        bars,
+        {"period": period, "tf1": tf1, "scale": scale,
+         "buy_pct": buy_pct, "sell_pct": sell_pct, "all_in": all_in,
+         "init_cash": init_cash, "init_position": init_position,
+         "trade_qty": trade_qty,
+         "params": {"low1": low1, "low2": low2,
+                    "high1": high1, "high2": high2}},
+        warmup_until,
+        strategy_name="channel_deviation")
 
 
 def _empty_metrics(init_cash: float, init_position: float) -> dict:

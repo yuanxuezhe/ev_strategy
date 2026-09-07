@@ -33,8 +33,8 @@
   numba/CUDA 端不支持 → 不要用) / 循环 / 异常 / lambda / f-string
 
 注意: 提前 `return` 在三端语义一致 (CUDA 端靠 `__device__` 函数的函数返回实现),
-但 channel_deviation 保持 **signal 变量形式** (不提前 return), 与冻结版
-`frozen/strategy.py` 逐位对齐 —— 它的信号赋值后还要执行本桶的锁存段。
+但 channel_deviation 保持 **signal 变量形式** (不提前 return), 让本桶的锁存段
+在信号赋值后仍生效 —— 公式与历史实现逐位一致 (test_differential 72 项 bitwise)。
 
 ## 3. ctx 字段契约 (`dsl._CTX_TO_KERNEL`, 单一事实源)
 

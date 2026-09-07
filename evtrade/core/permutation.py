@@ -19,7 +19,7 @@ tests/test_sweep.py::test_permutation_sanity 锁定。
 
 import numpy as np
 
-from .sweep import _run_window
+from .sweep import run_one_from_dict
 
 
 def permutation_test(bars: dict, params: dict, warmup_until: int,
@@ -35,7 +35,7 @@ def permutation_test(bars: dict, params: dict, warmup_until: int,
     统计量用**费前**年化超额: 费用影响由确定性评分 (ann_net, sweep 层) 单独衡量,
     置换检验只回答"多日维度的择时方向是否异于运气"。
     """
-    real_m = _run_window(bars, params, warmup_until)
+    real_m = run_one_from_dict(bars, params, warmup_until)
     real = real_m.get("ann_excess_pct", 0.0)
 
     stime = bars["stime"]
@@ -60,7 +60,7 @@ def permutation_test(bars: dict, params: dict, warmup_until: int,
         shuffled = dict(bars)
         for k in price_keys:
             shuffled[k] = bars[k][new_idx]
-        m = _run_window(shuffled, params, warmup_until)
+        m = run_one_from_dict(shuffled, params, warmup_until)
         vals[j] = m.get("ann_excess_pct", 0.0)
         if vals[j] >= real:
             ge += 1

@@ -131,6 +131,34 @@ def _build_dsl_kernel_impl(strategy_name: str, source_hash: str):
     # numba jitclass 注册时会按 __module__ 回查 sys.modules, 必须先挂进去
     sys.modules[mod.__name__] = mod
     exec(compile(src, f"<kernel_dsl:{strategy_name}>", "exec"), mod.__dict__)
+    # 注入 make_state 便捷 shim: 直接调本模块 KernelState jitclass (与历史
+    # kernel.py::make_state 等价)。保留供 _KMOD.make_state 测试 / 旧脚本;
+    # 新代码请用 make_state_general(..., strategy_params=...)。
+    KS = mod.KernelState
+    def make_state(period="5m", warmup_until=0, tf1=21,
+                   low1=1.5, low2=1.0, high1=1.5, high2=0.5,
+                   init_cash=200000.0, init_position=200000.0,
+                   trade_qty=10000.0, scale=1.0,
+                   buy_pct=0.0, sell_pct=0.0, all_in=False,
+                   record_trades=False, trade_cap=0,
+                   p0=0.0, p1=0.0, p2=0.0, p3=0.0,
+                   p4=0.0, p5=0.0, p6=0.0, p7=0.0,
+                   p8=0.0, p9=0.0, p10=0.0, p11=0.0,
+                   p12=0.0, p13=0.0, p14=0.0, p15=0.0):
+        from .kernel import resolve_period_seconds
+        if all_in:
+            buy_pct = max(buy_pct, 1.0)
+            sell_pct = max(sell_pct, 1.0)
+        return KS(resolve_period_seconds(period), warmup_until, tf1,
+                  low1, low2, high1, high2,
+                  init_cash, init_position, trade_qty, scale,
+                  float(buy_pct), float(sell_pct), bool(all_in),
+                  bool(record_trades), int(trade_cap),
+                  float(p0), float(p1), float(p2), float(p3),
+                  float(p4), float(p5), float(p6), float(p7),
+                  float(p8), float(p9), float(p10), float(p11),
+                  float(p12), float(p13), float(p14), float(p15))
+    mod.make_state = make_state
     return mod
 
 

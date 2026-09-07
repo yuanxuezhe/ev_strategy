@@ -13,8 +13,9 @@ from .base import StrategyBase, register_strategy
 
 
 # DSL 主逻辑 (白名单: 算术/比较/布尔/标量赋值/return)
-# 语义与 frozen/strategy.py (signal 变量形式) 逐位一致: 信号只赋值不提前 return,
-# 让随后的极端偏离锁存在本桶仍生效 —— 三端 (Python/numba/CUDA) 同源同语义。
+# 信号只赋值不提前 return, 让随后的极端偏离锁存在本桶仍生效。
+# 三端 (Python/numba/CUDA) 同源同语义; 公式逐位锁定 (test_differential 72 项
+# bitwise 一致, 与原 frozen/strategy.py 历史行为一致, 后者已并入本文件)。
 _CHANNEL_DEVIATION_DSL = """
 if ctx.up != ctx.up or ctx.dw != ctx.dw or ctx.up == 0 or ctx.dw == 0:
     return 0

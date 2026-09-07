@@ -102,9 +102,8 @@ evtrade/
   __init__.py          顶层 re-export + sys.modules 兼容垫片
   __main__.py          python -m evtrade 入口
   cli.py               argparse 子命令 (backtest/sweep/replay/params)
-  core/                kernel / engine / sweep / replay / gpu / data
+  core/                kernel / kernel_dsl / engine / sweep / replay / gpu / data
   strategies/          DSL + StrategyBase + 默认参数 (_defaults/)
-  frozen/              冻结层 (与 kernel.py 逐位锁定)
   feeds/               行情 feed 注册表
   execution/           Executor 抽象 (Simulated / Broker)
   indicators/          纯函数技术指标

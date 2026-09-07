@@ -11,18 +11,14 @@ from __future__ import annotations
   cli.py        CLI 入口 (回测 / 扫描 / 回放 三个子命令)
 
 子包:
-  frozen/       ⚠️ 冻结层 (kernel 锁定, 改了触发 72 项测试)
-                - aggregator.py   BarAggregator 增量桶合并
-                - timeutils.py    compute_bucket_general (任意周期)
-                - models.py       Bar / fmt
-                - account.py      Account 记账
-                - strategy.py     ChannelDeviationStrategy (冻结版)
-                - incremental_indicators.py  IncrementalEMA / EMAChannel
-
   core/         ✅ 主调度层
-                - kernel.py       numba 流式决策内核 (冻结, 与 frozen 同源等价)
+                - kernel.py       numba 流式决策内核 (DSL splice 模板 + 数据流)
+                - kernel_dsl.py   按策略特化的内核渲染 (build_dsl_kernel)
+                - aggregator.py   BarAggregator 增量桶合并 (差分锁定参考实现)
+                - timeutils.py    compute_bucket_general (任意周期, 差分锁定)
+                - incremental_indicators.py  IncrementalEMA (差分锁定)
                 - engine.py       参考引擎 (供 replay 对账)
-                - gpu.py          CUDA 内核 (与 kernel 等价)
+                - gpu.py          CUDA 内核 (DSL 渲染产物注入)
                 - sweep.py        并发参数扫描 + 鲁棒评分
                 - replay.py       录制回放对账
                 - permutation.py  MC 置换检验
@@ -50,9 +46,7 @@ from __future__ import annotations
 🟢🟡🔴 修改频次分类 (每个文件 docstring 顶部也标了)
 ================================================================
 🟢 冻结 (kernel 锁定, 改了触发全红):
-    frozen/aggregator / timeutils / models / account / strategy /
-    incremental_indicators
-    core/kernel / engine / gpu / replay
+    core/aggregator / timeutils / incremental_indicators / kernel / engine / gpu / replay
 
 🟡 可改 (用户面 / 参数面):
     cli.py  core/config / data / sweep  execution/base
@@ -121,7 +115,7 @@ _sys.modules.setdefault("evtrade.incremental_indicators", _incr_indicators_mod)
 
 # ---- core 主调度 ----
 from .core.kernel import (
-    KernelState, make_state, run_backtest, run_backtest_trace, step,
+    KernelState, run_backtest, run_backtest_trace, step,
     bucket_table, summarize, trades_to_list, bars_to_arrays,
     bucket_ts_encoded, encoded_to_epoch, epoch_to_encoded, _days_from_civil,
 )
@@ -177,7 +171,7 @@ __all__ = [
     "render_numba_state_body", "render_cuda_device_function", "DSLCtx", "dsl_check",
     # 引擎 / 内核
     "Engine",
-    "KernelState", "make_state", "run_backtest", "run_backtest_trace", "step",
+    "KernelState", "run_backtest", "run_backtest_trace", "step",
     "bucket_table", "summarize", "trades_to_list", "bars_to_arrays",
     "bucket_ts_encoded", "encoded_to_epoch", "epoch_to_encoded", "_days_from_civil",
     # DSL 特化内核 (任意 DSL 策略的 numba/CUDA 路径)

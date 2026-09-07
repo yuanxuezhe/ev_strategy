@@ -84,7 +84,6 @@ def test_gpu_matches_cpu_bitwise():
 
 def test_gpu_walkforward_window_isolation():
     """warmup=split: GPU 测试窗成交全部落在 split 之后"""
-    from evtrade.kernel import make_state, run_backtest  # noqa: F401
     bars = bars_to_arrays(synthetic_bars(days=30, start_ymd="20250101", seed=23))
     split = 20250120000000
     p = [{"period": "5m", "tf1": 21,

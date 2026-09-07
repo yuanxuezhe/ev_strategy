@@ -13,8 +13,9 @@ import numpy as np
 
 from evtrade import (Account, BarAggregator, ChannelDeviationStrategy, Engine,
                      Feed, SimulatedExecutor)
+from evtrade.core.kernel_dsl import dsl_kernel, make_state_general
 from evtrade.data import synthetic_bars
-from evtrade.kernel import bars_to_arrays, make_state, run_backtest, summarize
+from evtrade.kernel import bars_to_arrays, resolve_period_seconds, summarize
 from evtrade.sweep import parse_grid, sweep
 
 
@@ -31,7 +32,8 @@ def main():
     bars = synthetic_bars(days=days, start_ymd="20250101", seed=42)
     arr = bars_to_arrays(bars)
     n = len(bars)
-    params = dict(tf1=21, low1=0.4, low2=0.25, high1=0.4, high2=0.2)
+    # 统一 params dict 形式 (与 sweep / replay 同路径; 不再用 legacy 顶层 low1..high2)
+    params = {"low1": 0.4, "low2": 0.25, "high1": 0.4, "high2": 0.2}
     warmup = 20250301000000
     print(f"数据: {n} 根 1m bar ({days} 天)  参数: {params}  "
           f"CPU 核数: {os.cpu_count()}\n")
@@ -50,7 +52,8 @@ def main():
 
     account = Account(cash=200000.0, position=200000.0)
     executor = RecExec(account, qty=10000.0, verbose=False)
-    aggregator = BarAggregator(PERIODS_CFG["5m"], on_bars=None, warmup_until="20250301000000")
+    aggregator = BarAggregator(resolve_period_seconds("5m"), on_bars=None,
+                               warmup_until="20250301000000")
     strategy = ChannelDeviationStrategy(params=params)
     engine = Engine(ListFeed(bars), aggregator, strategy, executor, tf1=21, verbose=False)
     engine.run()
@@ -60,12 +63,17 @@ def main():
     print(f"参考引擎   : {t_ref*1000:10.1f} ms  ({n/t_ref/1e6:.2f} M bar/s)  "
           f"trades={ref['n']} equity={ref['eq']:.2f}")
 
+    # ---- 内核: 走 dsl_kernel("channel_deviation") 特化模块 (单源渲染产物) ----
+    kmod = dsl_kernel("channel_deviation")
     # ---- 内核: 首次 (含 JIT 编译) ----
-    st = make_state(period="5m", warmup_until=warmup, record_trades=True, trade_cap=n, **params)
+    st = make_state_general("channel_deviation", period="5m", warmup_until=warmup,
+                            tf1=21, init_cash=200000.0, init_position=200000.0,
+                            trade_qty=10000.0, record_trades=True, trade_cap=n,
+                            strategy_params=params)
     t0 = time.perf_counter()
-    run_backtest(st, arr["stime"], arr["open"], arr["high"], arr["low"],
-                 arr["close"], arr["volume"],
-                 np.empty(0, np.int8), np.empty(0), np.empty(0))
+    kmod.run_backtest(st, arr["stime"], arr["open"], arr["high"], arr["low"],
+                      arr["close"], arr["volume"],
+                      np.empty(0, np.int8), np.empty(0), np.empty(0))
     t_cold = time.perf_counter() - t0
     print(f"内核(冷)   : {t_cold*1000:10.1f} ms  (含 numba JIT 编译)")
 
@@ -73,10 +81,13 @@ def main():
     reps = 10
     t0 = time.perf_counter()
     for _ in range(reps):
-        st = make_state(period="5m", warmup_until=warmup, record_trades=False, **params)
-        run_backtest(st, arr["stime"], arr["open"], arr["high"], arr["low"],
-                     arr["close"], arr["volume"],
-                     np.empty(0, np.int8), np.empty(0), np.empty(0))
+        st = make_state_general("channel_deviation", period="5m", warmup_until=warmup,
+                                tf1=21, init_cash=200000.0, init_position=200000.0,
+                                trade_qty=10000.0, record_trades=False,
+                                strategy_params=params)
+        kmod.run_backtest(st, arr["stime"], arr["open"], arr["high"], arr["low"],
+                          arr["close"], arr["volume"],
+                          np.empty(0, np.int8), np.empty(0), np.empty(0))
     t_warm = (time.perf_counter() - t0) / reps
     s = summarize(st)
     print(f"内核(热)   : {t_warm*1000:10.1f} ms  ({n/t_warm/1e6:.2f} M bar/s)  "
@@ -88,9 +99,10 @@ def main():
     print("核对       : 参考引擎与内核成交数/资金/持仓一致 ✓\n")
 
     # ---- 并发扫描: 1000 组参数 (CPU) ----
+    # 统一 base: 策略参数以 params dict 为唯一事实源 (与新 sweep 路径对齐)
     base = {"start": "20250301", "period": "5m", "tf1": 21,
-            "low1": 0.4, "low2": 0.25, "high1": 0.4, "high2": 0.2,
-            "trade_qty": 10000.0, "init_cash": 200000.0, "init_position": 200000.0}
+            "trade_qty": 10000.0, "init_cash": 200000.0, "init_position": 200000.0,
+            "params": {"low1": 0.4, "low2": 0.25, "high1": 0.4, "high2": 0.2}}
     grid = parse_grid([
         "low1=0.30,0.35,0.40,0.45,0.50,0.55,0.60,0.65,0.70,0.75",
         "low2=0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55,0.60",
@@ -108,27 +120,19 @@ def main():
     # ---- GPU 对比 (需 cupy; 与 CPU 结果按网格顺序逐组核对) ----
     try:
         from evtrade.gpu import cuda_sweep_window_generic
-        from evtrade.sweep import _run_window
+        from evtrade.sweep import run_one_from_dict
     except Exception as e:
         print(f"\n[GPU] cupy 不可用, 跳过 ({e})")
         return
-    # 通用 CUDA kernel 走 params dict; 把基准 base + grid key 装进 "params"
-    # (channel_deviation 的 params_spec = low1..high2, 由 _run_window 走 run_one_dsl)。
-    def _to_param_list(combo_iter):
-        out = []
-        for c in combo_iter:
-            p = dict(base, **c)
-            p["params"] = {k: p[k] for k in ("low1", "low2", "high1", "high2")}
-            p["strategy_name"] = "channel_deviation"
-            out.append(p)
-        return out
 
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        cpu_res = list(ex.map(lambda c: _run_window(arr, dict(base, **c), 20250301000000),
+        cpu_res = list(ex.map(lambda c: run_one_from_dict(arr, dict(base, **c), 20250301000000),
                               grid))
     t0 = time.perf_counter()
-    gpu_res = cuda_sweep_window_generic(arr, _to_param_list(grid), 20250301000000,
+    gpu_res = cuda_sweep_window_generic(arr,
+                                        [dict(base, **c) for c in grid],
+                                        20250301000000,
                                         strategy_name="channel_deviation")
     t_gpu = time.perf_counter() - t0
     mism = sum(1 for g, c in zip(gpu_res, cpu_res)
@@ -144,15 +148,13 @@ def main():
         "high2=0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55",
     ])
     t0 = time.perf_counter()
-    cuda_sweep_window_generic(arr, _to_param_list(big), 20250301000000,
+    cuda_sweep_window_generic(arr, [dict(base, **c) for c in big], 20250301000000,
                               strategy_name="channel_deviation")
     t_big = time.perf_counter() - t0
     total = len(big) * n
     print(f"GPU {len(big)} 组 x {n} 根 = {total / 1e9:.2f} G bar-steps: {t_big:.1f}s "
           f"({total / t_big / 1e9:.2f} G bar-steps/s)")
 
-
-from evtrade.config import PERIODS as PERIODS_CFG
 
 if __name__ == "__main__":
     main()
