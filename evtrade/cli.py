@@ -299,7 +299,7 @@ def _run_kernel(args):
 def _run_ref(args):
     """原 Python 实现路径 (保留逐根 sleep / 分段拉数的原始行为)"""
     from .core.aggregator import BarAggregator
-    from .frozen.account import Account
+    from .execution.account import Account
     from .core.engine import Engine
     from .execution.base import SimulatedExecutor
     from .feeds.mysql_history import MySQLBacktestFeed

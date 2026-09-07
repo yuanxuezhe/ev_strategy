@@ -149,7 +149,7 @@ def build_engine(feed, *, period, warmup_until=None,
       - period 接受 "5m" 字符串或周期秒数 int
       - warmup_until 为 stime 字符串阈值 (BarAggregator 约定), None 表示不预热
     """
-    from ..frozen.account import Account
+    from ..execution.account import Account
     from ..core.timeutils import resolve_period_seconds
     from ..strategies import get_strategy
 

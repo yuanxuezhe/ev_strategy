@@ -82,7 +82,7 @@ import sys as _sys
 from .primitives import Bar, fmt
 from .core.timeutils import compute_bucket, compute_bucket_general, daterange, resolve_period_seconds
 from .core.aggregator import BarAggregator
-from .frozen.account import Account
+from .execution.account import Account
 from .strategies.channel_deviation import ChannelDeviationStrategy
 from .frozen.incremental_indicators import EMAChannel, IncrementalEMA, ema, ema_channel
 
@@ -98,12 +98,11 @@ from .core import permutation as _permutation_mod
 from .core import gpu as _gpu_mod
 from . import primitives as _primitives_mod
 from .core import timeutils as _timeutils_mod, aggregator as _aggregator_mod
+from .execution import account as _account_mod, base as _execution_mod
 from .frozen import (
-    account as _account_mod,
     incremental_indicators as _incr_indicators_mod,
 )
 from .strategies import channel_deviation as _strategy_mod  # 旧 evtrade.strategy shim (向后兼容)
-from .execution import base as _execution_mod
 _sys.modules.setdefault("evtrade.data", _data_mod)
 _sys.modules.setdefault("evtrade.config", _config_mod)
 _sys.modules.setdefault("evtrade.kernel", _kernel_mod)
