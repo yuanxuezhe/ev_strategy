@@ -64,7 +64,6 @@ from __future__ import annotations
 ================================================================
 📜 用法
 ================================================================
-  python mysql_analyze_demo.py --period 5m --start 20250101 --end 20260903 --no-sleep
   python -m evtrade backtest --engine kernel --period 5m ...
   python -m evtrade sweep --grid low1=1.0,1.5,2.0 --grid high2=0.3,0.5,0.8 ...
   python -m evtrade replay --log live_demo.log --against-ref

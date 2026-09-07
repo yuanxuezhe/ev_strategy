@@ -30,12 +30,6 @@ from evtrade.strategies._defaults_loader import (
 
 
 @pytest.fixture
-def isolated_defaults(tmp_path, monkeypatch):
-    monkeypatch.setenv("EVTRADE_DEFAULTS_DIR", str(tmp_path))
-    return tmp_path
-
-
-@pytest.fixture
 def fake_sweep_df():
     """构造一个模拟 sweep 结果 DataFrame"""
     return pd.DataFrame([

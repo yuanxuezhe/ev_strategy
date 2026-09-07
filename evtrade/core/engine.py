@@ -22,9 +22,9 @@ from __future__ import annotations
 from ..frozen.aggregator import BarAggregator
 from ..frozen.incremental_indicators import EMAChannel
 from ..frozen.models import fmt
-from ..frozen.strategy import ChannelDeviationStrategy
 from ..execution.base import Executor
 from ..feeds.base import Feed
+from ..strategies.base import StrategyBase
 from .config import TF1
 
 
@@ -38,7 +38,7 @@ class Engine:
     """
 
     def __init__(self, feed: Feed, aggregator: BarAggregator,
-                 strategy: ChannelDeviationStrategy, executor: Executor,
+                 strategy: StrategyBase, executor: Executor,
                  tf1: int = TF1, verbose=True):
         self.feed = feed
         self.aggregator = aggregator
@@ -75,7 +75,7 @@ class Engine:
             return   # 预热: 只累积指标历史, 不进入策略
 
         price = float(cur["close"])
-        self.executor.account.last_price = price
+        self.executor.update_price(price)
 
         # 增量 EMA: 基于已闭合序列 + 当前桶最新 H/L, O(1)
         up, dw = self.ema_ch.channel(cur["high"], cur["low"])

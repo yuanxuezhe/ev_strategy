@@ -19,7 +19,7 @@ tests/test_sweep.py::test_permutation_sanity 锁定。
 
 import numpy as np
 
-from .sweep import _ann_net, _run_window
+from .sweep import _run_window
 
 
 def permutation_test(bars: dict, params: dict, warmup_until: int,

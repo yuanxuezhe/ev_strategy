@@ -33,6 +33,13 @@ class Executor:
     def trade(self, signal: str, price: float, ts: str) -> bool:
         raise NotImplementedError
 
+    def update_price(self, price: float) -> None:
+        """更新账户最新价 (权益估值用; 由 Engine 在策略期每根 bar 调用)。
+
+        封装 ``self.account.last_price = price``, 避免引擎穿透执行器内部结构。
+        """
+        self.account.last_price = price
+
 
 class SimulatedExecutor(Executor):
     """回测模拟下单: 以信号当根 close 成交, 资金/持仓不足则买满/卖完

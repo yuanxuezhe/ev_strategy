@@ -7,23 +7,7 @@
 """
 from __future__ import annotations
 
-import numpy as np
-import pytest
-
 from evtrade.cli import sweep_main
-
-
-def _make_bars(n=64):
-    stime = np.arange(20260101000000, 20260101000000 + n * 60000, 60000,
-                      dtype=np.int64)
-    return {
-        "stime": stime,
-        "open":  np.full(n, 100.0, dtype=np.float64),
-        "high":  np.full(n, 101.0, dtype=np.float64),
-        "low":   np.full(n, 99.0, dtype=np.float64),
-        "close": np.full(n, 100.5, dtype=np.float64),
-        "volume": np.full(n, 1000, dtype=np.int64),
-    }
 
 
 def test_sweep_main_no_params_no_defaults_no_legacy_kwargs(tmp_path, monkeypatch):

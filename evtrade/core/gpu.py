@@ -50,7 +50,8 @@ from collections import OrderedDict
 import numpy as np
 
 from .config import INIT_CASH, INIT_POSITION
-from .kernel import resolve_period_seconds
+from .kernel import encoded_to_epoch, resolve_period_seconds
+from .kernel_dsl import _invalidate_cache, _source_hash as _source_hash_gpu
 
 _CUDA_SOURCE = r"""
 extern "C" __global__ void sweep_kernel(
@@ -465,27 +466,13 @@ _GENERIC_KERNEL_CACHE: dict = {}
 GPU_RENDERER_VERSION = "v1"
 
 
-def _source_hash_gpu(strategy_cls) -> str:
-    """compute_signal.__doc__ 的 sha1 (与 kernel_dsl._source_hash 同源)"""
-    import hashlib
-    method = getattr(strategy_cls, "compute_signal", None)
-    doc = getattr(method, "__doc__", None) or ""
-    return hashlib.sha1(doc.encode("utf-8")).hexdigest()
-
-
 def invalidate_gpu_cache(strategy_name: str | None = None) -> int:
     """清除 GPU kernel 缓存; strategy_name=None 时清空全部
 
     返回清除的条目数, 供测试断言与 dev reload 工具用。
+    复用 kernel_dsl._invalidate_cache (与 DSL 缓存失效同逻辑)。
     """
-    if strategy_name is None:
-        n = len(_GENERIC_KERNEL_CACHE)
-        _GENERIC_KERNEL_CACHE.clear()
-        return n
-    keys = [k for k in _GENERIC_KERNEL_CACHE if k[0] == strategy_name]
-    for k in keys:
-        _GENERIC_KERNEL_CACHE.pop(k, None)
-    return len(keys)
+    return _invalidate_cache(_GENERIC_KERNEL_CACHE, strategy_name)
 
 
 def _compile_generic_kernel(strategy_name: str):
@@ -696,6 +683,117 @@ def gpu_info() -> dict:
     return info
 
 
+def _alloc_gpu_outputs(m: int):
+    """分配一组 GPU 输出数组 (cuda_sweep_window / _generic 共用, 17 个 cp.empty)。
+
+    返回 dict, key 与 _collect_gpu_results 形参同名。两处原先各写一份完全相同的
+    cp.empty 序列; 提取后避免新增输出列时漏改其一。
+    """
+    return {
+        "out_cash": cp.empty(m, cp.float64),
+        "out_pos": cp.empty(m, cp.float64),
+        "out_last": cp.empty(m, cp.float64),
+        "out_ntrades": cp.empty(m, cp.int64),
+        "out_nbuy": cp.empty(m, cp.int64),
+        "out_nsell": cp.empty(m, cp.int64),
+        "out_mdd": cp.empty(m, cp.float64),
+        "out_turnover": cp.empty(m, cp.float64),
+        "out_dsum": cp.empty(m, cp.float64),
+        "out_dsum2": cp.empty(m, cp.float64),
+        "out_dn": cp.empty(m, cp.int64),
+        "out_xmdd": cp.empty(m, cp.float64),
+        "out_dneg_sum2": cp.empty(m, cp.float64),
+        "out_dneg_n": cp.empty(m, cp.int64),
+        "out_init_equity": cp.empty(m, cp.float64),
+        "out_peak_ts": cp.empty(m, cp.int64),
+        "out_valley_ts": cp.empty(m, cp.int64),
+        "out_recovered": cp.empty(m, cp.int32),
+    }
+
+
+def _collect_gpu_results(bars, params_list, idxs, warmup_until,
+                         cash, pos, last, ntr, nbuy, nsell, mdd, turnover,
+                         dsum, dsum2, dn, xmdd, dneg_sum2, dneg_n, init_eq,
+                         peak_ts, valley_ts, recovered) -> dict:
+    """GPU kernel 输出 host 数组 -> {param_idx: 绩效字典}
+
+    cuda_sweep_window / cuda_sweep_window_generic 共用此汇总逻辑,
+    避免 sharpe/sortino/cagr/calmar/max_dd_days 公式在两处复制
+    (公式与 kernel.summarize 同口径; 任一改动需同步 kernel.summarize)。
+    """
+    stime = bars["stime"]
+    years = 0.0
+    idx0 = int(np.searchsorted(stime, int(warmup_until)))
+    if idx0 < len(stime) and stime[-1] > stime[idx0]:
+        years = ((encoded_to_epoch(int(stime[-1])) - encoded_to_epoch(int(stime[idx0])))
+                 / (365.25 * 86400.0))
+    out: dict = {}
+    for j, i in enumerate(idxs):
+        p = params_list[i]
+        init_cash = float(p.get("init_cash", INIT_CASH))
+        init_position = float(p.get("init_position", INIT_POSITION))
+        baseline = init_cash + init_position * float(last[j])
+        equity = float(cash[j]) + float(pos[j]) * float(last[j])
+        diff = equity - baseline
+        pct = (diff / baseline * 100.0) if baseline else 0.0
+        ann = (pct / years) if years > 0 else 0.0
+        sharpe = 0.0
+        if dn[j] >= 2:
+            mean_d = dsum[j] / dn[j]
+            var_d = dsum2[j] / dn[j] - mean_d * mean_d
+            if var_d > 0.0:
+                sharpe = mean_d / var_d ** 0.5 * 252.0 ** 0.5
+        # Sortino: 仅下行 (d<0)
+        sortino = 0.0
+        if dneg_n[j] >= 1 and dn[j] >= 1:
+            mean_d = dsum[j] / dn[j]
+            dn_var = dneg_sum2[j] / dneg_n[j]
+            if dn_var > 0.0:
+                sortino = mean_d / dn_var ** 0.5 * 252.0 ** 0.5
+        # CAGR
+        ieq = float(init_eq[j]) if init_eq[j] > 0.0 else (
+            init_cash + init_position * float(last[j]))
+        cagr = 0.0
+        if ieq > 0.0 and years > 0.0:
+            ratio = equity / ieq
+            if ratio > 0.0:
+                cagr = (ratio ** (1.0 / years) - 1.0) * 100.0
+        # Calmar
+        calmar = 0.0
+        if mdd[j] > 1e-9:
+            calmar = ann / (float(mdd[j]) * 100.0)
+        # 最大回撤持续天数
+        dd_days = 0.0
+        if int(peak_ts[j]) > 0 and int(valley_ts[j]) >= int(peak_ts[j]):
+            end_ts = int(stime[-1]) if int(recovered[j]) == 0 else int(valley_ts[j])
+            if end_ts >= int(peak_ts[j]):
+                dd_days = (encoded_to_epoch(end_ts) - encoded_to_epoch(int(peak_ts[j]))) / 86400.0
+        out[i] = {
+            "final_price": float(last[j]),
+            "n_trades": int(ntr[j]),
+            "n_buy": int(nbuy[j]),
+            "n_sell": int(nsell[j]),
+            "final_cash": float(cash[j]),
+            "final_position": float(pos[j]),
+            "final_equity": equity,
+            "baseline": baseline,
+            "excess": diff,
+            "excess_pct": pct,
+            "years": years,
+            "ann_excess_pct": ann,
+            "sharpe_excess": sharpe,
+            "sortino_excess": sortino,
+            "cagr": cagr,
+            "calmar": calmar,
+            "max_dd_days": dd_days,
+            "max_dd_recovered": bool(int(recovered[j])),
+            "x_mdd": float(xmdd[j]),
+            "max_drawdown": float(mdd[j]),
+            "turnover": float(turnover[j]),
+        }
+    return out
+
+
 def cuda_sweep_window(bars: dict, params_list: list[dict],
                       warmup_until: int) -> list[dict]:
     """GPU 批量回测: 一组参数 -> 一个线程, 按周期分组各一次 launch
@@ -749,24 +847,14 @@ def cuda_sweep_window(bars: dict, params_list: list[dict],
             low2s[j] = float(p.get("low2", 1.0))
             high1s[j] = float(p.get("high1", 1.5))
             high2s[j] = float(p.get("high2", 0.5))
-        out_cash = cp.empty(m, cp.float64)
-        out_pos = cp.empty(m, cp.float64)
-        out_last = cp.empty(m, cp.float64)
-        out_ntrades = cp.empty(m, cp.int64)
-        out_nbuy = cp.empty(m, cp.int64)
-        out_nsell = cp.empty(m, cp.int64)
-        out_mdd = cp.empty(m, cp.float64)
-        out_turnover = cp.empty(m, cp.float64)
-        out_dsum = cp.empty(m, cp.float64)
-        out_dsum2 = cp.empty(m, cp.float64)
-        out_dn = cp.empty(m, cp.int64)
-        out_xmdd = cp.empty(m, cp.float64)
-        out_dneg_sum2 = cp.empty(m, cp.float64)
-        out_dneg_n = cp.empty(m, cp.int64)
-        out_init_equity = cp.empty(m, cp.float64)
-        out_peak_ts = cp.empty(m, cp.int64)
-        out_valley_ts = cp.empty(m, cp.int64)
-        out_recovered = cp.empty(m, cp.int32)
+        _out = _alloc_gpu_outputs(m)
+        out_cash = _out["out_cash"]; out_pos = _out["out_pos"]; out_last = _out["out_last"]
+        out_ntrades = _out["out_ntrades"]; out_nbuy = _out["out_nbuy"]; out_nsell = _out["out_nsell"]
+        out_mdd = _out["out_mdd"]; out_turnover = _out["out_turnover"]
+        out_dsum = _out["out_dsum"]; out_dsum2 = _out["out_dsum2"]; out_dn = _out["out_dn"]
+        out_xmdd = _out["out_xmdd"]; out_dneg_sum2 = _out["out_dneg_sum2"]; out_dneg_n = _out["out_dneg_n"]
+        out_init_equity = _out["out_init_equity"]
+        out_peak_ts = _out["out_peak_ts"]; out_valley_ts = _out["out_valley_ts"]; out_recovered = _out["out_recovered"]
 
         threads = 256
         blocks = (m + threads - 1) // threads
@@ -812,77 +900,13 @@ def cuda_sweep_window(bars: dict, params_list: list[dict],
         valley_ts = out_valley_ts.get()
         recovered = out_recovered.get()
 
-        # 年数: 与 kernel.summarize 同式 (首末策略期 bar 的自然日差 / 365.25)
-        stime = bars["stime"]
-        years = 0.0
-        idx0 = int(np.searchsorted(stime, int(warmup_until)))
-        if idx0 < len(stime) and stime[-1] > stime[idx0]:
-            from .kernel import encoded_to_epoch
-            years = ((encoded_to_epoch(int(stime[-1])) - encoded_to_epoch(int(stime[idx0])))
-                     / (365.25 * 86400.0))
-
-        for j, i in enumerate(idxs):
-            p = params_list[i]
-            init_cash = float(p.get("init_cash", INIT_CASH))
-            init_position = float(p.get("init_position", INIT_POSITION))
-            baseline = init_cash + init_position * float(last[j])
-            equity = float(cash[j]) + float(pos[j]) * float(last[j])
-            diff = equity - baseline
-            pct = (diff / baseline * 100) if baseline else 0
-            ann = (pct / years) if years > 0 else 0.0
-            sharpe = 0.0
-            if dn[j] >= 2:
-                mean_d = dsum[j] / dn[j]
-                var_d = dsum2[j] / dn[j] - mean_d * mean_d
-                if var_d > 0.0:
-                    sharpe = mean_d / var_d ** 0.5 * 252.0 ** 0.5
-            # Sortino: 仅下行 (d<0)
-            sortino = 0.0
-            if dneg_n[j] >= 1 and dn[j] >= 1:
-                mean_d = dsum[j] / dn[j]
-                dn_var = dneg_sum2[j] / dneg_n[j]
-                if dn_var > 0.0:
-                    sortino = mean_d / dn_var ** 0.5 * 252.0 ** 0.5
-            # CAGR
-            cagr = 0.0
-            ieq = float(init_eq[j]) if init_eq[j] > 0.0 else (init_cash + init_position * float(last[j]))
-            if ieq > 0.0 and years > 0.0:
-                ratio = equity / ieq
-                if ratio > 0.0:
-                    cagr = (ratio ** (1.0 / years) - 1.0) * 100.0
-            # Calmar
-            calmar = 0.0
-            if mdd[j] > 1e-9:
-                calmar = ann / (float(mdd[j]) * 100.0)
-            # 最大回撤持续天数
-            dd_days = 0.0
-            if int(peak_ts[j]) > 0 and int(valley_ts[j]) >= int(peak_ts[j]):
-                end_ts = int(stime[-1]) if int(recovered[j]) == 0 else int(valley_ts[j])
-                if end_ts >= int(peak_ts[j]):
-                    dd_days = (encoded_to_epoch(end_ts) - encoded_to_epoch(int(peak_ts[j]))) / 86400.0
-            results[i] = {
-                "final_price": float(last[j]),
-                "n_trades": int(ntr[j]),
-                "n_buy": int(nbuy[j]),
-                "n_sell": int(nsell[j]),
-                "final_cash": float(cash[j]),
-                "final_position": float(pos[j]),
-                "final_equity": equity,
-                "baseline": baseline,
-                "excess": diff,
-                "excess_pct": pct,
-                "years": years,
-                "ann_excess_pct": ann,
-                "sharpe_excess": sharpe,
-                "sortino_excess": sortino,
-                "cagr": cagr,
-                "calmar": calmar,
-                "max_dd_days": dd_days,
-                "max_dd_recovered": bool(int(recovered[j])),
-                "x_mdd": float(xmdd[j]),
-                "max_drawdown": float(mdd[j]),
-                "turnover": float(turnover[j]),
-            }
+        # 汇总: 与 kernel.summarize 同口径 (公式集中在 _collect_gpu_results)
+        for _i, _m in _collect_gpu_results(
+            bars, params_list, idxs, warmup_until,
+            cash, pos, last, ntr, nbuy, nsell, mdd, turnover,
+            dsum, dsum2, dn, xmdd, dneg_sum2, dneg_n, init_eq,
+            peak_ts, valley_ts, recovered).items():
+            results[_i] = _m
     return results
 
 
@@ -960,24 +984,14 @@ def cuda_sweep_window_generic(bars: dict, params_list: list[dict],
         d_tf1s = cp.asarray(tf1s)
 
         # 输出数组
-        out_cash = cp.empty(m, cp.float64)
-        out_pos = cp.empty(m, cp.float64)
-        out_last = cp.empty(m, cp.float64)
-        out_ntrades = cp.empty(m, cp.int64)
-        out_nbuy = cp.empty(m, cp.int64)
-        out_nsell = cp.empty(m, cp.int64)
-        out_mdd = cp.empty(m, cp.float64)
-        out_turnover = cp.empty(m, cp.float64)
-        out_dsum = cp.empty(m, cp.float64)
-        out_dsum2 = cp.empty(m, cp.float64)
-        out_dn = cp.empty(m, cp.int64)
-        out_xmdd = cp.empty(m, cp.float64)
-        out_dneg_sum2 = cp.empty(m, cp.float64)
-        out_dneg_n = cp.empty(m, cp.int64)
-        out_init_equity = cp.empty(m, cp.float64)
-        out_peak_ts = cp.empty(m, cp.int64)
-        out_valley_ts = cp.empty(m, cp.int64)
-        out_recovered = cp.empty(m, cp.int32)
+        _out = _alloc_gpu_outputs(m)
+        out_cash = _out["out_cash"]; out_pos = _out["out_pos"]; out_last = _out["out_last"]
+        out_ntrades = _out["out_ntrades"]; out_nbuy = _out["out_nbuy"]; out_nsell = _out["out_nsell"]
+        out_mdd = _out["out_mdd"]; out_turnover = _out["out_turnover"]
+        out_dsum = _out["out_dsum"]; out_dsum2 = _out["out_dsum2"]; out_dn = _out["out_dn"]
+        out_xmdd = _out["out_xmdd"]; out_dneg_sum2 = _out["out_dneg_sum2"]; out_dneg_n = _out["out_dneg_n"]
+        out_init_equity = _out["out_init_equity"]
+        out_peak_ts = _out["out_peak_ts"]; out_valley_ts = _out["out_valley_ts"]; out_recovered = _out["out_recovered"]
 
         threads = 256
         blocks = (m + threads - 1) // threads
@@ -1016,77 +1030,11 @@ def cuda_sweep_window_generic(bars: dict, params_list: list[dict],
         peak_ts = out_peak_ts.get(); valley_ts = out_valley_ts.get()
         recovered = out_recovered.get()
 
-        stime = bars["stime"]
-        years = 0.0
-        idx0 = int(np.searchsorted(stime, int(warmup_until)))
-        if idx0 < len(stime) and stime[-1] > stime[idx0]:
-            from .kernel import encoded_to_epoch
-            years = ((encoded_to_epoch(int(stime[-1])) - encoded_to_epoch(int(stime[idx0])))
-                     / (365.25 * 86400.0))
-
-        for j, i in enumerate(idxs):
-            p = params_list[i]
-            init_cash = float(p.get("init_cash", 200000.0))
-            init_position = float(p.get("init_position", 200000.0))
-            baseline = init_cash + init_position * float(last[j])
-            equity = float(cash[j]) + float(pos[j]) * float(last[j])
-            diff = equity - baseline
-            pct = (diff / baseline * 100.0) if baseline else 0.0
-            ann = (pct / years) if years > 0 else 0.0
-            sharpe = 0.0
-            if dn[j] >= 2:
-                mean_d = dsum[j] / dn[j]
-                var_d = dsum2[j] / dn[j] - mean_d * mean_d
-                if var_d > 0.0:
-                    sharpe = mean_d / var_d ** 0.5 * 252.0 ** 0.5
-            sortino = 0.0
-            if dneg_n[j] >= 1 and dn[j] >= 1:
-                mean_d = dsum[j] / dn[j]
-                dn_var = dneg_sum2[j] / dneg_n[j]
-                if dn_var > 0.0:
-                    sortino = mean_d / dn_var ** 0.5 * 252.0 ** 0.5
-            ieq = float(init_eq[j]) if init_eq[j] > 0.0 else (
-                init_cash + init_position * float(last[j]))
-            cagr = 0.0
-            if ieq > 0.0 and years > 0.0:
-                ratio = equity / ieq
-                if ratio > 0.0:
-                    cagr = (ratio ** (1.0 / years) - 1.0) * 100.0
-            calmar = 0.0
-            if mdd[j] > 1e-9:
-                calmar = ann / (float(mdd[j]) * 100.0)
-            dd_days = 0.0
-            if int(peak_ts[j]) > 0 and int(valley_ts[j]) >= int(peak_ts[j]):
-                end_ts = int(stime[-1]) if int(recovered[j]) == 0 else int(valley_ts[j])
-                if end_ts >= int(peak_ts[j]):
-                    from .kernel import encoded_to_epoch
-                    dd_days = (encoded_to_epoch(end_ts) - encoded_to_epoch(int(peak_ts[j]))) / 86400.0
-            results[i] = {
-                "final_price": float(last[j]),
-                "n_trades": int(ntr[j]),
-                "n_buy": int(nbuy[j]),
-                "n_sell": int(nsell[j]),
-                "final_cash": float(cash[j]),
-                "final_position": float(pos[j]),
-                "final_equity": equity,
-                "baseline": baseline,
-                "excess": diff,
-                "excess_pct": pct,
-                "years": years,
-                "ann_excess_pct": ann,
-                "sharpe_excess": sharpe,
-                "sortino_excess": sortino,
-                "cagr": cagr,
-                "calmar": calmar,
-                "max_dd_days": dd_days,
-                "max_dd_recovered": bool(int(recovered[j])),
-                "x_mdd": float(xmdd[j]),
-                "max_drawdown": float(mdd[j]),
-                "turnover": float(turnover[j]),
-            }
+        # 拉回 host, 与 cuda_sweep_window 同样的口径汇总 (公式集中在 _collect_gpu_results)
+        for _i, _m in _collect_gpu_results(
+            bars, params_list, idxs, warmup_until,
+            cash, pos, last, ntr, nbuy, nsell, mdd, turnover,
+            dsum, dsum2, dn, xmdd, dneg_sum2, dneg_n, init_eq,
+            peak_ts, valley_ts, recovered).items():
+            results[_i] = _m
     return results
-
-
-if __name__ == "__main__":
-    for k, v in gpu_info().items():
-        print(f"{k:12s}: {v}")

@@ -190,10 +190,7 @@ def pick_best_row(df, strategy_name: str):
         "filter_pass": bool(chosen.get("filter_pass", False)),
         "candidate_total": int(len(work)),
         "chosen_params": {k: chosen[k] for k in chosen.index
-                          if k in {"low1", "low2", "high1", "high2",
-                                   "lookback", "breakout_pct",
-                                   "entry_dev", "exit_dev"}
-                          or _is_strategy_param(k, strategy_name)},
+                          if _is_strategy_param(k, strategy_name)},
     }
     if runner_up is not None:
         reason["runner_up_score"] = float(runner_up["score"])

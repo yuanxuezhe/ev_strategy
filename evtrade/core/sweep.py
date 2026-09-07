@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 from .kernel import make_state, run_backtest, summarize
-from .kernel_dsl import run_one_dsl, strategy_has_dsl
+from .kernel_dsl import _EMPTY_F, _EMPTY_SIG, run_one_dsl, strategy_has_dsl
 from ..frozen.timeutils import resolve_period_seconds as period_seconds
 
 GRID_KEYS = ("low1", "low2", "high1", "high2", "tf1", "period", "trade_qty", "scale",
@@ -70,9 +70,6 @@ def parse_grid(specs: list, extra_keys: set[str] | None = None) -> list[dict]:
                 combo[k] = float(raw)
         combos.append(combo)
     return combos
-
-_EMPTY_SIG = np.empty(0, np.int8)
-_EMPTY_F = np.empty(0, np.float64)
 
 
 def run_one(bars: dict, period: str, warmup_until: int, tf1: int,
@@ -165,12 +162,15 @@ def run_one_general(bars: dict, period: str, warmup_until: int,
     diff = eq - baseline
     pct = (diff / baseline * 100.0) if baseline else 0.0
 
+    # 年数口径与 kernel.summarize / GPU _collect_gpu_results 一致:
+    # 首个 mark=1 (>= warmup_until) 的 bar 到末根, 不含预热段。
+    from .kernel import encoded_to_epoch
+    stime = bars["stime"]
     years = 0.0
-    if len(bars["stime"]) >= 2:
-        from .kernel import encoded_to_epoch
-        e0 = encoded_to_epoch(int(bars["stime"][0]))
-        e1 = encoded_to_epoch(int(bars["stime"][-1]))
-        years = (e1 - e0) / (365.25 * 86400.0)
+    idx0 = int(np.searchsorted(stime, int(warmup_until)))
+    if idx0 < len(stime) and stime[-1] > stime[idx0]:
+        years = ((encoded_to_epoch(int(stime[-1])) - encoded_to_epoch(int(stime[idx0])))
+                 / (365.25 * 86400.0))
 
     ann_excess = (pct / years) if years > 0 else 0.0
     return {
@@ -186,6 +186,8 @@ def run_one_general(bars: dict, period: str, warmup_until: int,
         "excess_pct": pct,
         "years": years,
         "ann_excess_pct": ann_excess,
+        # 参考引擎未追踪逐日权益曲线, 以下指标仅 kernel/GPU 路径计算;
+        # 此处占位 0.0/True, 与 _empty_metrics 一致 (口径缺口, 待参考层补权益序列后统一)。
         "sharpe_excess": 0.0,
         "sortino_excess": 0.0,
         "cagr": 0.0,
@@ -361,7 +363,7 @@ def sweep(bars: dict, base: dict, combos: list[dict],
         # 仅 DSL 路径需要预热; 无 DSL / use_general 走纯 Python, 无 numba 编译。
         if use_general and dsl_fast:
             try:
-                from .kernel_dsl import _EMPTY_F, _EMPTY_SIG, dsl_kernel, make_state_general
+                from .kernel_dsl import dsl_kernel, make_state_general
                 _first_p = params_list[0]
                 _kmod = dsl_kernel(strategy_name)
                 _probe_st = make_state_general(

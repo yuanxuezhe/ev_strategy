@@ -22,16 +22,7 @@ import evtrade.cli as cli
 from evtrade.strategies import _defaults_loader as dl
 
 
-# ---------- 测试夹具: 用临时目录隔离落盘 ----------
-
-@pytest.fixture
-def isolated_defaults(tmp_path, monkeypatch):
-    """让默认目录指向 tmp_path, 避免污染真实 _defaults/"""
-    monkeypatch.setenv("EVTRADE_DEFAULTS_DIR", str(tmp_path))
-    # 同时清掉 _RUNNER_BY_KEY 避免缓存影响
-    from evtrade.strategies.dsl import _RUNNER_BY_KEY
-    _RUNNER_BY_KEY.clear()
-    return tmp_path
+# ---------- 测试夹具: isolated_defaults 由 tests/conftest.py 提供 ----------
 
 
 # ---------- save / show / list 内部调用 ----------

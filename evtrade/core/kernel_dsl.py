@@ -33,11 +33,11 @@ GPU 对应端: gpu.py::_CUDA_SOURCE_GENERIC_TEMPLATE + render_cuda_device_functi
 由 cuda_sweep_window_generic(..., strategy_name=...) 使用。
 ================================================================
 """
-import functools
 import hashlib
 import inspect
 import sys
 import textwrap
+import threading
 import types
 
 import numpy as np
@@ -84,19 +84,28 @@ def strategy_has_dsl(strategy_name: str) -> bool:
 _KERNEL_DSL_CACHE: dict = {}
 
 
+def _invalidate_cache(cache: dict, strategy_name: str | None = None) -> int:
+    """通用缓存清除: 按 strategy_name 过滤 keys 并 pop, None 时清空全部。
+
+    kernel_dsl / gpu 的缓存失效共用此实现 (两处原先各写一份相同逻辑)。
+    返回清除的条目数。
+    """
+    if strategy_name is None:
+        n = len(cache)
+        cache.clear()
+        return n
+    keys = [k for k in cache if k[0] == strategy_name]
+    for k in keys:
+        cache.pop(k, None)
+    return len(keys)
+
+
 def invalidate_dsl_cache(strategy_name: str | None = None) -> int:
     """清除 DSL 内核缓存; strategy_name=None 时清空全部
 
     返回清除的条目数, 方便测试断言与日志。
     """
-    if strategy_name is None:
-        n = len(_KERNEL_DSL_CACHE)
-        _KERNEL_DSL_CACHE.clear()
-        return n
-    keys = [k for k in _KERNEL_DSL_CACHE if k[0] == strategy_name]
-    for k in keys:
-        _KERNEL_DSL_CACHE.pop(k, None)
-    return len(keys)
+    return _invalidate_cache(_KERNEL_DSL_CACHE, strategy_name)
 
 
 def _build_dsl_kernel_impl(strategy_name: str, source_hash: str):
@@ -127,8 +136,7 @@ def _build_dsl_kernel_impl(strategy_name: str, source_hash: str):
 
 # 单飞锁: 并发首 miss 时, 同一 key 只有第一个线程进 _build_dsl_kernel_impl,
 # 其它线程拿到它的结果, 避免重复 splice+exec 与 sys.modules 竞态。
-_BUILD_LOCKS: dict = {}
-_BUILD_LOCKS_GUARD = functools.lru_cache(maxsize=None)(lambda: __import__("threading").RLock())
+_BUILD_LOCK = threading.RLock()
 
 
 def build_dsl_kernel(strategy_name: str):
@@ -145,8 +153,7 @@ def build_dsl_kernel(strategy_name: str):
     if mod is not None:
         return mod
     # 单飞: 同 key 的并发首 miss 串行化
-    lock = _BUILD_LOCKS_GUARD()
-    with lock:
+    with _BUILD_LOCK:
         mod = _KERNEL_DSL_CACHE.get(key)
         if mod is not None:
             return mod

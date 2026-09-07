@@ -49,6 +49,8 @@ from numba import njit
 from numba.experimental import jitclass
 from numba.types import boolean, float64, int64, int8
 
+from ..frozen.timeutils import resolve_period_seconds  # 委托冻结层; 保留此名供 ``from evtrade.kernel import resolve_period_seconds`` 路径导入
+
 
 # ============ 时间戳: 14位整数 <-> epoch 秒 (纯整数历法) ============
 
@@ -120,17 +122,6 @@ def bucket_ts_encoded(t: int64, period_seconds: int64) -> int64:
     if e == e0:
         return epoch_to_encoded(e0)
     return epoch_to_encoded(e0 + period_seconds)
-
-
-def resolve_period_seconds(period: str) -> int:
-    """周期字符串 -> 秒数 (委托 frozen.timeutils, 带格式校验)"""
-    from ..frozen.timeutils import resolve_period_seconds as _resolve
-    return _resolve(period)
-
-
-def warmup_until_int(start_ymd: str) -> int64:
-    """策略起始日 -> mark 阈值整数 (YYYYMMDD000000); 0 表示无预热"""
-    return int(start_ymd) * 1000000
 
 
 # ============ EMA 标量助手 (与 IncrementalEMA 同一表达式) ============

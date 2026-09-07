@@ -88,15 +88,6 @@ def _fetch(code: str, start_ymd: str, end_ymd: str, db_url: str):
     return df
 
 
-def arrays_to_bars(arrays: dict, code: str = "SYN") -> list[Bar]:
-    """内核数组 -> list[Bar] (参考引擎/测试用)"""
-    return [Bar(stime=str(int(arrays["stime"][i])), code=code,
-                open=float(arrays["open"][i]), high=float(arrays["high"][i]),
-                low=float(arrays["low"][i]), close=float(arrays["close"][i]),
-                volume=int(arrays["volume"][i]))
-            for i in range(len(arrays["stime"]))]
-
-
 # ============ 合成数据 (确定性, 无库环境测试/演示) ============
 
 def synthetic_bars(days: int = 30, start_ymd: str = "20250101", seed: int = 42,

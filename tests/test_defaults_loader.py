@@ -10,12 +10,6 @@ import pytest
 import evtrade.strategies._defaults_loader as dl
 
 
-@pytest.fixture
-def isolated_defaults(tmp_path, monkeypatch):
-    monkeypatch.setenv("EVTRADE_DEFAULTS_DIR", str(tmp_path))
-    return tmp_path
-
-
 # ---------- 基础存在性 / 路径 ----------
 
 
