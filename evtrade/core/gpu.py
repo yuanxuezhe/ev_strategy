@@ -55,7 +55,47 @@ from .kernel_dsl import _invalidate_cache, _source_hash as _source_hash_gpu
 # 所有 DSL 策略 (含 channel_deviation) 统一走下方 _CUDA_SOURCE_GENERIC_TEMPLATE
 # (cuda_sweep_window_generic)。
 
+# Python 原生类型 -> CUDA 类型 (与 strategies/dsl._PY_TYPE_TO_CUDA 同源)
+_PY_TYPE_TO_CUDA = {bool: "int", int: "long long", float: "double"}
 
+
+def _build_cuda_state_decls(strategy_name: str) -> str:
+    """生成 CUDA kernel 内的 state_spec 字段声明 (按 strategy.state_spec 顺序)
+
+    输出格式: 每个字段一行 "{ctype} {name} = {default};", 嵌入模板主循环前的
+    寄存器声明区。空 state_spec 时返回空字符串。
+    """
+    from ..strategies import get_strategy_state_spec
+    state_spec = get_strategy_state_spec(strategy_name)
+    lines = []
+    for name, schema in state_spec.items():
+        ctype = _PY_TYPE_TO_CUDA[schema["type"]]
+        default = schema["default"]
+        if isinstance(default, bool):
+            lit = "1" if default else "0"
+        elif isinstance(default, int):
+            lit = str(default)
+        elif isinstance(default, float):
+            if default != default:  # NaN
+                lit = "__longlong_as_double((long long)0x7ff8000000000000ULL)"
+            else:
+                lit = repr(default)
+        else:
+            lit = repr(default)
+        lines.append(f"    {ctype} {name} = {lit};")
+    return "\n".join(lines)
+
+
+def _build_cuda_strategy_check_call(strategy_name: str) -> str:
+    """生成 strategy_check(...) 调用处的 state arg 列表 (按 state_spec 字段名顺序)
+
+    与 build_cuda_device_header(strategy_name) 生成的函数签名顺序一致 (state 字段
+    在前, 框架字段居中, p0..p7 在后); 此处只返回 state arg 部分 (逗号分隔),
+    模板调用处补上其余 11 个框架 arg + 8 个参数。
+    """
+    from ..strategies import get_strategy_state_spec
+    state_spec = get_strategy_state_spec(strategy_name)
+    return ", ".join(state_spec.keys())
 
 
 # ============ 通用 CUDA kernel: 策略段由 DSL 注入 (步骤 1/2) ============
@@ -65,7 +105,9 @@ from .kernel_dsl import _invalidate_cache, _source_hash as _source_hash_gpu
 # "提前返回跳过后续语句" 的语义与 Python/numba 端完全一致 (内联块做不到)。
 # 设计要点:
 #   - params 用 params_arr 索引 (p0..p7), 不写死策略参数名 → 任意 DSL 策略通用
-#   - 桶切换重置锁用 lock_ts != cur_ts 判断 (与 DSL 语义同式)
+#   - state_spec 字段由策略类声明; 本模板在编译期按 strategy_name 注入对应
+#     寄存器声明 ({STATE_DECLS}) 与 strategy_check 调用参数 ({STRATEGY_STATE_ARGS})
+#   - 桶切换重置锁用 state_spec 字段的"时间戳类"字段 != cur_ts 判断 (与 DSL 语义同式)
 #   - 回撤时间戳用 1m bar stime (与 CPU kernel.step 同口径)
 _CUDA_SOURCE_GENERIC_TEMPLATE = r"""
 // ==== 策略段: DSL 渲染的 __device__ 函数 (编译期注入, 见 strategies/dsl.py) ====
@@ -109,8 +151,8 @@ extern "C" __global__ void sweep_kernel_generic(
     long long cur_count = 0, cur_mark = 1;
     double up_sum = 0.0, dw_sum = 0.0, up_ema = nan_bits, dw_ema = nan_bits;
     long long up_count = 0, dw_count = 0;
-    int low_hit = 0, high_hit = 0, low_acted = 0, high_acted = 0;
-    long long lock_ts = 0;
+    // ---- 策略 state_spec 字段 (按 strategy_name 的 state_spec 注入) ----
+{STATE_DECLS}
     double cash = init_cash, position = init_position, last_price = 0.0;
     long long n_trades = 0, n_buy = 0, n_sell = 0;
     double turnover = 0.0, peak = 0.0, mdd = 0.0;
@@ -179,8 +221,8 @@ extern "C" __global__ void sweep_kernel_generic(
         else dw = cur_low * k_ema + dw_ema * (1.0 - k_ema);
 
         // ============ 策略段 (DSL device 函数; return 语义与 DSL 一致) ============
-        int signal = strategy_check(low_hit, high_hit, low_acted, high_acted,
-                                    lock_ts, cur_ts, cur_open, cur_high, cur_low,
+        int signal = strategy_check({STRATEGY_STATE_ARGS},
+                                    cur_ts, cur_open, cur_high, cur_low,
                                     cur_close, cur_vol, up, dw,
                                     p0, p1, p2, p3, p4, p5, p6, p7);
         // =========================================================================
@@ -307,7 +349,10 @@ def _compile_generic_kernel(strategy_name: str):
         strategy_func = render_cuda_device_function(cls)
     except CompileError as e:
         raise ValueError(f"策略 {strategy_name!r} 无法渲染到 CUDA: {e}") from e
-    src = _CUDA_SOURCE_GENERIC_TEMPLATE.replace("{STRATEGY_BODY}", strategy_func)
+    src = (_CUDA_SOURCE_GENERIC_TEMPLATE
+           .replace("{STRATEGY_BODY}", strategy_func)
+           .replace("{STATE_DECLS}", _build_cuda_state_decls(strategy_name))
+           .replace("{STRATEGY_STATE_ARGS}", _build_cuda_strategy_check_call(strategy_name)))
     if isinstance(cc_raw, (tuple, list)):
         archs = [f"compute_{cc_raw[0]}{cc_raw[1]}", "compute_90"]
     else:

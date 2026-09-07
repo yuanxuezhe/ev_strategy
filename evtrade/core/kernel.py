@@ -17,10 +17,13 @@ DSL 渲染契约 (唯一真相源在 strategies/dsl.py::_CTX_TO_KERNEL):
   ctx.p0..p15        -> st.p0..st.p15    (按策略 params_spec 声明顺序)
   ctx.cur_ts/high/low/close/open/volume -> st.cur_*
   ctx.up / ctx.dw    -> _strategy_check 的函数参数 (裸名)
-  ctx.low_hit / high_hit        -> st.low_hit / st.high_hit
-  ctx._low_acted / _high_acted  -> st.low_acted / st.high_acted
-  ctx._bucket_ts     -> st.lock_ts
+  state_spec 字段   -> st.<name>          (单名空间; 策略类声明, 框架层无 baked-in 字段)
   其余 ctx.x / 裸名 x -> 函数局部变量 (首次赋值前不可读)
+
+KernelState jitclass 工厂化 (2026-09-07, Phase 2 Commit 3):
+  状态字段由策略类 state_spec 声明; framework 层无硬编码。_STATE_SPEC / KernelState
+  块由 kernel_dsl.py 按策略 splice, 编译期注入 (numba 首次调用时 jitclass 重建)。
+  工厂: _build_kernel_state_source(strategy_name)。
 
 修改本文件**前**请读 kbs/12-重构与性能内核.md 第 2 节"流式内核"。
 通用部分的改动 (step / _ema_push / _execute / summarize / KernelState 字段)
@@ -160,7 +163,174 @@ def _ema_current(s_sum: float64, s_count: int64, s_ema: float64,
 
 
 # ============ 内核状态 (jitclass, 纯标量 + 可选成交记录) ============
+# 本尊 KernelState 无 state_spec 字段 (state 由策略类声明, 工厂化注入);
+# 真实执行路径走 kernel_dsl._build_dsl_kernel_impl, 按 strategy_name 拼出含
+# state_spec 字段的特化 KernelState (splice 注入下面的 KERNEL-STATE-CLASS 区间)。
+# 本尊保留为"无状态" jitclass 仅作向后兼容 (旧脚本/测试若直接调用 make_state
+# 走 step() 时, 信号恒为 0, 与策略段空模板一致; 真实执行请用 dsl_kernel(name))。
 
+# Python 原生类型 -> numba jitclass 类型 (单名空间, 策略 state_spec 直接消费)
+_STATE_TYPE_MAP = {bool: boolean, int: int64, float: float64}
+
+
+def _build_kernel_state_source(strategy_name: str) -> str:
+    """生成该策略专用的 _STATE_SPEC + KernelState jitclass 源码 (含 state_spec 字段)
+
+    字段类型映射: bool → boolean, int → int64, float → float64 (与 strategies/dsl._PY_TYPE_TO_NUMBA 同源);
+    __init__ 末尾按 state_spec.default 初始化每个字段。
+
+    供 kernel_dsl.py 在 exec 前 splice 注入 KERNEL-STATE-CLASS-BEGIN/END 区间;
+    numba 首次调用时按新 spec 重建 jitclass (后续走 cache)。"""
+    from ..strategies import get_strategy_state_spec
+    state_spec = get_strategy_state_spec(strategy_name)
+    state_decl_lines = []
+    state_init_lines = []
+    for name, schema in state_spec.items():
+        nb_type_name = (
+            "boolean" if schema["type"] is bool
+            else "int64" if schema["type"] is int
+            else "float64"
+        )
+        state_decl_lines.append(f'    ("{name}", {nb_type_name}),')
+        default = schema["default"]
+        state_init_lines.append(f"        self.{name} = {default!r}")
+    state_decl_block = "\n".join(state_decl_lines) if state_decl_lines else "    # (无 state_spec 字段)"
+    state_init_block = "\n".join(state_init_lines) if state_init_lines else "        pass  # (无 state_spec 字段)"
+    # 注: 外层 f-string 用 '''...''' 三单引号; 内层 docstring 用 """..."""
+    # 三双引号 (Python 词法允许同向单/双三引号共存)。
+    return f'''\
+_STATE_SPEC = [
+    # -- 周期/策略/资金 配置 --
+    ("period_seconds", int64),
+    ("warmup_until", int64), ("tf1", int64),
+    # 通用策略参数 (按 params_spec 顺序; p0..p15, 任意策略用)
+    ("p0", float64), ("p1", float64), ("p2", float64), ("p3", float64),
+    ("p4", float64), ("p5", float64), ("p6", float64), ("p7", float64),
+    ("p8", float64), ("p9", float64), ("p10", float64), ("p11", float64),
+    ("p12", float64), ("p13", float64), ("p14", float64), ("p15", float64),
+    ("init_cash", float64), ("init_position", float64), ("trade_qty", float64),
+    ("scale", float64), ("last_side", int64), ("cur_qty", float64),
+    # -- 资金模式 (阶段 2: --all-in / --buy-pct / --sell-pct) --
+    ("buy_pct", float64), ("sell_pct", float64), ("all_in", boolean),
+    # -- 聚合器: 当前桶 --
+    ("has_cur", boolean), ("cur_ts", int64),
+    ("cur_open", float64), ("cur_high", float64), ("cur_low", float64),
+    ("cur_close", float64), ("cur_volume", float64), ("cur_count", int64),
+    ("cur_mark", int64),
+    # -- EMA 通道 --
+    ("up_sum", float64), ("up_count", int64), ("up_ema", float64),
+    ("dw_sum", float64), ("dw_count", int64), ("dw_ema", float64),
+    # -- 策略 state_spec 字段 (按 {strategy_name!r} 的 state_spec) --
+{state_decl_block}
+    # -- 账户 --
+    ("cash", float64), ("position", float64), ("last_price", float64),
+    # -- 绩效统计 (扫描选参用) --
+    ("n_trades", int64), ("n_buy", int64), ("n_sell", int64),
+    ("turnover", float64),
+    ("peak_equity", float64), ("max_drawdown", float64),
+    ("peak_eq_ts", int64), ("valley_eq_ts", int64), ("recovered", boolean),
+    # -- 绩效统计: 超额曲线 --
+    ("cur_day", int64), ("day_init", boolean),
+    ("x_day_end", float64), ("x_day_end_prev", float64), ("day_end_init", boolean),
+    ("d_sum", float64), ("d_sum2", float64), ("d_n", int64),
+    ("d_neg_sum2", float64), ("d_neg_n", int64),
+    ("x_peak", float64), ("x_mdd", float64),
+    ("first_ts", int64), ("last_ts", int64), ("first_ts_set", boolean),
+    ("init_equity", float64),
+    # -- 成交记录 (可选) --
+    ("record_trades", boolean),
+    ("trade_ts", int64[:]), ("trade_side", int8[:]), ("trade_qty_a", float64[:]),
+    ("trade_price", float64[:]), ("trade_cash_after", float64[:]),
+]
+
+
+@jitclass(_STATE_SPEC)
+class KernelState:
+    """单次回测/实盘会话的全部状态 (每线程独立, 天然并发安全)
+
+    state_spec 字段: 按策略类 state_spec 注入 (本策略 {strategy_name!r}):
+      {sorted(state_spec.keys())!r}
+    """
+
+    def __init__(self, period_seconds, warmup_until, tf1,
+                 init_cash, init_position, trade_qty, scale,
+                 buy_pct, sell_pct, all_in,
+                 record_trades, trade_cap,
+                 p0=0.0, p1=0.0, p2=0.0, p3=0.0,
+                 p4=0.0, p5=0.0, p6=0.0, p7=0.0,
+                 p8=0.0, p9=0.0, p10=0.0, p11=0.0,
+                 p12=0.0, p13=0.0, p14=0.0, p15=0.0):
+        self.period_seconds = period_seconds
+        self.warmup_until = warmup_until
+        self.tf1 = tf1
+        self.p0, self.p1, self.p2, self.p3 = p0, p1, p2, p3
+        self.p4, self.p5, self.p6, self.p7 = p4, p5, p6, p7
+        self.p8, self.p9, self.p10, self.p11 = p8, p9, p10, p11
+        self.p12, self.p13, self.p14, self.p15 = p12, p13, p14, p15
+        self.init_cash = init_cash
+        self.init_position = init_position
+        self.trade_qty = trade_qty
+        self.scale = scale
+        self.last_side = 0
+        self.cur_qty = trade_qty
+        self.buy_pct = buy_pct
+        self.sell_pct = sell_pct
+        self.all_in = all_in
+        self.has_cur = False
+        self.cur_ts = 0
+        self.cur_open = 0.0
+        self.cur_high = 0.0
+        self.cur_low = 0.0
+        self.cur_close = 0.0
+        self.cur_volume = 0.0
+        self.cur_count = 0
+        self.cur_mark = 1
+        self.up_sum = 0.0
+        self.up_count = 0
+        self.up_ema = np.nan
+        self.dw_sum = 0.0
+        self.dw_count = 0
+        self.dw_ema = np.nan
+        # state_spec 字段 (按 {strategy_name!r} 的 state_spec)
+{state_init_block}
+        self.cash = init_cash
+        self.position = init_position
+        self.last_price = 0.0
+        self.n_trades = 0
+        self.n_buy = 0
+        self.n_sell = 0
+        self.turnover = 0.0
+        self.peak_equity = 0.0
+        self.max_drawdown = 0.0
+        self.peak_eq_ts = 0
+        self.valley_eq_ts = 0
+        self.recovered = True
+        self.cur_day = 0
+        self.day_init = False
+        self.x_day_end = 0.0
+        self.x_day_end_prev = np.nan
+        self.day_end_init = False
+        self.d_sum = 0.0
+        self.d_sum2 = 0.0
+        self.d_n = 0
+        self.d_neg_sum2 = 0.0
+        self.d_neg_n = 0
+        self.x_peak = -1.0e18
+        self.x_mdd = 0.0
+        self.first_ts = 0
+        self.last_ts = 0
+        self.first_ts_set = False
+        self.init_equity = 0.0
+        self.record_trades = record_trades
+        self.trade_ts = np.empty(trade_cap, np.int64)
+        self.trade_side = np.empty(trade_cap, np.int8)
+        self.trade_qty_a = np.empty(trade_cap, np.float64)
+        self.trade_price = np.empty(trade_cap, np.float64)
+        self.trade_cash_after = np.empty(trade_cap, np.float64)
+'''
+
+
+# ==== KERNEL-STATE-CLASS-BEGIN (kernel_dsl.py 按 strategy_name 整段替换) ====
 _STATE_SPEC = [
     # -- 周期/策略/资金 配置 --
     ("period_seconds", int64),
@@ -184,10 +354,6 @@ _STATE_SPEC = [
     # -- EMA 通道 (上/下轨各一组增量状态) --
     ("up_sum", float64), ("up_count", int64), ("up_ema", float64),
     ("dw_sum", float64), ("dw_count", int64), ("dw_ema", float64),
-    # -- 策略锁存状态 --
-    ("low_hit", boolean), ("high_hit", boolean),
-    ("lock_ts", int64),
-    ("low_acted", boolean), ("high_acted", boolean),
     # -- 账户 --
     ("cash", float64), ("position", float64), ("last_price", float64),
     # -- 绩效统计 (内核新增: 扫描选参用) --
@@ -212,9 +378,10 @@ _STATE_SPEC = [
 
 @jitclass(_STATE_SPEC)
 class KernelState:
-    """单次回测/实盘会话的全部状态 (每线程独立, 天然并发安全)
+    """单次回测/实盘会话的全部状态 (无 state_spec; 本尊仅作向后兼容)
 
-    p0..p15: 通用策略参数 (按策略的 params_spec 声明顺序填入; 任意 DSL 策略同路径)
+    真实执行请用 dsl_kernel(name): kernel_dsl 会按 strategy_name 拼出含
+    state_spec 字段的特化 KernelState (splice 注入上面的 KERNEL-STATE-CLASS 区间)。
     """
 
     def __init__(self, period_seconds, warmup_until, tf1,
@@ -256,11 +423,6 @@ class KernelState:
         self.dw_sum = 0.0
         self.dw_count = 0
         self.dw_ema = np.nan
-        self.low_hit = False
-        self.high_hit = False
-        self.lock_ts = 0
-        self.low_acted = False
-        self.high_acted = False
         self.cash = init_cash
         self.position = init_position
         self.last_price = 0.0
@@ -295,6 +457,7 @@ class KernelState:
         self.trade_qty_a = np.empty(trade_cap, np.float64)
         self.trade_price = np.empty(trade_cap, np.float64)
         self.trade_cash_after = np.empty(trade_cap, np.float64)
+# ==== KERNEL-STATE-CLASS-END ====
 
 
 # ============ 策略状态机 (DSL 渲染目标; 本尊函数体为空) ============

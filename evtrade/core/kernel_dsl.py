@@ -20,14 +20,19 @@ from __future__ import annotations
   tests/test_dsl_spliced_channel_deviation_bitwise 等价锁定:
     特化模块 = Python ref 引擎 (ChannelDeviationStrategy.check)。
 
-ctx 字段契约 (DSL -> 内核, 唯一事实源在 strategies/dsl.py::_CTX_TO_KERNEL):
+ctx 字段契约 (DSL -> 内核, 唯一事实源在 strategies/dsl.py::build_ctx_to_kernel_map):
   ctx.p0..p15        -> st.p0..st.p15    (按策略 params_spec 声明顺序)
   ctx.cur_ts/high/low/close/open/volume -> st.cur_*
   ctx.up / ctx.dw    -> _strategy_check 的函数参数 (裸名)
-  ctx.low_hit / high_hit        -> st.low_hit / st.high_hit
-  ctx._low_acted / _high_acted  -> st.low_acted / st.high_acted
-  ctx._bucket_ts     -> st.lock_ts
+  state_spec 字段   -> st.<name>          (单名空间; 策略类声明, 框架层无 baked-in 字段)
   其余 ctx.x / 裸名 x -> 函数局部变量 (首次赋值前不可读)
+
+splice 注入 (Phase 2 Commit 3):
+  本模块同时替换两段:
+    1. kernel._STATE_SPEC + KernelState 类 (KERNEL-STATE-CLASS 区间): 按策略 state_spec
+       注入对应 jitclass 字段 (__init__ 末尾按 default 初始化); numba 首次调用
+       时按新 spec 重建 jitclass, 后续走 cache。
+    2. kernel._strategy_check 函数体 (DSL-STRATEGY 区间): DSL body 渲染产物。
 
 GPU 对应端: gpu.py::_CUDA_SOURCE_GENERIC_TEMPLATE + render_cuda_device_function,
 由 cuda_sweep_window_generic(..., strategy_name=...) 使用。
@@ -45,6 +50,11 @@ import numpy as np
 # kernel.py 中整段替换的标记前缀 (与 kernel._strategy_check 内的注释一致)
 _SPLICE_BEGIN = "# ==== DSL-STRATEGY-BEGIN"
 _SPLICE_END = "# ==== DSL-STRATEGY-END"
+
+# kernel.py 中 KernelState jitclass 块的整段替换标记 (按 strategy_name 注入
+# state_spec 字段); 与 _SPLICE_BEGIN/END 配对使用。
+_STATE_CLASS_BEGIN = "# ==== KERNEL-STATE-CLASS-BEGIN"
+_STATE_CLASS_END = "# ==== KERNEL-STATE-CLASS-END"
 
 _EMPTY_SIG = np.empty(0, np.int8)
 _EMPTY_F = np.empty(0, np.float64)
@@ -111,16 +121,29 @@ def invalidate_dsl_cache(strategy_name: str | None = None) -> int:
 def _build_dsl_kernel_impl(strategy_name: str, source_hash: str):
     """实际 splice + exec; 由 build_dsl_kernel 持有单飞锁调用"""
     from . import kernel
-    from ..strategies import get_strategy_class
+    from ..strategies import get_strategy_class, get_strategy_state_spec
     from ..strategies.dsl import render_numba_state_body
 
-    body = render_numba_state_body(get_strategy_class(strategy_name)).strip("\n")
+    cls = get_strategy_class(strategy_name)
+    state_spec = get_strategy_state_spec(strategy_name)
+
+    # 1) 注入 DSL 策略段 (DSL body 渲染产物 -> _strategy_check 函数体)
+    body = render_numba_state_body(cls).strip("\n")
     src = inspect.getsource(kernel)
     i0 = src.index(_SPLICE_BEGIN)
     i1 = src.index(_SPLICE_END)
     i0 = src.rindex("\n", 0, i0) + 1                    # BEGIN 注释行行首
     i1 = src.index("\n", i1) + 1                        # END 注释行行尾之后
     src = src[:i0] + textwrap.indent(body, "    ") + "\n" + src[i1:]
+
+    # 2) 注入 KernelState jitclass (按 state_spec 添加字段)
+    state_src = kernel._build_kernel_state_source(strategy_name)
+    j0 = src.index(_STATE_CLASS_BEGIN)
+    j1 = src.index(_STATE_CLASS_END)
+    j0 = src.rindex("\n", 0, j0) + 1
+    j1 = src.index("\n", j1) + 1
+    src = src[:j0] + textwrap.indent(state_src, "") + src[j1:]
+
     # exec 源没有真实文件可作 numba 磁盘缓存键 -> 去掉 cache=True
     src = src.replace("@njit(cache=True)", "@njit()")
 
@@ -135,6 +158,7 @@ def _build_dsl_kernel_impl(strategy_name: str, source_hash: str):
     # kernel.py::make_state 等价)。保留供 _KMOD.make_state 测试 / 旧脚本;
     # 新代码请用 make_state_general(..., strategy_params=...)。
     KS = mod.KernelState
+    # state_spec 字段默认: 不传 (走 __init__ 内 hardcoded default)
     def make_state(period="5m", warmup_until=0, tf1=21,
                    init_cash=200000.0, init_position=200000.0,
                    trade_qty=10000.0, scale=1.0,
