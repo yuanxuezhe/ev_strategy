@@ -471,19 +471,21 @@ _PY_TYPE_TO_CUDA = {bool: "int", int: "long long", float: "double"}
 
 
 def _require_state_spec(strategy_class) -> dict:
-    """DSL 策略必须声明 state_spec (空 dict 也合法 = 无持久状态)。
+    """DSL 策略必须显式声明 state_spec (空 dict 也合法 = 无持久状态)。
+
+    用 __dict__ 区分"显式声明 state_spec = {}"与"沿用 StrategyBase 默认"。
+    后者 (典型为临时类 / 测试桩 / 旧版基类继承者) 视为缺声明, 编译期抛错。
 
     编译期探针 / 工厂函数统一调用, 缺 state_spec 时立即报错, 给用户
     明确诊断: 新 DSL 策略忘记声明持久状态。
     """
     cls = strategy_class if isinstance(strategy_class, type) else type(strategy_class)
-    spec = getattr(cls, "state_spec", None)
-    if spec is None:
+    if "state_spec" not in cls.__dict__:
         raise CompileError(
-            f"DSL 策略 {cls.__name__} 必须声明 state_spec 类属性 "
+            f"DSL 策略 {cls.__name__} 必须显式声明 state_spec 类属性 "
             f"(空 dict 表示无持久状态, 非空 dict 即框架投影的字段集)。"
         )
-    return spec
+    return cls.state_spec or {}
 
 
 def build_ctx_to_kernel_map(strategy_class) -> dict[str, str]:

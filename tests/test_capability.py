@@ -43,6 +43,7 @@ def test_can_run_gpu_rejects_too_many_params(monkeypatch):
     class _S(StrategyBase):
         name = "_cap_test_10p"
         params_spec = {f"p{i}": {"default": 0.0, "type": float} for i in range(10)}
+        state_spec = {}   # DSL 必填字段; capability 测试不依赖持久状态
 
     try:
         ok_cpu, _ = can_run("_cap_test_10p", "cpu")
@@ -80,6 +81,7 @@ def test_select_device_auto_with_gpu_for_incompatible_strategy_returns_cpu():
     class _S(StrategyBase):
         name = "_cap_test_too_many"
         params_spec = {f"p{i}": {"default": 0.0, "type": float} for i in range(10)}
+        state_spec = {}   # DSL 必填字段; capability 测试不依赖持久状态
 
     try:
         # 即使 gpu_available=True, 策略不兼容也应降级到 cpu
@@ -102,6 +104,7 @@ def _make_cls_with_n_params(n: int):
         pass
 
     _S.params_spec = spec
+    _S.state_spec = {}   # DSL 必填字段; 测试用空 (无持久状态)
 
     def _cleanup():
         _STRATEGIES.pop(name, None)

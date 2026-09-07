@@ -25,6 +25,7 @@ def _register_temp_dsl(name: str, body: str):
     @register_strategy(name)
     class _S(StrategyBase):
         params_spec = spec
+        state_spec = {}   # DSL 必填字段; 测试用空 (无持久状态)
 
         def compute_signal(self, ctx):
             """DSL body"""

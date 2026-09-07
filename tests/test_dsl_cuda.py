@@ -134,6 +134,7 @@ def test_breakout_renders_with_dsl_docstring():
     @register_strategy("_test_breakout_dsl")
     class _B(StrategyBase):
         params_spec = {"lookback": {"default": 20, "type": int}}
+        state_spec = {}   # DSL 必填字段; 测试用空 (无持久状态)
         def __init__(self, params=None, **kwargs):
             super().__init__(params=params, **kwargs)
             self._closes = []
@@ -277,6 +278,7 @@ def test_cuda_device_function_rejects_overflow_params():
     @register_strategy("_test_cuda_overflow")
     class _(StrategyBase):
         params_spec = {f"x{i}": {"default": 0.0} for i in range(9)}
+        state_spec = {}   # DSL 必填字段; 测试用空 (无持久状态)
         def compute_signal(self, ctx):
             """return ctx.p8"""
             return 0
