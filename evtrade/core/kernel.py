@@ -1,27 +1,32 @@
 from __future__ import annotations
-"""numba 流式决策内核 —— 与参考实现逐行等价 (差分测试锁定)
+"""numba 流式决策内核 —— DSL splice 模板 + 数据流基础设施
 
 ================================================================
-⚠️⚠️⚠️  冻结层核心模块  ⚠️⚠️⚠️
+⚠️  冻结层核心模块 (DSL splice 模板)  ⚠️
 ================================================================
-本文件是**最核心、最不可动**的文件:
-  - 56 项差分测试锁定 (test_differential.py + test_kernel_unit.py)
-  - 浮点表达式与 4 个参考实现 (indicators / strategy / aggregator / execution) 逐位等价
-  - 与 evtrade/gpu.py CUDA kernel 同步 (差分锁定)
+本文件是**DSL splice 的模板源**:
+  - 通用部分: KernelState / step / _execute / summarize / 时间桶 / EMA 增量
+    任何策略 (含 channel_deviation) 都通过 core.kernel_dsl.build_dsl_kernel(name)
+    把本文件源码整段替换 DSL-STRATEGY-BEGIN/END 区间, exec 出该策略专用的模块。
+  - 公共 API (make_state / run_backtest / step / _execute / summarize / bars_to_arrays
+    等): 留作兼容性引用, 但**走冻结本尊调用 step() 时信号为 0** (因 _strategy_check
+    函数体已空); 真实执行必须经 dsl_kernel(name) 返回的特化模块。
+  - 72 项差分测试 (test_differential.py + test_kernel_unit.py) 现已改为走 dsl_kernel。
+
+DSL 渲染契约 (唯一真相源在 strategies/dsl.py::_CTX_TO_KERNEL):
+  ctx.p0..p15        -> st.p0..st.p15    (按策略 params_spec 声明顺序)
+  ctx.cur_ts/high/low/close/open/volume -> st.cur_*
+  ctx.up / ctx.dw    -> _strategy_check 的函数参数 (裸名)
+  ctx.low_hit / high_hit        -> st.low_hit / st.high_hit
+  ctx._low_acted / _high_acted  -> st.low_acted / st.high_acted
+  ctx._bucket_ts     -> st.lock_ts
+  其余 ctx.x / 裸名 x -> 函数局部变量 (首次赋值前不可读)
 
 修改本文件**前**请读 kbs/12-重构与性能内核.md 第 2 节"流式内核"。
-任何对 step() / _ema_push / _strategy_check / _execute / summarize 的改动
-都会让 tests 全红, 必须同步改:
-  1. evtrade/gpu.py CUDA source 对应段 (且重新编译 PTX)
-  2. 参考实现对应函数 (indicators / strategy / aggregator / execution)
-  3. kbs/05/06/07/13 中相应章节的文档
-  4. tests/test_differential.py 中的等价性测试 (确认它仍 PASS)
-
-新增字段时: 同时改 _STATE_SPEC + KernelState.__init__ + 所有调用的 CPU 函数
-+ GPU kernel 的 register 声明 + Python 侧输出数组分配与汇总。
+通用部分的改动 (step / _ema_push / _execute / summarize / KernelState 字段)
+需同步改 evtrade/gpu.py CUDA source (且重新编译 PTX) 与 kbs/05/06/07/13 文档。
+策略逻辑**不要**写在本文件 —— 改 strategies/<name>.py::_DSL docstring。
 ================================================================
-
-设计要点:
 
 设计要点:
   * "流式"是语义属性, 不是实现属性: 内核逐根处理 bar, 决策只依赖截至当前 bar 的
@@ -184,7 +189,7 @@ _STATE_SPEC = [
     ("dw_sum", float64), ("dw_count", int64), ("dw_ema", float64),
     # -- 策略锁存状态 --
     ("low_hit", boolean), ("high_hit", boolean),
-    ("lock_init", boolean), ("lock_ts", int64),
+    ("lock_ts", int64),
     ("low_acted", boolean), ("high_acted", boolean),
     # -- 账户 --
     ("cash", float64), ("position", float64), ("last_price", float64),
@@ -267,7 +272,6 @@ class KernelState:
         self.dw_ema = np.nan
         self.low_hit = False
         self.high_hit = False
-        self.lock_init = False
         self.lock_ts = 0
         self.low_acted = False
         self.high_acted = False
@@ -354,53 +358,19 @@ def make_state(period: str = "5m", warmup_until: int64 = 0, tf1: int = 21,
 def _strategy_check(st, up: float64, dw: float64) -> int64:
     """策略检查: 返回 0=无信号 / 1=BUY / -1=SELL
 
-    本函数体是 strategies/channel_deviation.py DSL 的手写 st 形式 (与冻结版
-    frozen/strategy.py 逐位锁定)。kernel_dsl.build_dsl_kernel 会把
-    DSL-STRATEGY-BEGIN/END 标记之间的**整段函数体**替换成任意策略 DSL 渲染出的
-    同形代码 (ctx.X -> st.X / 函数参数 up,dw / 局部变量), 生成该策略专用的
-    内核模块 —— 一个内核源, N 个策略特化, 语义全部同源于 DSL。
+    本函数体由 kernel_dsl.build_dsl_kernel 通过 DSL-STRATEGY-BEGIN/END 标记
+    整段注入渲染产物。**所有策略** (含 channel_deviation) 都走 build_dsl_kernel
+    路径, 此函数体为空是正常的 (本尊上的 step() 会返回 0); 真实执行请用
+    `dsl_kernel(name)` 返回的特化模块。
+
+    历史: 2026-09 重构前, 此函数体内嵌 channel_deviation 的手写 st 形式;
+    现已删除, channel_deviation 走 dsl_kernel("channel_deviation") 与其他策略
+    共用渲染管线 —— 一份 DSL docstring 派生 Python/numba/CUDA 三端。
     """
     # ==== DSL-STRATEGY-BEGIN (kernel_dsl.py 按此标记整段替换) ====
-    if up != up or dw != dw or up == 0.0 or dw == 0.0:   # NaN 或 0 -> 无效
-        return 0
-    # 桶切换: 重置本桶操作锁
-    if (not st.lock_init) or st.cur_ts != st.lock_ts:
-        st.lock_ts = st.cur_ts
-        st.lock_init = True
-        st.low_acted = False
-        st.high_acted = False
-
-    cur_l = st.cur_low
-    cur_h = st.cur_high
-    low_dev = (dw - cur_l) / dw * 100
-    high_dev = (cur_h - up) / up * 100
-    low_dev_h = (dw - cur_h) / dw * 100        # BUY 触发用: H vs DW
-    high_dev_l = (cur_l - up) / up * 100       # SELL 触发用: L vs UP
-
-    signal = 0
-    # ===== 策略段: DSL 渲染 (channel_deviation 别名 p0/p1/p2/p3 = low1/low2/high1/high2) =====
-    # ctx.p0 = st.p0 (low1)
-    # ctx.p1 = st.p1 (low2)
-    # ctx.p2 = st.p2 (high1)
-    # ctx.p3 = st.p3 (high2)
-    if st.low_hit and low_dev_h < st.p1 and not st.low_acted:
-        signal = 1
-        st.low_hit = False
-        st.low_acted = True
-    elif st.high_hit and high_dev_l < st.p3 and not st.high_acted:
-        signal = -1
-        st.high_hit = False
-        st.high_acted = True
-
-    if low_dev > st.p0 and not st.low_acted:
-        st.low_hit = True
-        st.low_acted = True
-    if high_dev > st.p2 and not st.high_acted:
-        st.high_hit = True
-        st.high_acted = True
-    # ===== 策略段结束 =====
-    return signal
+    pass    # body 由 build_dsl_kernel 注入
     # ==== DSL-STRATEGY-END ====
+    return 0
 
 
 # ============ 模拟成交 (与 SimulatedExecutor.trade + Account.apply 逐行等价) ============

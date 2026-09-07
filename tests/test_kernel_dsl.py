@@ -11,9 +11,15 @@ import numpy as np
 import pytest
 
 from evtrade.strategies import get_strategy, get_strategy_param_spec
-from evtrade.core.kernel import (bars_to_arrays, make_state, run_backtest,
-                                  summarize)
+from evtrade.core.kernel import bars_to_arrays, summarize
+from evtrade.core.kernel_dsl import dsl_kernel
 from evtrade.replay import replay_engine, replay_kernel
+
+
+# 单源: 走 dsl_kernel("channel_deviation") 特化模块 (2026-09 重构后冻结本尊 _strategy_check 已清空)
+_KMOD = dsl_kernel("channel_deviation")
+make_state = _KMOD.make_state
+run_backtest = _KMOD.run_backtest
 
 
 def _synthetic():
@@ -106,16 +112,17 @@ def test_kernel_vs_ref_engine_bitwise():
     bars = _synthetic()
     warm = int("20241110")*1_000_000
     params = {"low1": 1.5, "low2": 1.0, "high1": 1.5, "high2": 0.5}
-    # kernel 路径: make_state + run_backtest (记录成交)
+    # kernel 路径: dsl_kernel("channel_deviation") 特化模块 (走 build_dsl_kernel 渲染管线)
     arr = bars_to_arrays(bars)
-    st = make_state(period="5m", warmup_until=warm, tf1=21, **params,
-                    init_cash=200000., init_position=200000., trade_qty=10000.,
-                    record_trades=True, trade_cap=len(arr["stime"]))
+    kmod = dsl_kernel("channel_deviation")
+    st = kmod.make_state(period="5m", warmup_until=warm, tf1=21, **params,
+                         init_cash=200000., init_position=200000., trade_qty=10000.,
+                         record_trades=True, trade_cap=len(arr["stime"]))
     sig_k = np.zeros(len(arr["stime"]), np.int8)
     up = np.full(len(arr["stime"]), np.nan)
     dw = np.full(len(arr["stime"]), np.nan)
-    run_backtest(st, arr["stime"], arr["open"], arr["high"], arr["low"],
-                 arr["close"], arr["volume"], sig_k, up, dw)
+    kmod.run_backtest(st, arr["stime"], arr["open"], arr["high"], arr["low"],
+                      arr["close"], arr["volume"], sig_k, up, dw)
     # ref 路径: replay_engine (frozen 策略)
     rep = replay_engine(bars, "5m", warm, 21, **params,
                         init_cash=200000., init_position=200000.,
@@ -140,25 +147,21 @@ def test_strategy_has_dsl():
         strategy_has_dsl("no_such_strategy")
 
 
-def test_dsl_spliced_channel_deviation_bitwise():
-    """DSL 渲染的 channel_deviation 特化内核 与 冻结 kernel 逐位一致
+def test_dsl_spliced_channel_deviation_vs_ref_engine_bitwise():
+    """DSL 渲染的 channel_deviation 特化内核 与 Python ref 引擎逐位一致
 
     这是渲染器忠实性的锁定: 特化模块 = kernel.py 源码整段替换策略段后 exec,
-    若渲染改变了语义 (字段映射/表达式顺序/锁存时机), 这里立刻红。
+    若渲染改变了语义 (字段映射/表达式顺序), 这里立刻红。
+
+    历史 (2026-09 重构前): 与"冻结 kernel 本尊"对比; 重构后冻结本尊的 _strategy_check
+    已被清空 (单源 = DSL docstring), 改与 Python ref 引擎对比, 含义更强:
+    渲染产物直接决定 numba 信号序列, 必须与 Python DSL docstring 执行结果逐位一致。
     """
     from evtrade.core.kernel_dsl import build_dsl_kernel
-    bars = bars_to_arrays(_synthetic())
+    bars_list = _synthetic()
+    bars = bars_to_arrays(bars_list)
     warm = int("20241110") * 1_000_000
     n = len(bars["stime"])
-
-    # 冻结 kernel (low1..high2 路径)
-    st_f = make_state(period="5m", warmup_until=warm, tf1=21,
-                      low1=1.5, low2=1.0, high1=1.5, high2=0.5,
-                      init_cash=200000., init_position=200000.,
-                      trade_qty=10000., scale=2.0)
-    sig_f = np.zeros(n, np.int8)
-    run_backtest(st_f, bars["stime"], bars["open"], bars["high"], bars["low"],
-                 bars["close"], bars["volume"], sig_f, np.empty(0), np.empty(0))
 
     # DSL 渲染特化模块 (p0..p3 路径, 含倍投)
     kmod = build_dsl_kernel("channel_deviation")
@@ -172,9 +175,18 @@ def test_dsl_spliced_channel_deviation_bitwise():
                       bars["low"], bars["close"], bars["volume"],
                       sig_d, np.empty(0), np.empty(0))
 
-    assert (sig_f != 0).sum() > 10, "有效信号样本过少"
-    assert np.array_equal(sig_f, sig_d), "信号轨迹不一致"
-    assert summarize(st_f) == kmod.summarize(st_d), "绩效汇总不一致"
+    # Python ref 引擎: ChannelDeviationStrategy.check (走 DSL docstring exec 路径)
+    # replay_engine 接受原始 Bar 对象列表 (不是 numpy dict)
+    rep = replay_engine(bars_list, "5m", warm, 21, 1.5, 1.0, 1.5, 0.5,
+                        init_cash=200000., init_position=200000.,
+                        trade_qty=10000., scale=2.0)
+    sig_ref = rep["sig"]
+
+    assert (sig_d != 0).sum() > 10, "有效信号样本过少"
+    assert np.array_equal(sig_d, sig_ref), \
+        "DSL 渲染特化内核 与 Python ref 引擎 信号轨迹不一致"
+    # 信号序列 bitwise 一致即说明渲染产物忠实于 DSL docstring (核心锁定)。
+    # 绩效汇总由 run_one_dsl vs run_one 单独锁定 (test_run_one_dsl_channel_deviation_matches_run_one)
 
 
 def test_make_state_general_maps_spec_order():

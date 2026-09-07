@@ -3,9 +3,16 @@ from __future__ import annotations
 
 import numpy as np
 
+from evtrade.core.kernel_dsl import dsl_kernel
 from evtrade.data import synthetic_bars
-from evtrade.kernel import (bars_to_arrays, make_state, run_backtest, step,
-                            summarize, trades_to_list)
+from evtrade.kernel import (bars_to_arrays, summarize, trades_to_list)
+
+
+# 单源: 走 dsl_kernel("channel_deviation") 特化模块 (2026-09 重构后冻结本尊 _strategy_check 已清空)
+_KMOD = dsl_kernel("channel_deviation")
+make_state = _KMOD.make_state
+run_backtest = _KMOD.run_backtest
+step = _KMOD.step
 
 
 def test_empty_data_safe():
@@ -185,7 +192,7 @@ def test_excess_curve_metrics():
     x_t = (策略权益 - 基线权益)/基线权益; 通过直接改账户字段模拟一笔买入,
     让 x 在 4 个交易日形成 波峰->回撤->回升->新高 的形态。
     """
-    from evtrade.kernel import make_state, step, summarize
+    # step 已通过模块顶部 _KMOD = dsl_kernel("channel_deviation") 引入
     st = make_state(period="5m", warmup_until=0, tf1=5,
                     low1=99.0, low2=98.0, high1=99.0, high2=98.0)
 

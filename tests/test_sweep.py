@@ -5,8 +5,16 @@ import numpy as np
 
 from evtrade.data import synthetic_bars
 from evtrade.kernel import bars_to_arrays
+from evtrade.core.kernel_dsl import dsl_kernel
 from evtrade.sweep import (_ann_net, _neighbor_decay, _pareto_flag, parse_grid,
                            run_one, sweep)
+
+
+# 单源: 走 dsl_kernel("channel_deviation") 特化模块 (2026-09 重构后冻结本尊 _strategy_check 已清空)
+_KMOD = dsl_kernel("channel_deviation")
+make_state = _KMOD.make_state
+run_backtest = _KMOD.run_backtest
+trades_to_list = _KMOD.trades_to_list
 
 
 def _bars():
@@ -159,7 +167,6 @@ def test_permutation_sanity():
 
 def test_test_window_trades_only_after_split():
     """warmup_until=split: 成交必须全部落在测试窗内"""
-    from evtrade.kernel import run_backtest, make_state, trades_to_list
     bars = _bars()
     split_int = 20241220000000
     st = make_state(period="5m", warmup_until=split_int, tf1=21,

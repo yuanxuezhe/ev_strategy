@@ -90,20 +90,26 @@ def replay_kernel(bars, period: str, warmup_until: int, tf1: int,
                   trade_qty: float = 10000.0, scale: float = 1.0,
                   buy_pct: float = 0.0, sell_pct: float = 0.0,
                   all_in: bool = False) -> dict:
-    """内核回放: 返回逐 bar 信号轨迹 (全 bar 对齐) + 成交流 + 绩效"""
+    """内核回放: 返回逐 bar 信号轨迹 (全 bar 对齐) + 成交流 + 绩效
+
+    走 dsl_kernel("channel_deviation") 特化模块 (2026-09 重构后, 冻结本尊的
+    _strategy_check 已清空, 真实执行必须经 dsl_kernel)。
+    """
+    from .kernel_dsl import dsl_kernel
     arr = bars_to_arrays(bars)
     n = len(bars)
-    st = make_state(period=period, warmup_until=warmup_until, tf1=tf1,
-                    low1=low1, low2=low2, high1=high1, high2=high2,
-                    init_cash=init_cash, init_position=init_position,
-                    trade_qty=trade_qty, scale=scale,
-                    buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in,
-                    record_trades=True, trade_cap=n)
+    kmod = dsl_kernel("channel_deviation")
+    st = kmod.make_state(period=period, warmup_until=warmup_until, tf1=tf1,
+                         low1=low1, low2=low2, high1=high1, high2=high2,
+                         init_cash=init_cash, init_position=init_position,
+                         trade_qty=trade_qty, scale=scale,
+                         buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in,
+                         record_trades=True, trade_cap=n)
     sig = np.zeros(n, np.int8)
     up = np.full(n, np.nan)
     dw = np.full(n, np.nan)
-    run_backtest(st, arr["stime"], arr["open"], arr["high"], arr["low"],
-                 arr["close"], arr["volume"], sig, up, dw)
+    kmod.run_backtest(st, arr["stime"], arr["open"], arr["high"], arr["low"],
+                      arr["close"], arr["volume"], sig, up, dw)
     return {"sig": sig, "up": up, "dw": dw,
             "trades": trades_to_list(st), "summary": summarize(st)}
 

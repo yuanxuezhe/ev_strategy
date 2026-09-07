@@ -3,9 +3,15 @@ from __future__ import annotations
 
 import numpy as np
 
+from evtrade.core.kernel_dsl import dsl_kernel
 from evtrade.data import synthetic_bars
-from evtrade.kernel import (bars_to_arrays, make_state, run_backtest,
-                            summarize, trades_to_list)
+from evtrade.kernel import (bars_to_arrays, summarize, trades_to_list)
+
+
+# 单源: 走 dsl_kernel("channel_deviation") 特化模块 (2026-09 重构后冻结本尊 _strategy_check 已清空)
+_KMOD = dsl_kernel("channel_deviation")
+make_state = _KMOD.make_state
+run_backtest = _KMOD.run_backtest
 
 
 def _bars():

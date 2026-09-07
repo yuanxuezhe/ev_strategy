@@ -13,8 +13,9 @@ import pytest
 from evtrade import (Account, BarAggregator, ChannelDeviationStrategy, Engine,
                      Feed, SimulatedExecutor)
 from evtrade.config import PERIODS
+from evtrade.core.kernel_dsl import dsl_kernel
 from evtrade.data import synthetic_bars
-from evtrade.kernel import bars_to_arrays, make_state, run_backtest, summarize, trades_to_list
+from evtrade.kernel import bars_to_arrays, summarize, trades_to_list
 
 SIG_NUM = {"BUY": 1, "SELL": -1, None: 0}
 
@@ -76,19 +77,22 @@ def run_reference(bars, period, warmup_until, tf1, params, init_cash, init_posit
 
 def run_kernel(bars, period, warmup_until_int, tf1, params, init_cash, init_position, trade_qty,
                scale=1.0):
+    """走 dsl_kernel("channel_deviation") 特化模块; 冻结 kernel 本尊的 _strategy_check
+    已被清空 (2026-09 重构, 单源), 真实执行必须经 dsl_kernel(name)。"""
     arr = bars_to_arrays(bars)
     n = len(bars)
-    st = make_state(period=period, warmup_until=warmup_until_int, tf1=tf1,
-                    low1=params["low1"], low2=params["low2"],
-                    high1=params["high1"], high2=params["high2"],
-                    init_cash=init_cash, init_position=init_position,
-                    trade_qty=trade_qty, scale=scale,
-                    record_trades=True, trade_cap=n)
+    kmod = dsl_kernel("channel_deviation")
+    st = kmod.make_state(period=period, warmup_until=warmup_until_int, tf1=tf1,
+                         low1=params["low1"], low2=params["low2"],
+                         high1=params["high1"], high2=params["high2"],
+                         init_cash=init_cash, init_position=init_position,
+                         trade_qty=trade_qty, scale=scale,
+                         record_trades=True, trade_cap=n)
     sig = np.zeros(n, np.int8)
     up = np.full(n, np.nan)
     dw = np.full(n, np.nan)
-    run_backtest(st, arr["stime"], arr["open"], arr["high"], arr["low"],
-                 arr["close"], arr["volume"], sig, up, dw)
+    kmod.run_backtest(st, arr["stime"], arr["open"], arr["high"], arr["low"],
+                      arr["close"], arr["volume"], sig, up, dw)
     return st, sig, up, dw
 
 

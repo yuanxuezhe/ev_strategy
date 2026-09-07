@@ -109,7 +109,7 @@ evtrade/
   execution/           Executor 抽象 (Simulated / Broker)
   indicators/          纯函数技术指标
 tests/                 113+ pytest 用例
-tools/                 维护工具 (gen_kernel_strategy.py 等)
+tools/                 维护工具
 docs/                  使用说明
 ```
 

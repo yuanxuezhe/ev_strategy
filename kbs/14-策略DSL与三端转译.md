@@ -125,7 +125,7 @@ python -m evtrade backtest --strategy dev_trigger --params "entry_dev:0.5" ...
 
 | 测试 | 锁什么 |
 |---|---|
-| `tests/test_kernel_dsl.py::test_dsl_spliced_channel_deviation_bitwise` | DSL 渲染特化内核 ≡ 冻结 kernel (信号轨迹 + 绩效, 含倍投) |
+| `tests/test_kernel_dsl.py::test_dsl_spliced_channel_deviation_vs_ref_engine_bitwise` | DSL 渲染特化内核 ≡ Python ref 引擎 (信号轨迹, 含倍投; 2026-09 重构后冻结本尊 _strategy_check 已清空, 改与 Python ref 引擎对账) |
 | `tests/test_kernel_dsl.py::test_dev_trigger_kernel_vs_ref_engine_bitwise` | 新策略三端同源: numba 内核 ≡ 参考引擎 |
 | `tests/test_kernel_dsl.py::test_run_one_dsl_channel_deviation_matches_run_one` | 通用入口 ≡ 冻结 `run_one` |
 | `tests/test_dsl_cuda.py` | 渲染产物结构 (ctx 剥离 / 状态映射 / 局部声明 / 溢出拒绝) |

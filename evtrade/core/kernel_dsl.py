@@ -2,23 +2,23 @@ from __future__ import annotations
 """kernel.py 读 DSL 渲染: 按策略特化的 numba 内核模块 (步骤 2)
 
 ================================================================
-✅  主调度层新增模块 (不改动冻结文件的语义)  ✅
+✅  主调度层  ✅
 ================================================================
 机制 —— 一份内核源, N 个策略特化:
-  kernel.py 的 _strategy_check 函数体位于 DSL-STRATEGY-BEGIN/END 标记之间,
-  是 channel_deviation DSL 的手写 st 形式 (与 frozen/strategy.py 逐位锁定)。
-  build_dsl_kernel(name) 把该策略的 DSL 经 strategies.dsl.render_numba_state_body
-  渲染成同形 st 代码, 整段替换两标记之间的内容, exec 出一个独立内核模块
-  (jitclass / step / run_backtest / summarize 全套, numba 首次调用时编译)。
+  kernel.py 的 _strategy_check 函数体位于 DSL-STRATEGY-BEGIN/END 标记之间
+  (空模板, 占位 pass)。build_dsl_kernel(name) 把该策略的 DSL 经
+  strategies.dsl.render_numba_state_body 渲染成 st 代码, 整段替换两标记之间的
+  内容, exec 出一个独立内核模块 (jitclass / step / run_backtest / summarize
+  全套, numba 首次调用时编译)。
 
-  dsl_kernel(name):
-    - channel_deviation -> 冻结 kernel 本尊 (零额外编译; 72 项差分测试不受影响)
-    - 其他 DSL 策略     -> build_dsl_kernel 的缓存产物
+  dsl_kernel(name) = build_dsl_kernel(name), **所有策略同路径** (含 channel_deviation;
+  2026-09 重构前 channel_deviation 走"冻结本尊"快路, 已删除 —— 见 git log d1c5371)。
 
 语义保证 (三端同源):
-  特化模块与冻结 kernel 的唯一差异是 _strategy_check 函数体, 其余逐字节相同;
-  DSL 渲染保持表达式字面顺序, 浮点路径与参考引擎一致。
-  tests/test_kernel_dsl.py: 特化(channel_deviation) 与冻结 kernel bitwise 一致。
+  特化模块 = kernel.py 源码 + DSL 渲染产物, 表达式字面顺序与 DSL docstring 一致;
+  浮点路径与参考引擎一致 (差分测试锁定)。
+  tests/test_dsl_spliced_channel_deviation_bitwise 等价锁定:
+    特化模块 = Python ref 引擎 (ChannelDeviationStrategy.check)。
 
 ctx 字段契约 (DSL -> 内核, 唯一事实源在 strategies/dsl.py::_CTX_TO_KERNEL):
   ctx.p0..p15        -> st.p0..st.p15    (按策略 params_spec 声明顺序)
@@ -163,10 +163,11 @@ def build_dsl_kernel(strategy_name: str):
 
 
 def dsl_kernel(strategy_name: str):
-    """策略 -> numba 内核模块; channel_deviation 返回冻结 kernel 本尊"""
-    if strategy_name == "channel_deviation":
-        from . import kernel
-        return kernel
+    """策略 -> numba 内核模块 (所有策略同路径, 经 build_dsl_kernel 渲染 + 缓存)
+
+    等价于 build_dsl_kernel(strategy_name), 保留此入口供向后兼容 (历史 API
+    即 dsl_kernel, 而不是 build_dsl_kernel)。
+    """
     return build_dsl_kernel(strategy_name)
 
 

@@ -106,10 +106,17 @@ def test_invalidate_dsl_cache_all():
         c1(); c2()
 
 
-def test_dsl_kernel_channel_deviation_returns_frozen_kernel():
-    """channel_deviation 特判保留: 返回冻结 kernel 本尊"""
+def test_dsl_kernel_channel_deviation_uses_spliced_kernel():
+    """channel_deviation 与其他 DSL 策略同路径 (2026-09 重构后): 返回 build_dsl_kernel
+    的缓存产物, 不再走"冻结本尊"快路 (旧特判已删除)"""
     from evtrade.core import kernel as frozen_kernel
-    assert dsl_kernel("channel_deviation") is frozen_kernel
+    kmod = dsl_kernel("channel_deviation")
+    # 现在 channel_deviation 走渲染管线, 不再返回冻结 kernel 本尊
+    assert kmod is not frozen_kernel
+    # 但仍是有 DSL docstring 的策略类 -> 返回的模块应带 _strategy_check
+    assert hasattr(kmod, "_strategy_check")
+    # 缓存: 第二次拿同一对象
+    assert dsl_kernel("channel_deviation") is kmod
 
 
 def test_renderer_version_is_a_string():
