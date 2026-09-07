@@ -23,3 +23,6 @@ evtrade/strategies/_defaults/*
 .venv/
 uv.lock
 .python-version
+
+# setuptools 构建产物
+evtrade.egg-info/
