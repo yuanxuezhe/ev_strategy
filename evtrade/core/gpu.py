@@ -55,48 +55,11 @@ from .kernel_dsl import _invalidate_cache, _source_hash as _source_hash_gpu
 # 所有 DSL 策略 (含 channel_deviation) 统一走下方 _CUDA_SOURCE_GENERIC_TEMPLATE
 # (cuda_sweep_window_generic)。
 
-# Python 原生类型 -> CUDA 类型 (与 strategies/dsl._PY_TYPE_TO_CUDA 同源)
-_PY_TYPE_TO_CUDA = {bool: "int", int: "long long", float: "double"}
-
-
-def _build_cuda_state_decls(strategy_name: str) -> str:
-    """生成 CUDA kernel 内的 state_spec 字段声明 (按 strategy.state_spec 顺序)
-
-    输出格式: 每个字段一行 "{ctype} {name} = {default};", 嵌入模板主循环前的
-    寄存器声明区。空 state_spec 时返回空字符串。
-    """
-    from ..strategies import get_strategy_state_spec
-    state_spec = get_strategy_state_spec(strategy_name)
-    lines = []
-    for name, schema in state_spec.items():
-        ctype = _PY_TYPE_TO_CUDA[schema["type"]]
-        default = schema["default"]
-        if isinstance(default, bool):
-            lit = "1" if default else "0"
-        elif isinstance(default, int):
-            lit = str(default)
-        elif isinstance(default, float):
-            if default != default:  # NaN
-                lit = "__longlong_as_double((long long)0x7ff8000000000000ULL)"
-            else:
-                lit = repr(default)
-        else:
-            lit = repr(default)
-        lines.append(f"    {ctype} {name} = {lit};")
-    return "\n".join(lines)
-
-
-def _build_cuda_strategy_check_call(strategy_name: str) -> str:
-    """生成 strategy_check(...) 调用处的 state arg 列表 (按 state_spec 字段名顺序)
-
-    与 build_cuda_device_header(strategy_name) 生成的函数签名顺序一致 (state 字段
-    在前, 框架字段居中, p0..p7 在后); 此处只返回 state arg 部分 (逗号分隔),
-    模板调用处补上其余 11 个框架 arg + 8 个参数。
-    """
-    from ..strategies import get_strategy_state_spec
-    state_spec = get_strategy_state_spec(strategy_name)
-    return ", ".join(state_spec.keys())
-
+# DSL → CUDA 投影 (state_spec / params_spec → CUDA 字符串) 在 strategies/dsl.py:
+#   build_cuda_state_decls       - state_spec 字段的寄存器声明
+#   build_cuda_strategy_check_call - strategy_check(...) 调用处的 state arg 列表
+#   build_cuda_device_header     - __device__ 函数签名头
+# core/ 不再持有策略投影逻辑, 只剩 CUDA kernel 源码 + 编译 + 调度基础设施。
 
 # ============ 通用 CUDA kernel: 策略段由 DSL 注入 (步骤 1/2) ============
 # 接受 N 个 double 参数 (params 数组); 策略段是 render_cuda_device_function
@@ -330,7 +293,12 @@ def _compile_generic_kernel(strategy_name: str):
     局部变量自动声明), 编译结果缓存到 _GENERIC_KERNEL_CACHE。
     """
     from ..strategies import get_strategy_class
-    from ..strategies.dsl import CompileError, render_cuda_device_function
+    from ..strategies.dsl import (
+        CompileError,
+        build_cuda_state_decls,
+        build_cuda_strategy_check_call,
+        render_cuda_device_function,
+    )
     cls = get_strategy_class(strategy_name)
     if not (hasattr(cls, "compute_signal") and cls.compute_signal.__doc__):
         # 纯 Python 策略: 没 DSL docstring; CUDA 不可用
@@ -351,8 +319,8 @@ def _compile_generic_kernel(strategy_name: str):
         raise ValueError(f"策略 {strategy_name!r} 无法渲染到 CUDA: {e}") from e
     src = (_CUDA_SOURCE_GENERIC_TEMPLATE
            .replace("{STRATEGY_BODY}", strategy_func)
-           .replace("{STATE_DECLS}", _build_cuda_state_decls(strategy_name))
-           .replace("{STRATEGY_STATE_ARGS}", _build_cuda_strategy_check_call(strategy_name)))
+           .replace("{STATE_DECLS}", build_cuda_state_decls(cls))
+           .replace("{STRATEGY_STATE_ARGS}", build_cuda_strategy_check_call(cls)))
     if isinstance(cc_raw, (tuple, list)):
         archs = [f"compute_{cc_raw[0]}{cc_raw[1]}", "compute_90"]
     else:

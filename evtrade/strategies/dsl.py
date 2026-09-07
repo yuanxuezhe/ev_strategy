@@ -539,6 +539,48 @@ def build_cuda_device_header(strategy_class) -> str:
             + ",\n    ".join(args) + "\n){")
 
 
+def build_cuda_state_decls(strategy_class) -> str:
+    """生成 CUDA kernel 主循环前的 state_spec 寄存器声明 (CUDA 类型字符串)
+
+    每行: "    {ctype} {name} = {literal};", 按 state_spec 字段顺序;
+    空 state_spec 时返回空字符串。嵌入 _CUDA_SOURCE_GENERIC_TEMPLATE 的
+    {STATE_DECLS} 占位符。
+
+    字面量: bool → 0/1, int → str(default), float → repr(default) 或 NaN bit cast。
+    """
+    spec = _require_state_spec(strategy_class)
+    lines = []
+    for name, schema in spec.items():
+        ctype = _PY_TYPE_TO_CUDA[schema["type"]]
+        default = schema["default"]
+        if isinstance(default, bool):
+            lit = "1" if default else "0"
+        elif isinstance(default, int):
+            lit = str(default)
+        elif isinstance(default, float):
+            if default != default:  # NaN
+                lit = "__longlong_as_double((long long)0x7ff8000000000000ULL)"
+            else:
+                lit = repr(default)
+        else:
+            lit = repr(default)
+        lines.append(f"    {ctype} {name} = {lit};")
+    return "\n".join(lines)
+
+
+def build_cuda_strategy_check_call(strategy_class) -> str:
+    """生成 strategy_check(...) 调用处的 state arg 列表 (按 state_spec 字段名顺序)
+
+    与 build_cuda_device_header(strategy_class) 生成的函数签名顺序一致
+    (state 字段在前, 框架字段居中, p0..p7 在后); 此处只返回 state arg 部分
+    (逗号分隔), 模板调用处补上其余 8 个框架 arg + 8 个参数。
+
+    嵌入 _CUDA_SOURCE_GENERIC_TEMPLATE 的 {STRATEGY_STATE_ARGS} 占位符。
+    """
+    spec = _require_state_spec(strategy_class)
+    return ", ".join(spec.keys())
+
+
 # numba 端不加 st. 前缀的字段 (_strategy_check 的函数参数)
 _KERNEL_BARE = frozenset({"up", "dw"})
 

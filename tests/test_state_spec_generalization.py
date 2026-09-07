@@ -19,7 +19,9 @@ from evtrade.strategies import (StrategyBase, register_strategy,
                                  get_strategy_state_spec,
                                  make_dsl_ctx, build_ctx_to_kernel_map,
                                  build_cuda_sig_fields, build_cuda_device_header)
-from evtrade.strategies.dsl import CompileError, render_numba_body, render_cuda_body
+from evtrade.strategies.dsl import (CompileError, render_numba_body, render_cuda_body,
+                                    build_cuda_state_decls,
+                                    build_cuda_strategy_check_call)
 
 
 # ============ 临时策略类 (本测试独享, 不污染 strategies 包) ============
@@ -200,6 +202,149 @@ def test_build_cuda_device_header_diff_state_has_state_args():
     assert "long long &counter" in header
     assert "int &touched_up" in header
     assert "double &last_level" in header
+
+
+# ============ CUDA 寄存器声明 + 调用 arg 工厂 (build_cuda_state_decls / build_cuda_strategy_check_call) ============
+
+def test_build_cuda_state_decls_zero_state_empty():
+    """零状态策略: 寄存器声明为空字符串"""
+    cls = get_strategy_class("zero_state_demo")
+    decls = build_cuda_state_decls(cls)
+    assert decls == ""
+
+
+def test_build_cuda_state_decls_zero_state_no_residual_field():
+    """零状态策略: 不应残留任何 baked-in 字段声明"""
+    cls = get_strategy_class("zero_state_demo")
+    decls = build_cuda_state_decls(cls)
+    for old in ("low_hit", "high_hit", "lock_ts", "low_acted", "high_acted"):
+        assert old not in decls, f"零状态残留声明 {old}"
+
+
+def test_build_cuda_strategy_check_call_zero_state_empty():
+    """零状态策略: 调用处 state arg 列表为空字符串"""
+    cls = get_strategy_class("zero_state_demo")
+    call_args = build_cuda_strategy_check_call(cls)
+    assert call_args == ""
+
+
+def test_build_cuda_state_decls_diff_state_contains_all_fields():
+    """不同状态策略: 寄存器声明含所有 state_spec 字段 (按顺序, 按类型)"""
+    cls = get_strategy_class("diff_state_demo")
+    decls = build_cuda_state_decls(cls)
+    # 按 state_spec 顺序: counter (int) → touched_up (bool) → last_level (float)
+    assert "long long counter = 0;" in decls
+    assert "int touched_up = 0;" in decls          # bool default False → 0
+    assert "double last_level = 0.0;" in decls
+
+
+def test_build_cuda_state_decls_diff_state_field_order_preserved():
+    """state_spec 字段顺序保留 (与 build_cuda_device_header 顺序一致)"""
+    cls = get_strategy_class("diff_state_demo")
+    decls = build_cuda_state_decls(cls)
+    counter_pos = decls.index("counter")
+    touched_pos = decls.index("touched_up")
+    last_pos = decls.index("last_level")
+    assert counter_pos < touched_pos < last_pos
+
+
+def test_build_cuda_strategy_check_call_diff_state_in_order():
+    """不同状态策略: 调用处 arg 列表与 state_spec 顺序一致 (逗号分隔)"""
+    cls = get_strategy_class("diff_state_demo")
+    call_args = build_cuda_strategy_check_call(cls)
+    assert call_args == "counter, touched_up, last_level"
+
+
+def test_build_cuda_state_decls_call_args_match_signature_order():
+    """build_cuda_strategy_check_call 输出顺序与 build_cuda_device_header
+    state 部分一致 (CUDA 编译时 strategy_check 调用必须按签名顺序传参)"""
+    cls = get_strategy_class("diff_state_demo")
+    header = build_cuda_device_header(cls)
+    call_args = build_cuda_strategy_check_call(cls)
+    # header 里 state 部分用 "&name" 形式 (CUDA 引用), call_args 用裸名
+    # 从 header 里按出现顺序抽出 state 字段名 (在 framework args 之前)
+    framework_marker = "const long long &cur_ts"
+    state_section = header.split(framework_marker)[0]
+    # 顺序扫描 state 字段 (按 state_spec 顺序)
+    state_field_order_header = []
+    for name in ("counter", "touched_up", "last_level"):
+        if f"&{name}" in state_section:
+            state_field_order_header.append(name)
+    assert call_args == ", ".join(state_field_order_header)
+    assert call_args == "counter, touched_up, last_level"
+
+
+def test_build_cuda_state_decls_handles_bool_default_true():
+    """bool default = True → 字面量 1 (CUDA 无 bool)"""
+    from evtrade.strategies.base import _STRATEGIES, register_strategy
+
+    @register_strategy("_bool_true_default")
+    class _BoolTrue(StrategyBase):
+        params_spec = {}
+        state_spec = {"flag": {"type": bool, "default": True}}
+        def compute_signal(self, ctx):
+            return 0
+
+    try:
+        decls = build_cuda_state_decls(_BoolTrue)
+        assert "int flag = 1;" in decls
+    finally:
+        _STRATEGIES.pop("_bool_true_default", None)
+
+
+def test_build_cuda_state_decls_handles_negative_int_default():
+    """int default = -5 → 字面量 -5 (负数正常输出)"""
+    from evtrade.strategies.base import _STRATEGIES, register_strategy
+
+    @register_strategy("_neg_int_default")
+    class _NegInt(StrategyBase):
+        params_spec = {}
+        state_spec = {"counter": {"type": int, "default": -5}}
+        def compute_signal(self, ctx):
+            return 0
+
+    try:
+        decls = build_cuda_state_decls(_NegInt)
+        assert "long long counter = -5;" in decls
+    finally:
+        _STRATEGIES.pop("_neg_int_default", None)
+
+
+def test_build_cuda_state_decls_handles_float_default():
+    """float default = 0.5 → 字面量 0.5"""
+    from evtrade.strategies.base import _STRATEGIES, register_strategy
+
+    @register_strategy("_float_default")
+    class _Float(StrategyBase):
+        params_spec = {}
+        state_spec = {"level": {"type": float, "default": 0.5}}
+        def compute_signal(self, ctx):
+            return 0
+
+    try:
+        decls = build_cuda_state_decls(_Float)
+        assert "double level = 0.5;" in decls
+    finally:
+        _STRATEGIES.pop("_float_default", None)
+
+
+def test_build_cuda_state_decls_handles_nan_float_default():
+    """float default = NaN → __longlong_as_double bit cast (与 kernel 同口径)"""
+    from evtrade.strategies.base import _STRATEGIES, register_strategy
+
+    @register_strategy("_nan_default")
+    class _Nan(StrategyBase):
+        params_spec = {}
+        state_spec = {"nan_field": {"type": float, "default": float("nan")}}
+        def compute_signal(self, ctx):
+            return 0
+
+    try:
+        decls = build_cuda_state_decls(_Nan)
+        assert "double nan_field = __longlong_as_double" in decls
+        assert "0x7ff8000000000000ULL" in decls
+    finally:
+        _STRATEGIES.pop("_nan_default", None)
 
 
 # ============ 缺 state_spec 应编译期抛错 ============
