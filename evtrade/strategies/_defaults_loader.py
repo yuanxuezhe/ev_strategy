@@ -318,7 +318,9 @@ def format_reason_log(strategy_name: str, reason: dict,
     if params:
         lines.append("  选中参数  :")
         for k, v in params.items():
-            lines.append(f"    {k} = {v!r}")
+            # 用 str(v) 而非 {v!r}: np.float64(1.5) 的 repr 是 "np.float64(1.5)",
+            # str 则为 "1.5" (test_format_reason_log_contains_key_fields 锁定)
+            lines.append(f"    {k} = {v}")
     if saved_path is not None:
         lines.append(f"  落盘文件  : {saved_path}")
         lines.append(f"  git commit: {'已 commit' if commit_ok else '跳过/失败 (见日志)'}")

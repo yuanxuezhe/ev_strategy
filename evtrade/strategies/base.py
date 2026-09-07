@@ -104,6 +104,15 @@ class StrategyBase:
         """返回 (signal, info); signal ∈ {"BUY", "SELL", None}"""
         raise NotImplementedError
 
+    def format_signal_line(self, cur: dict, up, dw, signal, info: dict) -> str:
+        """verbose 引擎的信号 bar 打印行 (Engine 只负责 print, 不假设 info 的键)
+
+        默认只打 OHLCV; 策略可覆写以追加自身指标字段 (info dict)。
+        """
+        return (f"{signal} >>> [{cur['ts']}] {cur['code']} | O:{cur['open']} "
+                f"H:{cur['high']} L:{cur['low']} C:{cur['close']} | "
+                f"vol:{cur['volume']} x{cur['count']}")
+
     def get_param(self, key: str, default=None):
         """从 self.params 取参数, 缺则 default"""
         return self.params.get(key, default)

@@ -25,7 +25,7 @@ from ..frozen.models import fmt
 from ..execution.base import Executor
 from ..feeds.base import Feed
 from ..strategies.base import StrategyBase
-from .config import TF1
+from .config import INIT_CASH, INIT_POSITION, TF1, TRADE_QTY
 
 
 # ============ 引擎 (连接 Feed → Aggregator → 策略 → 执行) ============
@@ -88,22 +88,10 @@ class Engine:
         if not self.verbose:
             return
 
-        low_dev = info.get("low_dev")
-        high_dev = info.get("high_dev")
-        low_dev_h = info.get("low_dev_h")
-        high_dev_l = info.get("high_dev_l")
-        low_hit_prev = info.get("low_hit_prev")
-        high_hit_prev = info.get("high_hit_prev")
-
-        prefix = f"{signal} >>> " if signal else "             "
-        line = (f"{prefix}[{cur['ts']}] {cur['code']} | O:{cur['open']} H:{cur['high']} "
-                f"L:{cur['low']} C:{cur['close']} | vol:{cur['volume']} x{cur['count']} | "
-                f"UP={fmt(up)} DW={fmt(dw)} | "
-                f"low_dev(L/DW)={fmt(low_dev)}% high_dev(H/UP)={fmt(high_dev)}% | "
-                f"low_dev_h(H/DW)={fmt(low_dev_h)}% high_dev_l(L/UP)={fmt(high_dev_l)}% | "
-                f"low_hit_prev={fmt(low_hit_prev)} high_hit_prev={fmt(high_hit_prev)}")
+        # 信号行的字段与格式由策略自己负责 (Engine 不假设 info 的键)
         if signal:
-            print(line, flush=True)
+            print(self.strategy.format_signal_line(cur, up, dw, signal, info),
+                  flush=True)
 
     def run(self):
         total = 0
@@ -140,3 +128,41 @@ class Engine:
         print(f"盈亏差额 (策略-基线)   : {diff:+.2f}")
         print(f"盈亏比例              : {pct:+.2f}%")
         print("=" * 60)
+
+
+# ============ 装配工厂 (cli._run_ref / sweep.run_one_general 共用) ============
+
+def build_engine(feed, *, period, warmup_until=None,
+                 strategy=None, strategy_name=None, strategy_params=None,
+                 init_cash=INIT_CASH, init_position=INIT_POSITION,
+                 trade_qty=TRADE_QTY, scale=1.0,
+                 buy_pct=0.0, sell_pct=0.0, all_in=False,
+                 tf1=TF1, verbose=False, executor=None) -> Engine:
+    """装配 Feed → Aggregator → Strategy → Executor → Engine
+
+    参考引擎的四处装配 (_run_ref / run_one_general / replay_engine / 测试)
+    本是同一套 Account+Executor+Strategy+Aggregator+Engine, 本工厂只统一
+    "装配", 不统一"汇总" (各调用方的绩效口径不同)。
+
+      - strategy 未给时按 strategy_name + strategy_params 构造 (get_strategy)
+      - executor 未给时新建 Account + SimulatedExecutor (verbose 跟随 verbose)
+      - period 接受 "5m" 字符串或周期秒数 int
+      - warmup_until 为 stime 字符串阈值 (BarAggregator 约定), None 表示不预热
+    """
+    from ..frozen.account import Account
+    from ..frozen.timeutils import resolve_period_seconds
+    from ..strategies import get_strategy
+
+    if strategy is None:
+        strategy = get_strategy(strategy_name, params=strategy_params or {})
+    account = Account(cash=init_cash, position=init_position)
+    if executor is None:
+        from ..execution.base import SimulatedExecutor
+        executor = SimulatedExecutor(account, qty=trade_qty, verbose=verbose,
+                                     scale=scale, buy_pct=buy_pct,
+                                     sell_pct=sell_pct, all_in=all_in)
+    period_seconds = (resolve_period_seconds(period)
+                      if isinstance(period, str) else period)
+    aggregator = BarAggregator(period_seconds, on_bars=None,
+                               warmup_until=warmup_until)
+    return Engine(feed, aggregator, strategy, executor, tf1=tf1, verbose=verbose)

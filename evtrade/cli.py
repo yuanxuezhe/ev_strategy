@@ -177,11 +177,11 @@ def _run_kernel(args):
         legacy_high1=args.high1, legacy_high2=args.high2)
 
     from .core.data import load_bars
-    from .core.kernel import bucket_table, make_state
+    from .core.kernel import bucket_table
     from .core.kernel_dsl import dsl_kernel, make_state_general, strategy_has_dsl
 
     # 无 DSL docstring 的策略不能进内核路径 (numba/CUDA 都由 DSL 渲染)
-    if args.strategy != "channel_deviation" and not strategy_has_dsl(args.strategy):
+    if not strategy_has_dsl(args.strategy):
         print(f"[警告] 策略 {args.strategy!r} 没有 DSL compute_signal docstring; "
               f"kernel 引擎不可用, 请用 --engine ref")
         return
@@ -197,28 +197,19 @@ def _run_kernel(args):
           f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}  "
           f"引擎: kernel (numba)\n", flush=True)
 
-    if args.strategy == "channel_deviation":
-        # 冻结内核路径 (low1..high2 别名; 72 项差分锁定)
-        st = make_state(period=args.period, warmup_until=int(args.start) * 1_000_000,
-                        tf1=args.tf1, low1=args.low1, low2=args.low2,
-                        high1=args.high1, high2=args.high2,
-                        init_cash=INIT_CASH, init_position=INIT_POSITION,
-                        trade_qty=args.trade_qty, scale=args.scale,
-                        buy_pct=args.buy_pct, sell_pct=args.sell_pct,
-                        all_in=args.all_in,
-                        record_trades=True, trade_cap=n)
-    else:
-        # DSL 策略: 按策略 params_spec 顺序填 p0..pN, 内核段由 DSL 渲染
-        st = make_state_general(args.strategy, period=args.period,
-                                warmup_until=int(args.start) * 1_000_000,
-                                tf1=args.tf1, init_cash=INIT_CASH,
-                                init_position=INIT_POSITION,
-                                trade_qty=args.trade_qty, scale=args.scale,
-                                buy_pct=args.buy_pct, sell_pct=args.sell_pct,
-                                all_in=args.all_in,
-                                strategy_params=strategy_params,
-                                record_trades=True, trade_cap=n)
-    kmod = dsl_kernel(args.strategy)   # channel_deviation -> 冻结 kernel 本尊
+    # 统一入口: channel_deviation 的 dsl_kernel 返回冻结本尊 (零额外编译),
+    # 其余 DSL 策略为渲染特化; 参数一律按 params_spec 顺序填 p0..pN
+    # (channel_deviation: low1..high2 = p0..p3 别名, KernelState 内互通)。
+    st = make_state_general(args.strategy, period=args.period,
+                            warmup_until=int(args.start) * 1_000_000,
+                            tf1=args.tf1, init_cash=INIT_CASH,
+                            init_position=INIT_POSITION,
+                            trade_qty=args.trade_qty, scale=args.scale,
+                            buy_pct=args.buy_pct, sell_pct=args.sell_pct,
+                            all_in=args.all_in,
+                            strategy_params=strategy_params,
+                            record_trades=True, trade_cap=n)
+    kmod = dsl_kernel(args.strategy)
     t0 = time.perf_counter()
     if show_bars:
         sig_out = np.zeros(n, np.int8)

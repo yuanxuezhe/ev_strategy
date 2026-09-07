@@ -22,9 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from .kernel import make_state, run_backtest, summarize
 from .kernel_dsl import _EMPTY_F, _EMPTY_SIG, run_one_dsl, strategy_has_dsl
-from ..frozen.timeutils import resolve_period_seconds as period_seconds
 
 GRID_KEYS = ("low1", "low2", "high1", "high2", "tf1", "period", "trade_qty", "scale",
              "buy_pct", "sell_pct", "all_in")
@@ -78,25 +76,35 @@ def run_one(bars: dict, period: str, warmup_until: int, tf1: int,
             scale: float = 1.0,
             buy_pct: float = 0.0, sell_pct: float = 0.0,
             all_in: bool = False) -> dict:
-    """单组参数单窗回测 (内核), 返回 kernel.summarize 口径的绩效字典"""
-    st = make_state(period=period, warmup_until=warmup_until, tf1=tf1,
-                    low1=low1, low2=low2, high1=high1, high2=high2,
-                    init_cash=init_cash, init_position=init_position,
-                    trade_qty=trade_qty, scale=scale,
-                    buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in)
-    run_backtest(st, bars["stime"], bars["open"], bars["high"], bars["low"],
-                 bars["close"], bars["volume"], _EMPTY_SIG, _EMPTY_F, _EMPTY_F)
-    return summarize(st)
+    """channel_deviation 单组参数单窗回测 (冻结内核语义, 向后兼容 shim)
+
+    历史公开 API (顶层 low1..high2 位置参数); 内部统一走 run_one_dsl,
+    两者 bitwise 一致 (见 test_run_one_dsl_channel_deviation_matches_run_one)。
+    新代码请直接用 run_one_dsl(strategy_name="channel_deviation", ...)。
+    """
+    return run_one_dsl(bars, period, warmup_until,
+                       init_cash, init_position, trade_qty,
+                       tf1=tf1, scale=scale,
+                       buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in,
+                       strategy_name="channel_deviation",
+                       strategy_params={"low1": low1, "low2": low2,
+                                        "high1": high1, "high2": high2})
 
 
 def _run_window(bars: dict, p: dict, warmup_until: int) -> dict:
-    return run_one(bars, p["period"], warmup_until, p["tf1"],
-                   p["low1"], p["low2"], p["high1"], p["high2"],
-                   p["init_cash"], p["init_position"], p["trade_qty"],
-                   p.get("scale", 1.0),
-                   buy_pct=p.get("buy_pct", 0.0),
-                   sell_pct=p.get("sell_pct", 0.0),
-                   all_in=p.get("all_in", False))
+    """channel_deviation 单组参数单窗回测 (冻结内核语义, 统一走 run_one_dsl)
+
+    参数优先级: 顶层 low1..high2 (CLI 旗标/网格/旧 API) > p["params"] 基础值。
+    permutation / benchmark 等调用方沿用本 API; sweep 内部已统一走 run_one_dsl。
+    """
+    sp = {k: p[k] for k in ("low1", "low2", "high1", "high2") if k in p}
+    sp.update({k: v for k, v in (p.get("params") or {}).items() if k not in sp})
+    return run_one_dsl(bars, p["period"], warmup_until,
+                       p["init_cash"], p["init_position"], p["trade_qty"],
+                       tf1=p.get("tf1", 21), scale=p.get("scale", 1.0),
+                       buy_pct=p.get("buy_pct", 0.0), sell_pct=p.get("sell_pct", 0.0),
+                       all_in=p.get("all_in", False),
+                       strategy_name="channel_deviation", strategy_params=sp)
 
 
 def _empty_metrics(init_cash: float, init_position: float) -> dict:
@@ -129,36 +137,29 @@ def run_one_general(bars: dict, period: str, warmup_until: int,
       - 走参考引擎 (慢约 500x), 不进 numba/CUDA 加速路径
       - 用于参数空间探索 / 新策略验证
     """
-    from ..frozen.account import Account
-    from ..frozen.aggregator import BarAggregator
-    from .engine import Engine
-    from ..execution.base import SimulatedExecutor
-    from ..strategies import get_strategy
+    from .engine import build_engine
     from ._harness import NumpyDictFeed
 
     feed = NumpyDictFeed(bars)
 
-    account = Account(cash=init_cash, position=init_position)
-    executor = SimulatedExecutor(account, qty=trade_qty, verbose=False,
-                                  scale=scale,
-                                  buy_pct=buy_pct, sell_pct=sell_pct,
-                                  all_in=all_in)
-    strategy = get_strategy(strategy_name, params=strategy_params or {})
-    aggregator = BarAggregator(
-        period_seconds(period) if isinstance(period, str) else period,
-        on_bars=None,
-        warmup_until=str(warmup_until) if warmup_until else None,
-    )
     tf1 = (strategy_params or {}).get("tf1", 21)
-    eng = Engine(feed, aggregator, strategy, executor, tf1=tf1, verbose=False)
+    eng = build_engine(feed, period=period,
+                       warmup_until=str(warmup_until) if warmup_until else None,
+                       strategy_name=strategy_name,
+                       strategy_params=strategy_params or {},
+                       init_cash=init_cash, init_position=init_position,
+                       trade_qty=trade_qty, scale=scale,
+                       buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in,
+                       tf1=tf1, verbose=False)
     # 空数据安全 (sweep 单窗可能给到空 bars, 已知 flush 会 IndexError, 跳过即可)
     if len(bars["stime"]) == 0:
         return _empty_metrics(init_cash, init_position)
     eng.run()
 
-    final_price = executor.account.last_price
-    eq = executor.account.equity(final_price)
-    baseline = executor.account.baseline_equity(final_price)
+    account = eng.executor.account
+    final_price = account.last_price
+    eq = account.equity(final_price)
+    baseline = account.baseline_equity(final_price)
     diff = eq - baseline
     pct = (diff / baseline * 100.0) if baseline else 0.0
 
@@ -273,11 +274,16 @@ def sweep(bars: dict, base: dict, combos: list[dict],
     splits:  滚动 WFO 分割日列表 ["20260101","20260401"]; 1 个时窗口名为 train/test
              (兼容旧 --split), 多个时为 train/test1..testK。None=单窗 (列名无前缀)。
 
-    strategy_name: 策略 key (默认 channel_deviation)。路径选择 (步骤 3 通用化):
-      - channel_deviation                  -> 冻结 numba 内核 (_run_window)
-      - 其他带 DSL docstring 的策略        -> DSL 特化 numba 内核 (run_one_dsl);
-            device="gpu" 时走通用 CUDA kernel (cuda_sweep_window_generic)
-      - 无 DSL 的策略 (如 breakout)        -> 参考引擎 (run_one_general, 慢约 500x)
+    strategy_name: 策略 key (默认 channel_deviation)。路径选择 (三端同源):
+      - 带 DSL docstring 的策略 (含 channel_deviation, 其 dsl_kernel 返回冻结
+        本尊) -> numba 特化内核 (run_one_dsl); device="gpu" 时走 CUDA ——
+        channel_deviation 走冻结模板 (cuda_sweep_window), 其余走通用模板
+        (cuda_sweep_window_generic)
+      - 无 DSL 的策略 (如 breakout) -> 参考引擎 (run_one_general, 慢约 500x)
+
+    参数传递 (统一路径): 策略参数以 params dict 为唯一事实源
+    (--params > _defaults 落盘 > CLI 旗标 > params_spec 默认);
+    channel_deviation 的顶层 low1..high2 旗标兼容并存 (见下方合并逻辑)。
     """
     import pandas as pd
 
@@ -328,26 +334,38 @@ def sweep(bars: dict, base: dict, combos: list[dict],
 
     win_data = [(nm, window_bars(e), int(w) * 1_000_000) for nm, e, w in wins]
 
-    # 通用策略: 把 grid key 覆盖到 base["params"] 上; 缺失的参数继承 base
+    # 统一参数路径: 策略参数以 params dict 为唯一事实源 (--params > _defaults > 旗标)。
+    # channel_deviation 的历史接口是顶层 low1..high2 —— 双向兼容:
+    #   a) 顶层键并入基础 params (params dict 已显式给出的键优先)
+    #   b) 基础 params 回填顶层别名 (冻结 CUDA 路径 cuda_sweep_window 读顶层)
+    base_params = dict(base.get("params") or {})
+    if strategy_name == "channel_deviation":
+        for k in ("low1", "low2", "high1", "high2"):
+            if k in base:
+                base_params.setdefault(k, base[k])
+        for k in ("low1", "low2", "high1", "high2"):
+            if k in base_params:
+                base[k] = base_params[k]
+        base["params"] = base_params
+    # 网格 key 覆盖到 base["params"] 上; 缺失的参数继承基础值
     #   语义: --params 提供基础参数, --grid 在指定 key 上扫描, 未指定 key 沿用基础值
-    if strategy_name != "channel_deviation":
-        base_params = dict(base.get("params", {}))
-        new_combos = []
-        for c in combos:
-            # 用临时 dict 合并, 不修改原 c (避免 list(c) + 赋值 c[k] 互相污染)
-            merged_params = {**base_params, **c}
-            new_c = dict(c)            # copy of grid keys
-            new_c["params"] = merged_params
-            new_combos.append(new_c)
-        combos = new_combos
+    new_combos = []
+    for c in combos:
+        # 用临时 dict 合并, 不修改原 c (避免 list(c) + 赋值 c[k] 互相污染)
+        merged_params = {**base_params, **c}
+        new_c = dict(c)            # copy of grid keys
+        new_c["params"] = merged_params
+        new_combos.append(new_c)
+    combos = new_combos
     params_list = [{**base, **c} for c in combos]
 
     t0 = time.perf_counter()
-    use_general = (strategy_name != "channel_deviation")
-    # DSL 策略 -> numba/CUDA 快路径; 无 DSL -> 参考引擎兜底
-    dsl_fast = use_general and strategy_has_dsl(strategy_name)
+    # 路径选择: dsl_fast (含 channel_deviation, 其 dsl_kernel 返回冻结本尊) ->
+    # numba 内核; 无 DSL -> 参考引擎兜底。GPU 冻结模板仅 channel_deviation。
+    dsl_fast = strategy_has_dsl(strategy_name)
+    frozen_cuda = (strategy_name == "channel_deviation")
     metrics = [None] * len(win_data)
-    if device == "gpu" and not use_general:
+    if device == "gpu" and frozen_cuda:
         from .gpu import cuda_sweep_window
         for wi, (nm, wb, warm) in enumerate(win_data):
             metrics[wi] = cuda_sweep_window(wb, params_list, warm)
@@ -360,8 +378,8 @@ def sweep(bars: dict, base: dict, combos: list[dict],
         # 主线程预热: 把首次 numba specialization 串行化在主线程, 避免并发
         # worker 同时第一次调用 dsl_kernel(name).run_backtest 时各自触发
         # numba type specialization, 浪费 CPU 且扭曲冷启动延迟。
-        # 仅 DSL 路径需要预热; 无 DSL / use_general 走纯 Python, 无 numba 编译。
-        if use_general and dsl_fast:
+        # channel_deviation 的冻结本尊同样是 numba 首调编译, 一并预热。
+        if dsl_fast:
             try:
                 from .kernel_dsl import dsl_kernel, make_state_general
                 _first_p = params_list[0]
@@ -396,8 +414,8 @@ def sweep(bars: dict, base: dict, combos: list[dict],
             futures = {}
             for wi, (nm, wb, warm) in enumerate(win_data):
                 for ci, p in enumerate(params_list):
-                    if use_general and dsl_fast:
-                        # DSL 策略: DSL 特化 numba 内核 (与 run_one 同口径)
+                    if dsl_fast:
+                        # DSL 策略 (含 channel_deviation -> 冻结本尊): numba 内核
                         fut = ex.submit(
                             run_one_dsl, wb, p["period"], warm,
                             p["init_cash"], p["init_position"], p["trade_qty"],
@@ -407,7 +425,7 @@ def sweep(bars: dict, base: dict, combos: list[dict],
                             p.get("all_in", False),
                             strategy_name=strategy_name,
                             strategy_params=p.get("params", {}))
-                    elif use_general:
+                    else:
                         # 无 DSL 策略: 走参考引擎, 不依赖 low1/low2/... 等固定参数
                         sp = p.get("params", {})
                         fut = ex.submit(
@@ -418,8 +436,6 @@ def sweep(bars: dict, base: dict, combos: list[dict],
                             p.get("all_in", False),
                             strategy_name=strategy_name,
                             strategy_params=sp)
-                    else:
-                        fut = ex.submit(_run_window, wb, p, warm)
                     futures[fut] = (wi, ci)
 
             # 流式收集: as_completed 按完成顺序返回; 立即写 metrics[wi][ci]

@@ -114,6 +114,20 @@ class ChannelDeviationStrategy(StrategyBase):
                 "low_hit_prev": self.low_hit, "high_hit_prev": self.high_hit}
         return signal, info
 
+    def format_signal_line(self, cur, up, dw, signal, info):
+        """verbose 引擎的信号行 (原 Engine.on_bars 内联格式, 原样迁入)"""
+        from ..frozen.models import fmt
+        prefix = f"{signal} >>> " if signal else "             "
+        return (f"{prefix}[{cur['ts']}] {cur['code']} | O:{cur['open']} H:{cur['high']} "
+                f"L:{cur['low']} C:{cur['close']} | vol:{cur['volume']} x{cur['count']} | "
+                f"UP={fmt(up)} DW={fmt(dw)} | "
+                f"low_dev(L/DW)={fmt(info.get('low_dev'))}% "
+                f"high_dev(H/UP)={fmt(info.get('high_dev'))}% | "
+                f"low_dev_h(H/DW)={fmt(info.get('low_dev_h'))}% "
+                f"high_dev_l(L/UP)={fmt(info.get('high_dev_l'))}% | "
+                f"low_hit_prev={fmt(info.get('low_hit_prev'))} "
+                f"high_hit_prev={fmt(info.get('high_hit_prev'))}")
+
 
 class _ChannelDevCtx:
     """DSL 上下文: 字段顺序与 GPU 通用 kernel 的 p0..p7 寄存器对齐

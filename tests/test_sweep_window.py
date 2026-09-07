@@ -84,18 +84,24 @@ def test_sweep_does_not_crash_when_one_combo_fails():
          "low1": 2.5, "low2": 1.5, "high1": 2.0, "high2": 1.0},
     ]
 
-    # 注入 _run_window 副作用: 让第二个 (wi=0, ci=1) 抛异常
+    # 注入 run_one_dsl 副作用: 让第二个 (wi=0, ci=1) 抛异常
+    # (channel_deviation 路径已统一走 run_one_dsl, 不再经 _run_window)
     import unittest.mock
-    real = sweep_mod._run_window
+    real = sweep_mod.run_one_dsl
     calls = {"n": 0}
 
-    def flaky(bars, p, warm):
+    def flaky(bars, period, warmup_until, init_cash, init_position, trade_qty,
+              tf1=21, scale=1.0, buy_pct=0.0, sell_pct=0.0, all_in=False,
+              strategy_name="channel_deviation", strategy_params=None):
         calls["n"] += 1
         if calls["n"] == 2:
             raise RuntimeError("simulated combo failure")
-        return real(bars, p, warm)
+        return real(bars, period, warmup_until, init_cash, init_position,
+                    trade_qty, tf1=tf1, scale=scale, buy_pct=buy_pct,
+                    sell_pct=sell_pct, all_in=all_in,
+                    strategy_name=strategy_name, strategy_params=strategy_params)
 
-    with unittest.mock.patch.object(sweep_mod, "_run_window", flaky):
+    with unittest.mock.patch.object(sweep_mod, "run_one_dsl", flaky):
         with __import__("pytest").raises(RuntimeError, match="simulated combo failure"):
             sweep_mod.sweep(bars, base, combos, split_ymd=None, n_workers=2,
                             device="cpu", strategy_name="channel_deviation",
