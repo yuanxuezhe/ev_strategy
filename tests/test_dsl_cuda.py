@@ -29,7 +29,9 @@ def test_python_unchanged():
     # 包含 ctx.xxx 字段访问 (DSL 原样)
     assert "ctx.up" in out["python"]
     assert "ctx.dw" in out["python"]
-    assert "ctx._bucket_ts" in out["python"]
+    # state_spec 字段以单名空间形式原样保留 (无 ctx -> 内核改名)
+    assert "ctx.lock_ts" in out["python"]
+    assert "ctx.low_acted" in out["python"]
 
 
 def test_numba_no_ctx_prefix():

@@ -34,8 +34,15 @@ class _Strategy:
 
 
 def _make_cls_with_dsl(body: str):
-    """返回一个类, compute_signal.__doc__ == body"""
-    cls = type("_S", (), {"compute_signal": staticmethod(lambda ctx: 0)})
+    """返回一个类, compute_signal.__doc__ == body
+
+    DSL 工厂要求 state_spec (空 dict 表示无持久状态, 测试用无状态策略)。
+    """
+    cls = type("_S", (), {
+        "compute_signal": staticmethod(lambda ctx: 0),
+        "state_spec": {},   # DSL 必填字段; 测试用空 (无持久状态)
+        "params_spec": {},
+    })
     cls.compute_signal.__doc__ = body
     return cls
 

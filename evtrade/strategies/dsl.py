@@ -455,8 +455,8 @@ def compile_all(strategy_class, method_name: str = "compute_signal") -> dict:
 # 单名空间: ctx.<name> = 内核侧 <name> = state_spec[name], 全部 identity 映射
 # (旧版的 _bucket_ts -> lock_ts 等改名随 channel_deviation 迁移一并取消)。
 #
-# 向后兼容: 未声明 state_spec 的策略暂时使用 _LEGACY_STATE_SPEC 默认值,
-# 等所有 DSL 策略迁移完毕后移除。
+# DSL 策略必须声明 state_spec; 缺则编译期抛错。声明可以为空 dict (无持久状态,
+# DSL body 里只能写局部变量, 不能写 ctx.<持久字段>)。
 from .base import get_strategy_state_spec
 
 # 框架通用 ctx 字段 (每根 bar 由 dsl_check / kernel step 注入, 不在 state_spec)
@@ -465,72 +465,35 @@ _FRAMEWORK_CTX_FIELDS = (
     "up", "dw",
 )
 
-# 历史 ctx -> 内核 映射 (含 _bucket_ts → lock_ts 等改名)。仅在策略未声明
-# state_spec 时使用 — 待所有 DSL 策略迁移完毕 (Commit 2) 后整体移除。
-_OLD_CTX_TO_KERNEL = {
-    "cur_ts": "cur_ts", "cur_open": "cur_open", "cur_high": "cur_high",
-    "cur_low": "cur_low", "cur_close": "cur_close", "cur_volume": "cur_volume",
-    "up": "up", "dw": "dw",
-    "low_hit": "low_hit", "high_hit": "high_hit",
-    "_low_acted": "low_acted", "_high_acted": "high_acted",
-    "_bucket_ts": "lock_ts",
-}
-for _i in range(16):
-    _OLD_CTX_TO_KERNEL[f"p{_i}"] = f"p{_i}"
-
-# 历史 CUDA device 函数签名 (未声明 state_spec 的策略使用)。Commit 2 移除。
-_OLD_CUDA_SIG_FIELDS = frozenset(
-    {"low_hit", "high_hit", "low_acted", "high_acted", "lock_ts",
-     "cur_ts", "cur_open", "cur_high", "cur_low", "cur_close", "cur_volume",
-     "up", "dw"}
-    | {f"p{i}" for i in range(8)}
-)
-
-_OLD_CUDA_DEVICE_HEADER = """\
-__device__ __forceinline__ int strategy_check(
-    int &low_hit, int &high_hit, int &low_acted, int &high_acted,
-    long long &lock_ts,
-    const long long &cur_ts,
-    const double &cur_open, const double &cur_high,
-    const double &cur_low, const double &cur_close, const double &cur_volume,
-    const double &up, const double &dw,
-    const double &p0, const double &p1, const double &p2, const double &p3,
-    const double &p4, const double &p5, const double &p6, const double &p7)
-{"""
-
-# 历史 state_spec (供 make_dsl_ctx 初始化未声明策略的 ctx)。
-_OLD_LEGACY_STATE_SPEC = {
-    "low_hit":    {"type": bool,  "default": False},
-    "high_hit":   {"type": bool,  "default": False},
-    "_bucket_ts": {"type": int,   "default": None},   # 默认 None (历史行为, 未迁移)
-    "_low_acted": {"type": bool,  "default": False},
-    "_high_acted": {"type": bool,  "default": False},
-}
-
 # Python 原生类型 -> numba 类型名 / CUDA 类型声明
 _PY_TYPE_TO_NUMBA = {bool: "boolean", int: "int64", float: "float64"}
 _PY_TYPE_TO_CUDA = {bool: "int", int: "long long", float: "double"}
 
 
-def _use_legacy_mode(strategy_class) -> bool:
-    """该策略是否走向后兼容路径 (未声明 state_spec)"""
+def _require_state_spec(strategy_class) -> dict:
+    """DSL 策略必须声明 state_spec (空 dict 也合法 = 无持久状态)。
+
+    编译期探针 / 工厂函数统一调用, 缺 state_spec 时立即报错, 给用户
+    明确诊断: 新 DSL 策略忘记声明持久状态。
+    """
     cls = strategy_class if isinstance(strategy_class, type) else type(strategy_class)
-    return not (getattr(cls, "state_spec", None) or {})
+    spec = getattr(cls, "state_spec", None)
+    if spec is None:
+        raise CompileError(
+            f"DSL 策略 {cls.__name__} 必须声明 state_spec 类属性 "
+            f"(空 dict 表示无持久状态, 非空 dict 即框架投影的字段集)。"
+        )
+    return spec
 
 
 def build_ctx_to_kernel_map(strategy_class) -> dict[str, str]:
-    """DSL ctx 字段名 -> 内核状态字段名
+    """DSL ctx 字段名 -> 内核状态字段名 (单名空间 identity 映射)
 
-    - 未声明 state_spec 的策略: 返回历史映射 _OLD_CTX_TO_KERNEL (含
-      _bucket_ts → lock_ts 等改名, 等所有策略迁移后整段移除)
-    - 声明了 state_spec 的策略: 单名空间 identity 映射
-      (框架字段 + state_spec 字段 + p0..p15)
+    包含: 框架字段 (cur_ts/up/dw/...) + state_spec 字段 + p0..p15
     """
-    if _use_legacy_mode(strategy_class):
-        return dict(_OLD_CTX_TO_KERNEL)
+    spec = _require_state_spec(strategy_class)
     m = {f: f for f in _FRAMEWORK_CTX_FIELDS}
-    cls = strategy_class if isinstance(strategy_class, type) else type(strategy_class)
-    for name in (getattr(cls, "state_spec", None) or {}):
+    for name in spec:
         m[name] = name
     for i in range(16):
         m[f"p{i}"] = f"p{i}"
@@ -541,14 +504,11 @@ def build_cuda_sig_fields(strategy_class) -> frozenset:
     """CUDA __device__ 函数签名内可引用的字段集合 (DSL 字段引用校验用)
 
     包含: 框架字段 + state_spec 字段 + p0..p7 (CUDA 通用模板上限)。
-    未声明 state_spec 时使用历史固定集合 _OLD_CUDA_SIG_FIELDS。
     """
-    if _use_legacy_mode(strategy_class):
-        return _OLD_CUDA_SIG_FIELDS
-    cls = strategy_class if isinstance(strategy_class, type) else type(strategy_class)
+    spec = _require_state_spec(strategy_class)
     return frozenset(
         set(_FRAMEWORK_CTX_FIELDS)
-        | set(getattr(cls, "state_spec", None) or {})
+        | set(spec)
         | {f"p{i}" for i in range(8)}
     )
 
@@ -556,16 +516,13 @@ def build_cuda_sig_fields(strategy_class) -> frozenset:
 def build_cuda_device_header(strategy_class) -> str:
     """生成 __device__ __forceinline__ int strategy_check(...) 的 C 签名头
 
-    - 未声明 state_spec: 返回 _OLD_CUDA_DEVICE_HEADER (历史固定签名)
-    - 声明了 state_spec: 按 state_spec 字段顺序追加到框架字段前,
-      int/bool → int, int → long long, float → double
+    按 state_spec 字段顺序追加到框架字段前;
+    int/bool → int, int → long long, float → double
     """
-    if _use_legacy_mode(strategy_class):
-        return _OLD_CUDA_DEVICE_HEADER
-    cls = strategy_class if isinstance(strategy_class, type) else type(strategy_class)
+    spec = _require_state_spec(strategy_class)
     state_args = [
         f"{_PY_TYPE_TO_CUDA[schema['type']]} &{name}"
-        for name, schema in (getattr(cls, "state_spec", None) or {}).items()
+        for name, schema in spec.items()
     ]
     framework_args = [
         "const long long &cur_ts",
@@ -727,18 +684,11 @@ class DSLCtx:
 def make_dsl_ctx(strategy_class) -> DSLCtx:
     """构造 DSL Python 端 ctx: 框架字段 + state_spec 字段 (按 default 初始化)
 
-    状态字段按 strategy.state_spec (或 _OLD_LEGACY_STATE_SPEC 向后兼容回退)
-    投影。未声明 state_spec 的旧策略仍按历史字段名 (_bucket_ts / _low_acted /
-    _high_acted / low_hit / high_hit) 初始化, 与 kernel 端 _OLD_CTX_TO_KERNEL
-    改名一致; 等所有策略迁移完毕后 _OLD_LEGACY_STATE_SPEC 与 _OLD_CTX_TO_KERNEL
-    一起移除。
+    状态字段按 strategy.state_spec 投影 (空 dict 也合法 = 无持久状态)。
+    DSL 策略必须声明 state_spec, 缺则编译期抛 CompileError。
     """
+    spec = _require_state_spec(strategy_class)
     ctx = DSLCtx()
-    if _use_legacy_mode(strategy_class):
-        spec = _OLD_LEGACY_STATE_SPEC
-    else:
-        cls = strategy_class if isinstance(strategy_class, type) else type(strategy_class)
-        spec = cls.state_spec
     for name, schema in spec.items():
         setattr(ctx, name, schema["default"])
     return ctx

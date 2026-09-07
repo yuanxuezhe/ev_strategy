@@ -31,6 +31,12 @@ class DevTriggerStrategy(StrategyBase):
         "entry_dev": {"default": 0.8, "type": float, "min": 0.0, "max": 50.0},
     }
 
+    state_spec = {
+        "lock_ts":    {"type": int,  "default": 0},
+        "low_acted":  {"type": bool, "default": False},
+        "high_acted": {"type": bool, "default": False},
+    }
+
     def __init__(self, params: dict | None = None, **kwargs):
         super().__init__(params=params, **kwargs)
         self._ctx = make_dsl_ctx(type(self))   # 状态字段跨桶持久
@@ -56,15 +62,15 @@ class DevTriggerStrategy(StrategyBase):
 DevTriggerStrategy.compute_signal.__doc__ = """\
 if ctx.up != ctx.up or ctx.dw != ctx.dw or ctx.up == 0 or ctx.dw == 0:
     return 0
-if ctx.cur_ts != ctx._bucket_ts:
-    ctx._bucket_ts = ctx.cur_ts
-    ctx._low_acted = False
-    ctx._high_acted = False
-if ctx.cur_low < ctx.dw * (1 - ctx.p0 / 100) and not ctx._low_acted:
-    ctx._low_acted = True
+if ctx.cur_ts != ctx.lock_ts:
+    ctx.lock_ts = ctx.cur_ts
+    ctx.low_acted = False
+    ctx.high_acted = False
+if ctx.cur_low < ctx.dw * (1 - ctx.p0 / 100) and not ctx.low_acted:
+    ctx.low_acted = True
     return 1
-if ctx.cur_high > ctx.up * (1 + ctx.p0 / 100) and not ctx._high_acted:
-    ctx._high_acted = True
+if ctx.cur_high > ctx.up * (1 + ctx.p0 / 100) and not ctx.high_acted:
+    ctx.high_acted = True
     return -1
 return 0
 """

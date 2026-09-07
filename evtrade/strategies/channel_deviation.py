@@ -16,33 +16,37 @@ from .base import StrategyBase, register_strategy
 # 信号只赋值不提前 return, 让随后的极端偏离锁存在本桶仍生效。
 # 三端 (Python/numba/CUDA) 同源同语义; 公式逐位锁定 (test_differential 72 项
 # bitwise 一致, 与原 frozen/strategy.py 历史行为一致, 后者已并入本文件)。
+#
+# 持久状态字段 (state_spec 投影): low_hit, high_hit, lock_ts, low_acted,
+# high_acted。字段名与 numba jitclass / CUDA device 函数 单名空间对齐 (不
+# 再用下划线前缀的 _bucket_ts / _low_acted / _high_acted)。
 _CHANNEL_DEVIATION_DSL = """
 if ctx.up != ctx.up or ctx.dw != ctx.dw or ctx.up == 0 or ctx.dw == 0:
     return 0
-if ctx.cur_ts != ctx._bucket_ts:
-    ctx._bucket_ts = ctx.cur_ts
-    ctx._low_acted = False
-    ctx._high_acted = False
+if ctx.cur_ts != ctx.lock_ts:
+    ctx.lock_ts = ctx.cur_ts
+    ctx.low_acted = False
+    ctx.high_acted = False
 ctx.low_dev = (ctx.dw - ctx.cur_low) / ctx.dw * 100
 ctx.high_dev = (ctx.cur_high - ctx.up) / ctx.up * 100
 ctx.low_dev_h = (ctx.dw - ctx.cur_high) / ctx.dw * 100
 ctx.high_dev_l = (ctx.cur_low - ctx.up) / ctx.up * 100
 # 参数访问: 按 params_spec 顺序 p0=low1, p1=low2, p2=high1, p3=high2
 signal = 0
-if ctx.low_hit and ctx.low_dev_h < ctx.p1 and not ctx._low_acted:
+if ctx.low_hit and ctx.low_dev_h < ctx.p1 and not ctx.low_acted:
     signal = 1
     ctx.low_hit = False
-    ctx._low_acted = True
-elif ctx.high_hit and ctx.high_dev_l < ctx.p3 and not ctx._high_acted:
+    ctx.low_acted = True
+elif ctx.high_hit and ctx.high_dev_l < ctx.p3 and not ctx.high_acted:
     signal = -1
     ctx.high_hit = False
-    ctx._high_acted = True
-if ctx.low_dev > ctx.p0 and not ctx._low_acted:
+    ctx.high_acted = True
+if ctx.low_dev > ctx.p0 and not ctx.low_acted:
     ctx.low_hit = True
-    ctx._low_acted = True
-if ctx.high_dev > ctx.p2 and not ctx._high_acted:
+    ctx.low_acted = True
+if ctx.high_dev > ctx.p2 and not ctx.high_acted:
     ctx.high_hit = True
-    ctx._high_acted = True
+    ctx.high_acted = True
 return signal
 """
 
@@ -56,6 +60,11 @@ class ChannelDeviationStrategy(StrategyBase):
       low2:  下轨回撤确认阈值 (%)
       high1: 上轨极端偏离阈值 (%)
       high2: 上轨回撤确认阈值 (%)
+
+    state_spec (DSL 持久状态, framework 投影到 numba jitclass / CUDA device 函数):
+      low_hit / high_hit:    是否在当前桶触发极端偏离
+      lock_ts:               上一次锁定的桶 ts (桶切换时清零)
+      low_acted / high_acted: 本桶内是否已对低/高信号下过单 (避免重复触发)
     """
 
     params_spec = {
@@ -65,16 +74,22 @@ class ChannelDeviationStrategy(StrategyBase):
         "high2": {"default": 0.5, "type": float, "min": 0.0, "max": 100.0},
     }
 
+    state_spec = {
+        "low_hit":    {"type": bool, "default": False},
+        "high_hit":   {"type": bool, "default": False},
+        "lock_ts":    {"type": int,  "default": 0},
+        "low_acted":  {"type": bool, "default": False},
+        "high_acted": {"type": bool, "default": False},
+    }
+
     def __init__(self, params: dict | None = None, **kwargs):
         super().__init__(params=params, **kwargs)
-        self.low_hit = False
-        self.high_hit = False
-        self._bucket_ts = None
-        self._low_acted = False
-        self._high_acted = False
+        # ctx 跨桶持久 (state_spec 字段跨 bar 持续); 状态字段初值由 make_dsl_ctx
+        # 按 state_spec.default 注入, 不再手工初始化 self.<字段>。
+        from .dsl import make_dsl_ctx, make_python_runner
+        self._ctx = make_dsl_ctx(type(self))
         # runner 走类级缓存 (make_python_runner 内部按 (cls, source_hash) 复用);
         # 避免每次 __init__ 都 exec 一次原 DSL body。
-        from .dsl import make_python_runner
         self._runner = make_python_runner(type(self), "compute_signal")
 
     def compute_signal(self, ctx):
@@ -82,7 +97,13 @@ class ChannelDeviationStrategy(StrategyBase):
         pass  # DSL 注入
 
     def check(self, cur, up_or_indicators, dw=None):
-        """兼容旧 (cur, up, dw) 与新 (cur, dict) 两种调用"""
+        """兼容旧 (cur, up, dw) 与新 (cur, dict) 两种调用
+
+        直接复用 self._ctx (状态字段在 ctx 上跨桶持久, 不再每 bar 重建 +
+        手工 copy-back); 与 dsl_check 同源风格: 把每根 bar 的 cur_*/up/dw/pN
+        直接挂到 self._ctx 上, 再跑 runner(ctx); 信号状态 (low_hit/lock_ts/
+        low_acted/...) 由 runner 直接修改 ctx。
+        """
         if isinstance(up_or_indicators, dict):
             up = up_or_indicators.get("up")
             dw_val = up_or_indicators.get("dw")
@@ -92,29 +113,25 @@ class ChannelDeviationStrategy(StrategyBase):
         if up is None or dw_val is None or up == 0 or dw_val == 0:
             return None, {}
 
-        # DSL 字段映射: p0=low1, p1=low2, p2=high1, p3=high2
-        # (与 params_spec 顺序一致, 让 DSL 与 GPU/numba 三端一致)
-        ctx = _ChannelDevCtx(
-            cur_ts=cur["ts"], cur_high=cur["high"], cur_low=cur["low"],
-            cur_close=cur["close"],
-            up=up, dw=dw_val,
-            p0=self.low1, p1=self.low2, p2=self.high1, p3=self.high2,
-            low_hit=self.low_hit, high_hit=self.high_hit,
-            _bucket_ts=self._bucket_ts,
-            _low_acted=self._low_acted,
-            _high_acted=self._high_acted)
-        sig_int = self._runner(ctx)
-        self.low_hit = ctx.low_hit
-        self.high_hit = ctx.high_hit
-        self._bucket_ts = ctx._bucket_ts
-        self._low_acted = ctx._low_acted
-        self._high_acted = ctx._high_acted
-
+        ctx = self._ctx
+        ctx.cur_ts = cur["ts"]
+        ctx.cur_open = float(cur.get("open", 0.0))
+        ctx.cur_high = float(cur["high"])
+        ctx.cur_low = float(cur["low"])
+        ctx.cur_close = float(cur["close"])
+        ctx.cur_volume = float(cur.get("volume", 0.0))
+        ctx.up = up
+        ctx.dw = dw_val
+        for i, k in enumerate(self.params_spec):
+            setattr(ctx, f"p{i}", float(self.params[k]))
+        sig_int = int(self._runner(ctx))
+        # low_dev* 是 DSL body 里挂在 ctx 上的临时属性, 由 _runner 写入
         signal = {1: "BUY", -1: "SELL"}.get(sig_int)
         info = {"up": up, "dw": dw_val,
                 "low_dev": ctx.low_dev, "high_dev": ctx.high_dev,
                 "low_dev_h": ctx.low_dev_h, "high_dev_l": ctx.high_dev_l,
-                "low_hit_prev": self.low_hit, "high_hit_prev": self.high_hit}
+                "low_hit_prev": ctx.low_hit,
+                "high_hit_prev": ctx.high_hit}
         return signal, info
 
     def format_signal_line(self, cur, signal, info):
@@ -166,39 +183,6 @@ class ChannelDeviationStrategy(StrategyBase):
         if up is None or dw is None:
             return {}
         return {"up": up, "dw": dw}
-
-
-class _ChannelDevCtx:
-    """DSL 上下文: 字段顺序与 GPU 通用 kernel 的 p0..p7 寄存器对齐
-
-    p0..p7 是策略参数 (按 params_spec 顺序); pN 之后是状态字段。
-    """
-    __slots__ = ("cur_ts", "cur_high", "cur_low", "cur_close",
-                 "up", "dw", "p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7",
-                 "low_hit", "high_hit", "_bucket_ts", "_low_acted", "_high_acted",
-                 "low_dev", "high_dev", "low_dev_h", "high_dev_l")
-
-    def __init__(self, cur_ts, cur_high, cur_low, cur_close,
-                 up, dw,
-                 p0=0.0, p1=0.0, p2=0.0, p3=0.0, p4=0.0, p5=0.0, p6=0.0, p7=0.0,
-                 low_hit=False, high_hit=False,
-                 _bucket_ts=None, _low_acted=False, _high_acted=False):
-        self.cur_ts = cur_ts
-        self.cur_high = cur_high
-        self.cur_low = cur_low
-        self.cur_close = cur_close
-        self.up = up
-        self.dw = dw
-        self.p0, self.p1, self.p2, self.p3 = p0, p1, p2, p3
-        self.p4, self.p5, self.p6, self.p7 = p4, p5, p6, p7
-        self.low_hit, self.high_hit = low_hit, high_hit
-        self._bucket_ts = _bucket_ts
-        self._low_acted = _low_acted
-        self._high_acted = _high_acted
-        self.low_dev = 0.0
-        self.high_dev = 0.0
-        self.low_dev_h = 0.0
-        self.high_dev_l = 0.0
 
 
 ChannelDeviationStrategy.compute_signal.__doc__ = _CHANNEL_DEVIATION_DSL
