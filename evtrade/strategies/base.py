@@ -104,10 +104,11 @@ class StrategyBase:
         """返回 (signal, info); signal ∈ {"BUY", "SELL", None}"""
         raise NotImplementedError
 
-    def format_signal_line(self, cur: dict, up, dw, signal, info: dict) -> str:
+    def format_signal_line(self, cur: dict, signal, info: dict) -> str:
         """verbose 引擎的信号 bar 打印行 (Engine 只负责 print, 不假设 info 的键)
 
-        默认只打 OHLCV; 策略可覆写以追加自身指标字段 (info dict)。
+        framework 不假定任何特定指标; 策略覆写本方法时, 所需字段从 info dict
+        自己取 (e.g. up/dw、偏离值、过滤标志等)。默认实现仅打 OHLCV + 信号。
         """
         return (f"{signal} >>> [{cur['ts']}] {cur['code']} | O:{cur['open']} "
                 f"H:{cur['high']} L:{cur['low']} C:{cur['close']} | "

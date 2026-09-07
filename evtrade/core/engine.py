@@ -88,9 +88,11 @@ class Engine:
         if not self.verbose:
             return
 
-        # 信号行的字段与格式由策略自己负责 (Engine 不假设 info 的键)
+        # 信号行的字段与格式由策略自己负责 (Engine 不假设 info 的键;
+        # format_signal_line 签名只取 (cur, signal, info), 策略需展示的
+        # 指标字段都从 info 取, framework 不传任何 positional 指标)
         if signal:
-            print(self.strategy.format_signal_line(cur, up, dw, signal, info),
+            print(self.strategy.format_signal_line(cur, signal, info),
                   flush=True)
 
     def run(self):

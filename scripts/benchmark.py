@@ -11,12 +11,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
-from evtrade import (Account, BarAggregator, ChannelDeviationStrategy, Engine,
-                     Feed, SimulatedExecutor)
+from evtrade import (Account, BarAggregator, Engine, Feed, SimulatedExecutor)
 from evtrade.core.kernel_dsl import dsl_kernel, make_state_general
 from evtrade.data import synthetic_bars
 from evtrade.kernel import bars_to_arrays, resolve_period_seconds, summarize
 from evtrade.sweep import parse_grid, sweep
+from evtrade.strategies import get_strategy
 
 
 class ListFeed(Feed):
@@ -54,7 +54,7 @@ def main():
     executor = RecExec(account, qty=10000.0, verbose=False)
     aggregator = BarAggregator(resolve_period_seconds("5m"), on_bars=None,
                                warmup_until="20250301000000")
-    strategy = ChannelDeviationStrategy(params=params)
+    strategy = get_strategy("channel_deviation", params=params)
     engine = Engine(ListFeed(bars), aggregator, strategy, executor, tf1=21, verbose=False)
     engine.run()
     t_ref = time.perf_counter() - t0

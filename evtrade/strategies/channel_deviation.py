@@ -111,18 +111,23 @@ class ChannelDeviationStrategy(StrategyBase):
         self._high_acted = ctx._high_acted
 
         signal = {1: "BUY", -1: "SELL"}.get(sig_int)
-        info = {"low_dev": ctx.low_dev, "high_dev": ctx.high_dev,
+        info = {"up": up, "dw": dw_val,
+                "low_dev": ctx.low_dev, "high_dev": ctx.high_dev,
                 "low_dev_h": ctx.low_dev_h, "high_dev_l": ctx.high_dev_l,
                 "low_hit_prev": self.low_hit, "high_hit_prev": self.high_hit}
         return signal, info
 
-    def format_signal_line(self, cur, up, dw, signal, info):
-        """verbose 引擎的信号行 (原 Engine.on_bars 内联格式, 原样迁入)"""
+    def format_signal_line(self, cur, signal, info):
+        """verbose 引擎的信号行 (原 Engine.on_bars 内联格式, 原样迁入)
+
+        framework 不假定任何指标字段; channel_deviation 把 up/dw 与偏离值
+        都放在 info dict 里, 由本方法自行取用 (hook 签名无 positional 指标)。
+        """
         from ..primitives import fmt
         prefix = f"{signal} >>> " if signal else "             "
         return (f"{prefix}[{cur['ts']}] {cur['code']} | O:{cur['open']} H:{cur['high']} "
                 f"L:{cur['low']} C:{cur['close']} | vol:{cur['volume']} x{cur['count']} | "
-                f"UP={fmt(up)} DW={fmt(dw)} | "
+                f"UP={fmt(info.get('up'))} DW={fmt(info.get('dw'))} | "
                 f"low_dev(L/DW)={fmt(info.get('low_dev'))}% "
                 f"high_dev(H/UP)={fmt(info.get('high_dev'))}% | "
                 f"low_dev_h(H/DW)={fmt(info.get('low_dev_h'))}% "
