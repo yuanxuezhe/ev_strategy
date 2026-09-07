@@ -133,11 +133,12 @@ def test_scale_martingale_sequence():
 
 
 def test_bucket_table():
-    """桶表 (framework 层): OHLCV 聚合 / 通道轨 / 信号计数
+    """桶表 (framework 层): OHLCV 聚合 / 信号计数
 
-    策略专属偏离指标 (channel_deviation 的 low_dev / high_dev / ...) 不在框架中,
-    改由 strategies/channel_deviation.py::compute_deviation_columns 提供,
-    这里只校验框架桶聚合本身。
+    框架只输出 OHLCV + count + sig + n_sig; 指标 (EMA 通道 up/dw、策略
+    偏离百分比等) 不在框架中, 由策略 / 指标层在 hook 里追加
+    (see strategies/channel_deviation.compute_deviation_columns +
+    get_extra_bucket_columns).
     """
     from evtrade.kernel import bucket_table, run_backtest_trace
     bars = synthetic_bars(days=10, start_ymd="20250101", seed=5)
@@ -158,14 +159,15 @@ def test_bucket_table():
     run_backtest_trace(st, arr["stime"], arr["open"], arr["high"], arr["low"],
                        arr["close"], arr["volume"], sig, up, dw,
                        ts_out, o_out, h_out, l_out, c_out, v_out)
-    tab = bucket_table(arr["stime"], sig, up, dw,
+    tab = bucket_table(arr["stime"], sig,
                        ts_out, o_out, h_out, l_out, c_out, v_out)
 
-    # 框架只输出: OHLCV + count + up/dw + sig + n_sig
+    # 框架只输出: OHLCV + count + sig + n_sig (不含 up/dw 等指标)
     expected_keys = {"ts", "open", "high", "low", "close", "volume", "count",
-                     "up", "dw", "sig", "n_sig"}
+                     "sig", "n_sig"}
     assert set(tab.keys()) == expected_keys, \
-        f"bucket_table 应只输出 framework 字段, 多了: {set(tab.keys()) - expected_keys}"
+        f"bucket_table 应只输出 framework 字段, 多了: {set(tab.keys()) - expected_keys}, " \
+        f"少了: {expected_keys - set(tab.keys())}"
 
     uniq_ts, first_idx, counts = np.unique(ts_out, return_index=True,
                                            return_counts=True)
@@ -181,10 +183,6 @@ def test_bucket_table():
                        np.add.reduceat(arr["volume"], first_idx))
     # 信号计数守恒
     assert int(tab["n_sig"].sum()) == int((sig != 0).sum())
-    # 通道轨在 up/dw 无效处 (未就绪) 为 NaN (frame 层面提供原值过滤)
-    invalid = ~(np.isfinite(tab["up"]) & np.isfinite(tab["dw"]) & (tab["up"] != 0))
-    assert np.isnan(tab["up"][invalid]).all()
-    assert np.isnan(tab["dw"][invalid]).all()
 
 
 def test_period_1d_bucket_example():

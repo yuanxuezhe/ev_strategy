@@ -516,10 +516,12 @@ def run_backtest(st, stime, o, h, l, c, v, sig_out, up_out, dw_out) -> int64:
 def run_backtest_trace(st, stime, o, h, l, c, v,
                        sig_out, up_out, dw_out,
                        ts_out, o_out, h_out, l_out, c_out, v_out) -> int64:
-    """全轨迹版: 额外记录每根 1m bar 所在桶的状态 (桶 ts 与运行中 OHLCV)
+    """全轨迹版: 额外记录每根 1m bar 所在桶的状态 (桶 ts 与运行中 OHLCV + 信号)
 
-    供 bucket_table 生成"每根周期K线 + EMA 上下轨 + 偏离值"明细。
-    各轨迹数组传长度 0 表示不记录。
+    供 bucket_table 生成"每根周期K线"明细 (OHLCV + sig 轨迹)。
+    指标 (EMA 通道 up/dw 等) 也写入对应数组, 但不归 framework.bucket_table
+    处理; 调用方可经 StrategyBase.get_extra_bucket_columns(tab, up=..., dw=...)
+    钩子追加策略专属列。各轨迹数组传长度 0 表示不记录。
     """
     n = stime.shape[0]
     t_sig = sig_out.shape[0] > 0
@@ -542,20 +544,19 @@ def run_backtest_trace(st, stime, o, h, l, c, v,
     return st.n_trades
 
 
-def bucket_table(stime: np.ndarray, sig: np.ndarray, up: np.ndarray, dw: np.ndarray,
+def bucket_table(stime: np.ndarray, sig: np.ndarray,
                  ts_out, o_out, h_out, l_out, c_out, v_out) -> dict:
     """从全轨迹构建"每根周期K线"表格 (纯 numpy 向量化, framework 层)。
 
     每行 = 一个周期桶在**闭合时点**的状态:
       ts/open/high/low/close/volume/count  桶的最终 OHLCV 与含 1m 根数
-      up/dw                                通道轨 (该桶最后一根 bar 时点, 含未闭合桶)
       sig                                  桶最后一根 bar 的信号 (0/1/-1)
       n_sig                                桶内信号总数
-    up/dw 无效 (未就绪 NaN 或 0) 处通道值为 NaN。
 
-    **策略专属的偏离指标** (如 channel_deviation 的 low_dev/high_dev/...) **不在此处
-    计算**; 框架只提供行情 + 通道 + 信号轨迹的桶聚合, 调用方按需调用
-    `strategies/<name>.<compute_indicator_columns>(...)` 拼接。
+    **框架只输出行情 + 信号轨迹的桶聚合; 任何指标列** (如 EMA 通道 up/dw,
+    或策略专属的偏离百分比 low_dev/high_dev/...) **均不在此处计算**。
+    调用方按需把指标数组 (来自 `run_backtest_trace` 或策略模块)
+    传给 `strategy.get_extra_bucket_columns(tab, ...)` 等钩子拼接。
     """
     n = len(ts_out)
     new_bucket = np.r_[True, ts_out[1:] != ts_out[:-1]]
@@ -563,10 +564,6 @@ def bucket_table(stime: np.ndarray, sig: np.ndarray, up: np.ndarray, dw: np.ndar
     last_idx = np.flatnonzero(np.r_[new_bucket[1:], True])
     count = np.diff(np.r_[first_idx, n])
     n_sig = np.add.reduceat(np.abs(sig).astype(np.int64), first_idx)
-
-    valid = np.isfinite(up) & np.isfinite(dw) & (up != 0.0) & (dw != 0.0)
-    upv = np.where(valid, up, np.nan)
-    dwv = np.where(valid, dw, np.nan)
 
     return {
         "ts": ts_out[last_idx],
@@ -576,8 +573,6 @@ def bucket_table(stime: np.ndarray, sig: np.ndarray, up: np.ndarray, dw: np.ndar
         "close": c_out[last_idx],
         "volume": v_out[last_idx],
         "count": count,
-        "up": upv[last_idx],
-        "dw": dwv[last_idx],
         "sig": sig[last_idx],
         "n_sig": n_sig,
     }

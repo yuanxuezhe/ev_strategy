@@ -209,7 +209,7 @@ def _run_kernel(args):
                                 bars["low"], bars["close"], bars["volume"],
                                 sig_out, up_out, dw_out,
                                 ts_out, o_out, h_out, l_out, c_out, v_out)
-        tab = bucket_table(bars["stime"], sig_out, up_out, dw_out,
+        tab = bucket_table(bars["stime"], sig_out,
                            ts_out, o_out, h_out, l_out, c_out, v_out)
         # 只保留策略期 (--start 起) 的桶; 预热期仅用于指标准备, 不输出
         mask = tab["ts"] >= int(args.start) * 1_000_000
@@ -253,15 +253,18 @@ def _run_kernel(args):
 
     if show_bars:
         # 策略额外列: 由 StrategyBase.get_extra_bucket_columns 钩子提供,
-        # framework 不假定任何特定策略; 策略可覆写此方法追加自己的指标列
-        # (例如偏离百分比、信号评分等)。
+        # framework 只负责 OHLCV + sig 轨迹; 策略如需展示指标 (e.g. EMA
+        # 通道 up/dw、偏离百分比) 在其自己的 hook 里追加, framework 不假定
+        # 任何特定指标。per-bar 数组由 caller (此处为 _run_kernel) 透传。
         strategy = get_strategy(args.strategy, params=strategy_params)
-        extra_cols = strategy.get_extra_bucket_columns(tab)
+        extra_cols = strategy.get_extra_bucket_columns(
+            tab=tab, up=up_out, dw=dw_out, h=h_out, l=l_out,
+        )
         if args.show_bars:
             print("\n周期K线明细 (每行 = 一个桶在闭合时点; ts 为右端点; sig 为该桶最后一根 bar 的信号):")
             ts_l = tab["ts"].tolist()
             cols = {k: tab[k].tolist() for k in
-                    ("open", "high", "low", "close", "volume", "count", "up", "dw", "sig", "n_sig")}
+                    ("open", "high", "low", "close", "volume", "count", "sig", "n_sig")}
             cols.update({k: v.tolist() for k, v in extra_cols.items()})
             extra_keys = list(extra_cols.keys())
             for i in range(len(ts_l)):
@@ -271,11 +274,11 @@ def _run_kernel(args):
                 print(f"[{ts_l[i]}] O:{_f4(cols['open'][i])} H:{_f4(cols['high'][i])} "
                       f"L:{_f4(cols['low'][i])} C:{_f4(cols['close'][i])} "
                       f"V:{cols['volume'][i]:.0f} x{cols['count'][i]} | "
-                      f"UP={_f4(cols['up'][i])} DW={_f4(cols['dw'][i])} | {extra_line}"
+                      f"{extra_line}"
                       f"sig={cols['sig'][i]} n_sig={cols['n_sig'][i]}", flush=True)
         if args.bars_out:
             with open(args.bars_out, "w", encoding="utf-8-sig") as f:
-                header = "ts,open,high,low,close,volume,count,up,dw"
+                header = "ts,open,high,low,close,volume,count"
                 if extra_cols:
                     header += "," + ",".join(extra_cols.keys())
                 header += ",signal,n_sig\n"
@@ -283,7 +286,7 @@ def _run_kernel(args):
                 for i in range(len(tab["ts"])):
                     row = (f"{tab['ts'][i]},{tab['open'][i]},{tab['high'][i]},"
                            f"{tab['low'][i]},{tab['close'][i]},{tab['volume'][i]},"
-                           f"{tab['count'][i]},{tab['up'][i]},{tab['dw'][i]}")
+                           f"{tab['count'][i]}")
                     if extra_cols:
                         row += "," + ",".join(str(extra_cols[k][i]) for k in extra_cols)
                     row += f",{tab['sig'][i]},{tab['n_sig'][i]}\n"

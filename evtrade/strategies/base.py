@@ -113,13 +113,16 @@ class StrategyBase:
                 f"H:{cur['high']} L:{cur['low']} C:{cur['close']} | "
                 f"vol:{cur['volume']} x{cur['count']}")
 
-    def get_extra_bucket_columns(self, tab: dict) -> dict:
+    def get_extra_bucket_columns(self, *, tab: dict, **per_bar) -> dict:
         """策略在 framework 桶表之上追加的展示列 (CLI --show-bars / --bars-out 用)
 
-        tab 是 framework.bucket_table() 的输出 (OHLCV + up/dw + sig + n_sig);
-        策略覆写此方法追加自己的指标列 (numpy 数组, 长度与 tab['ts'] 一致)。
-        默认空 dict, 即仅展示 framework 字段; framework 不假定任何策略有额外列。
-        CLI/复盘工具按 key->value 形式迭代展示, 不感知具体列名。
+        tab 是 framework.bucket_table() 的输出 (OHLCV + sig + n_sig,
+        不含 up/dw 等指标); per_bar 是 caller 提供的 per-bar 数组 (e.g.
+        up=..., dw=..., h=..., l=..., 来自 run_backtest_trace)。
+        策略覆写此方法追加自己的指标列 (numpy 数组, 长度与 tab['ts'] 一致, 即
+        已按 tab['count'] 桶聚合)。默认空 dict, 即仅展示 framework 字段;
+        framework 不假定任何策略有额外列。CLI/复盘工具按 key->value 形式
+        迭代展示, 不感知具体列名。
         """
         return {}
 

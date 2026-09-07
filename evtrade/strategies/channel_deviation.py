@@ -130,15 +130,24 @@ class ChannelDeviationStrategy(StrategyBase):
                 f"low_hit_prev={fmt(info.get('low_hit_prev'))} "
                 f"high_hit_prev={fmt(info.get('high_hit_prev'))}")
 
-    def get_extra_bucket_columns(self, tab: dict) -> dict:
+    def get_extra_bucket_columns(self, *, tab: dict, **per_bar) -> dict:
         """策略额外列: 4 个偏离百分比 (与 DSL body 同式)
 
-        framework.bucket_table() 只提供 OHLCV + 通道 + 信号轨迹; 策略
-        在此钩子上追加自己的展示指标。CLI/复盘工具按 key->value 迭代,
-        无需感知具体列名。
+        framework.bucket_table() 只提供 OHLCV + 信号轨迹 (不输出指标);
+        per-bar up/dw/h/l 由 caller 通过 per_bar={"up":..., "dw":..., "h":..., "l":...}
+        传入 (来自 run_backtest_trace)。策略按 per-bar 计算偏离, 再按
+        tab['count'] 桶聚合到与 tab['ts'] 等长。
         """
-        return compute_deviation_columns(tab["up"], tab["dw"],
-                                         tab["high"], tab["low"])
+        import numpy as np
+        up = per_bar.get("up")
+        dw = per_bar.get("dw")
+        h = per_bar.get("h")
+        l = per_bar.get("l")
+        if up is None or dw is None or h is None or l is None:
+            return {}
+        per_bar_dev = compute_deviation_columns(up, dw, h, l)
+        last_idx = np.cumsum(tab["count"]) - 1
+        return {k: v[last_idx] for k, v in per_bar_dev.items()}
 
 
 class _ChannelDevCtx:
