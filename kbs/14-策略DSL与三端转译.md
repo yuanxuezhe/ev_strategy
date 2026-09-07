@@ -141,6 +141,7 @@ python -m evtrade backtest --strategy dev_trigger --params "entry_dev:0.5" ...
 - breakout (滚动窗口型) 需要 O(N) 窗口状态, DSL 契约装不下, 保持参考引擎路径;
 - CUDA device 函数签名的局部变量类型按字面推断 (纯整数字面量 → int, 其余 →
   double); 策略里不要用与内核字段同名的局部变量名;
-- 旧 `cuda_sweep_window` (channel_deviation 专用) 的回撤时间戳用桶 ts,
-  与 CPU 的 1m bar stime 口径有细微差异 (历史行为, `max_dd_days` 不参与
-  GPU/CPU 对账); 通用 kernel 已修正, 新策略一律走通用 kernel。
+- GPU 一律走通用 kernel (`cuda_sweep_window_generic`), 所有 DSL 策略 (含
+  channel_deviation) 同路径; `cuda_sweep_window` 保留为向后兼容 shim (顶层
+  low1..high2 归一化到 params dict 后委托 generic)。回撤时间戳用 1m bar stime,
+  与 CPU `kernel.step` 同口径。旧冻结模板 (`_CUDA_SOURCE`, 桶 ts 口径) 已移除。

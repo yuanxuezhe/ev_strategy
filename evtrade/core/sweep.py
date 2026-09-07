@@ -276,9 +276,8 @@ def sweep(bars: dict, base: dict, combos: list[dict],
 
     strategy_name: 策略 key (默认 channel_deviation)。路径选择 (三端同源):
       - 带 DSL docstring 的策略 (含 channel_deviation, 其 dsl_kernel 返回冻结
-        本尊) -> numba 特化内核 (run_one_dsl); device="gpu" 时走 CUDA ——
-        channel_deviation 走冻结模板 (cuda_sweep_window), 其余走通用模板
-        (cuda_sweep_window_generic)
+        本尊) -> numba 特化内核 (run_one_dsl); device="gpu" 时走通用 CUDA
+        kernel (cuda_sweep_window_generic, channel_deviation 与其余 DSL 策略同路径)
       - 无 DSL 的策略 (如 breakout) -> 参考引擎 (run_one_general, 慢约 500x)
 
     参数传递 (统一路径): 策略参数以 params dict 为唯一事实源
@@ -335,17 +334,14 @@ def sweep(bars: dict, base: dict, combos: list[dict],
     win_data = [(nm, window_bars(e), int(w) * 1_000_000) for nm, e, w in wins]
 
     # 统一参数路径: 策略参数以 params dict 为唯一事实源 (--params > _defaults > 旗标)。
-    # channel_deviation 的历史接口是顶层 low1..high2 —— 双向兼容:
-    #   a) 顶层键并入基础 params (params dict 已显式给出的键优先)
-    #   b) 基础 params 回填顶层别名 (冻结 CUDA 路径 cuda_sweep_window 读顶层)
+    # channel_deviation 的历史接口是顶层 low1..high2 —— 并入基础 params dict
+    # (params dict 已显式给出的键优先); 所有 GPU 路径 (含 channel_deviation) 都读
+    # p["params"], 不再读顶层别名。
     base_params = dict(base.get("params") or {})
     if strategy_name == "channel_deviation":
         for k in ("low1", "low2", "high1", "high2"):
             if k in base:
                 base_params.setdefault(k, base[k])
-        for k in ("low1", "low2", "high1", "high2"):
-            if k in base_params:
-                base[k] = base_params[k]
         base["params"] = base_params
     # 网格 key 覆盖到 base["params"] 上; 缺失的参数继承基础值
     #   语义: --params 提供基础参数, --grid 在指定 key 上扫描, 未指定 key 沿用基础值
@@ -361,15 +357,11 @@ def sweep(bars: dict, base: dict, combos: list[dict],
 
     t0 = time.perf_counter()
     # 路径选择: dsl_fast (含 channel_deviation, 其 dsl_kernel 返回冻结本尊) ->
-    # numba 内核; 无 DSL -> 参考引擎兜底。GPU 冻结模板仅 channel_deviation。
+    # numba 内核; 无 DSL -> 参考引擎兜底。GPU 一律走通用 CUDA kernel
+    # (channel_deviation 经 cuda_sweep_window_generic, 与其余 DSL 策略同路径)。
     dsl_fast = strategy_has_dsl(strategy_name)
-    frozen_cuda = (strategy_name == "channel_deviation")
     metrics = [None] * len(win_data)
-    if device == "gpu" and frozen_cuda:
-        from .gpu import cuda_sweep_window
-        for wi, (nm, wb, warm) in enumerate(win_data):
-            metrics[wi] = cuda_sweep_window(wb, params_list, warm)
-    elif device == "gpu" and dsl_fast:
+    if device == "gpu" and dsl_fast:
         from .gpu import cuda_sweep_window_generic
         for wi, (nm, wb, warm) in enumerate(win_data):
             metrics[wi] = cuda_sweep_window_generic(wb, params_list, warm,

@@ -1,29 +1,23 @@
 from __future__ import annotations
-"""GPU 参数扫描 (CUDA 内核) 与环境探测
+"""GPU 参数扫描 (CUDA 通用内核) 与环境探测
 
 ================================================================
-⚠️  冻结层模块 (与 kernel.py 同步)  ⚠️
-================================================================
-本文件的 CUDA sweep_kernel 与 evtrade.kernel.step 是**逐位等价**的两个实现
-(tests/test_gpu.py 锁定, --fmad=false 强制禁止 FMA 合并)。
-
-修改本文件必须**同步**改 evtrade/kernel.py 对应段;
-NVRTC 重编译 PTX 后, 第一次 GPU 调用会触发编译延迟 (~数秒),
-后续调用命中 _kernel_cache["sweep"]。
+本模块的 CUDA sweep_kernel_generic 与 evtrade.kernel.step 是**等价**的两个实现
+(tests/test_dsl_cuda.py::test_generic_cuda_matches_cpu_channel_deviation 锁定,
+--fmad=false 强制禁止 FMA 合并)。所有 DSL 策略 (含 channel_deviation) 统一走
+通用模板; 策略段由 render_cuda_device_function 编译期注入 {STRATEGY_BODY}。
 
 新增 GPU 输出数组的步骤:
-  1. _CUDA_SOURCE 函数签名末尾加指针参数
+  1. _CUDA_SOURCE_GENERIC_TEMPLATE 函数签名末尾加指针参数
   2. kernel body 末尾写 out_xxx[tid]
-  3. cuda_sweep_window() 中加 cp.empty + 传参 + .get() 拉回 host
+  3. cuda_sweep_window_generic() 中加 cp.empty + 传参 + .get() 拉回 host
   4. Python 侧按 kernel.summarize() 同式汇总新指标
 ================================================================
 
 与 kernel.py 的分工:
-
-与 kernel.py 的分工:
   * kernel.step (numba)  = 流式决策内核: 回测/实盘/扫描共用, 是语义的"唯一权威"。
   * 本模块的 CUDA kernel = 同一步进语义的 GPU 移植 (一行对一行), 只服务参数扫描。
-    两者由 tests/test_gpu.py 差分锁定 (float64 + --fmad=false, 逐位一致)。
+    两者由 tests/test_dsl_cuda.py 差分锁定 (float64 + --fmad=false, 逐位一致)。
 
 关键优化 —— "相同的东西只算一次":
   桶时间戳 ts[i] 与预热标记 mark[i] 只依赖 (周期, 预热阈值), 与策略参数无关,
@@ -37,6 +31,10 @@ NVRTC 重编译 PTX 后, 第一次 GPU 调用会触发编译延迟 (~数秒),
     避免 a*b+c 融合改变舍入导致阈值比较漂移。
   * 输出 = 每组参数的终态标量; equity/baseline/excess 由 Python 侧按
     kernel.summarize 同式计算。
+
+历史: 旧 _CUDA_SOURCE (channel_deviation 专用冻结模板, 参数写死 low1s/high1s
+数组) 已移除, channel_deviation 一并并入通用模板 (回撤时间戳口径随之从"桶 ts"
+修正为"1m bar stime", 与 CPU kernel.step 对齐; max_dd_days 不参与对账)。
 
 本机验证 (2026-09-05): RTX 5090 (sm_120, Blackwell) + 驱动 CUDA 13.1, 无本地
 CUDA toolkit; 经 pip 的 nvidia-cuda-*-cu12 轮子提供 DLL, NVRTC 编译 PTX 由驱动 JIT。
@@ -53,204 +51,11 @@ from .config import INIT_CASH, INIT_POSITION
 from .kernel import encoded_to_epoch, resolve_period_seconds
 from .kernel_dsl import _invalidate_cache, _source_hash as _source_hash_gpu
 
-_CUDA_SOURCE = r"""
-extern "C" __global__ void sweep_kernel(
-    const long long* __restrict__ ts_arr,
-    const signed char* __restrict__ mark_arr,
-    const int* __restrict__ day_id,
-    const double* __restrict__ o, const double* __restrict__ h,
-    const double* __restrict__ l, const double* __restrict__ c,
-    const double* __restrict__ v,
-    long long n, int num_combos,
-    double init_cash, double init_position, double trade_qty,
-    double buy_pct, double sell_pct,
-    const double* __restrict__ scales,
-    const long long* __restrict__ tf1s,
-    const double* __restrict__ low1s, const double* __restrict__ low2s,
-    const double* __restrict__ high1s, const double* __restrict__ high2s,
-    double* out_cash, double* out_pos, double* out_last,
-    long long* out_ntrades, long long* out_nbuy, long long* out_nsell,
-    double* out_mdd, double* out_turnover,
-    double* out_dsum, double* out_dsum2, long long* out_dn, double* out_xmdd,
-    double* out_dneg_sum2, long long* out_dneg_n,
-    double* out_init_equity,
-    long long* out_peak_ts, long long* out_valley_ts, int* out_recovered)
-{
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_combos) return;
+# 旧的 _CUDA_SOURCE (channel_deviation 专用冻结模板) 已移除:
+# 所有 DSL 策略 (含 channel_deviation) 统一走下方 _CUDA_SOURCE_GENERIC_TEMPLATE。
+# 见 cuda_sweep_window (向后兼容 shim) 与 cuda_sweep_window_generic。
 
-    long long tf1 = tf1s[tid];
-    double scale = scales[tid];
-    double low1 = low1s[tid], low2 = low2s[tid];
-    double high1 = high1s[tid], high2 = high2s[tid];
-    double k_ema = 2.0 / ((double)tf1 + 1.0);
-    double nan_bits = __longlong_as_double((long long)0x7ff8000000000000ULL);
 
-    // ---- 状态 (寄存器), 与 KernelState 字段一一对应 ----
-    int has_cur = 0; long long cur_ts = 0;
-    double cur_high = 0.0, cur_low = 0.0, cur_close = 0.0, cur_vol = 0.0;
-    long long cur_count = 0, cur_mark = 1;
-    double up_sum = 0.0, dw_sum = 0.0, up_ema = nan_bits, dw_ema = nan_bits;
-    long long up_count = 0, dw_count = 0;
-    int low_hit = 0, high_hit = 0, lock_init = 0, low_acted = 0, high_acted = 0;
-    long long lock_ts = 0;
-    double cash = init_cash, position = init_position, last_price = 0.0;
-    long long n_trades = 0, n_buy = 0, n_sell = 0;
-    double turnover = 0.0, peak = 0.0, mdd = 0.0;
-    long long peak_ts = 0, valley_ts = 0; int recovered = 1;
-    long long last_side = 0; double cur_qty = trade_qty;   // 倍投状态
-    // 超额曲线 (与 kernel.step 同式)
-    int day_init = 0, day_end_init = 0, cur_day = -1;
-    double x_day_end = 0.0, x_day_end_prev = nan_bits;
-    double d_sum = 0.0, d_sum2 = 0.0, x_peak = -1.0e18, x_mdd = 0.0;
-    long long d_n = 0;
-    double d_neg_sum2 = 0.0; long long d_neg_n = 0;
-    double init_equity = 0.0;
-
-    for (long long i = 0; i < n; ++i) {
-        long long ts = ts_arr[i];
-        long long mark = (long long)mark_arr[i];
-
-        // ---- 桶切换: 闭合旧桶 -> push EMA ----
-        if (has_cur && ts != cur_ts) {
-            if (up_count < tf1) {
-                up_sum += cur_high; up_count++;
-                if (up_count == tf1) up_ema = up_sum / (double)tf1;
-            } else {
-                up_ema = cur_high * k_ema + up_ema * (1.0 - k_ema); up_count++;
-            }
-            if (dw_count < tf1) {
-                dw_sum += cur_low; dw_count++;
-                if (dw_count == tf1) dw_ema = dw_sum / (double)tf1;
-            } else {
-                dw_ema = cur_low * k_ema + dw_ema * (1.0 - k_ema); dw_count++;
-            }
-            has_cur = 0;
-        }
-        if (!has_cur) {
-            has_cur = 1; cur_ts = ts; cur_high = h[i]; cur_low = l[i];
-            cur_close = c[i]; cur_vol = v[i]; cur_count = 1; cur_mark = mark;
-        } else {
-            if (h[i] > cur_high) cur_high = h[i];
-            if (l[i] < cur_low) cur_low = l[i];
-            cur_close = c[i]; cur_vol += v[i]; cur_count++; cur_mark = mark;
-        }
-
-        // ---- 预热桶: 只累积指标 ----
-        if (cur_mark == 0) continue;
-
-        double price = cur_close;
-        last_price = price;
-
-        // ---- 通道值 (含未闭合桶) ----
-        double up, dw;
-        if (up_count < tf1 - 1) up = nan_bits;
-        else if (up_count == tf1 - 1) up = (up_sum + cur_high) / (double)tf1;
-        else up = cur_high * k_ema + up_ema * (1.0 - k_ema);
-        if (dw_count < tf1 - 1) dw = nan_bits;
-        else if (dw_count == tf1 - 1) dw = (dw_sum + cur_low) / (double)tf1;
-        else dw = cur_low * k_ema + dw_ema * (1.0 - k_ema);
-
-        // ---- 策略状态机 (kernel._strategy_check 同式) ----
-        int signal = 0;
-        if (!(up != up) && !(dw != dw) && up != 0.0 && dw != 0.0) {
-            if (!lock_init || cur_ts != lock_ts) {
-                lock_ts = cur_ts; lock_init = 1;
-                low_acted = 0; high_acted = 0;
-            }
-            double low_dev = (dw - cur_low) / dw * 100.0;
-            double high_dev = (cur_high - up) / up * 100.0;
-            double low_dev_h = (dw - cur_high) / dw * 100.0;
-            double high_dev_l = (cur_low - up) / up * 100.0;
-            if (low_hit && low_dev_h < low2 && !low_acted) {
-                signal = 1; low_hit = 0; low_acted = 1;
-            } else if (high_hit && high_dev_l < high2 && !high_acted) {
-                signal = -1; high_hit = 0; high_acted = 1;
-            }
-            if (low_dev > low1 && !low_acted) { low_hit = 1; low_acted = 1; }
-            if (high_dev > high1 && !high_acted) { high_hit = 1; high_acted = 1; }
-        }
-
-        // ---- 模拟成交 (kernel._execute 同式, 含倍投与比例模式; 仅在有信号时执行) ----
-        if (signal != 0) {
-            if (signal == last_side) {
-                cur_qty = cur_qty * scale;
-            } else {
-                cur_qty = trade_qty; last_side = signal;
-            }
-            if (signal == 1) {
-                double q;
-                if (price > 0.0) {
-                    double max_by_cash = cash / price;
-                    if (buy_pct > 0.0) {
-                        // 比例模式: 按当前现金的 buy_pct 算目标, 与资金上限取小;
-                        // 比例本身就是按当下资金算的, 不再被 cur_qty 上限截断
-                        double target = buy_pct * max_by_cash;
-                        q = (target < max_by_cash) ? target : max_by_cash;
-                    } else {
-                        q = (cur_qty < max_by_cash) ? cur_qty : max_by_cash;
-                    }
-                } else {
-                    q = 0.0;
-                }
-                if (q > 0.0) {
-                    cash -= q * price; position += q;
-                    n_trades++; n_buy++; turnover += q * price;
-                }
-            } else if (signal == -1) {
-                double q;
-                if (sell_pct > 0.0) {
-                    double target = sell_pct * position;
-                    q = (target < position) ? target : position;
-                } else {
-                    q = (cur_qty < position) ? cur_qty : position;
-                }
-                if (q > 0.0) {
-                    cash += q * price; position -= q;
-                    n_trades++; n_sell++; turnover += q * price;
-                }
-            }
-        }
-
-        // ---- 权益回撤 + 超额曲线 (与 kernel.step 第8步同式) ----
-        double eq = cash + position * last_price;
-        long long stime = ts;                  // 用于回撤时间戳
-        if (eq > peak) { peak = eq; peak_ts = stime; recovered = 1; }
-        if (peak > 0.0) {
-            double dd = (peak - eq) / peak;
-            if (dd > mdd) { mdd = dd; valley_ts = stime; recovered = 0; }
-        }
-        if (init_equity == 0.0) init_equity = init_cash + init_position * last_price;
-        double base_eq = init_cash + init_position * last_price;
-        double x = (eq - base_eq) / base_eq;
-        if (x > x_peak) x_peak = x;
-        double xdd = x_peak - x;
-        if (xdd > x_mdd) x_mdd = xdd;
-        int day = day_id[i];
-        if (!day_init) {
-            day_init = 1; cur_day = day;
-        } else if (day != cur_day) {
-            if (day_end_init) {
-                double d = x_day_end - x_day_end_prev;
-                d_sum += d; d_sum2 += d * d; d_n++;
-                if (d < 0.0) { d_neg_sum2 += d * d; d_neg_n++; }
-            }
-            x_day_end_prev = x_day_end;
-            day_end_init = 1; cur_day = day;
-        }
-        x_day_end = x;
-    }
-
-    out_cash[tid] = cash; out_pos[tid] = position; out_last[tid] = last_price;
-    out_ntrades[tid] = n_trades; out_nbuy[tid] = n_buy; out_nsell[tid] = n_sell;
-    out_mdd[tid] = mdd; out_turnover[tid] = turnover;
-    out_dsum[tid] = d_sum; out_dsum2[tid] = d_sum2; out_dn[tid] = d_n;
-    out_xmdd[tid] = x_mdd;
-    out_dneg_sum2[tid] = d_neg_sum2; out_dneg_n[tid] = d_neg_n;
-    out_init_equity[tid] = init_equity;
-    out_peak_ts[tid] = peak_ts; out_valley_ts[tid] = valley_ts; out_recovered[tid] = recovered;
-}
-"""
 
 
 # ============ 通用 CUDA kernel: 策略段由 DSL 注入 (步骤 1/2) ============
@@ -258,9 +63,10 @@ extern "C" __global__ void sweep_kernel(
 # 生成的 __device__ int strategy_check(...) 整函数, 编译期注入 {STRATEGY_BODY}。
 # device 函数形态的意义: DSL 里的 return X 直接成为函数返回,
 # "提前返回跳过后续语句" 的语义与 Python/numba 端完全一致 (内联块做不到)。
-# 与 _CUDA_SOURCE (旧 kernel) 的区别:
-#   - params 不再写死 low1/low2/high1/high2; 改用 params_arr 索引 (p0..p7)
-#   - 桶切换重置锁直接用 lock_ts != cur_ts 判断 (与 DSL 语义同式)
+# 设计要点:
+#   - params 用 params_arr 索引 (p0..p7), 不写死策略参数名 → 任意 DSL 策略通用
+#   - 桶切换重置锁用 lock_ts != cur_ts 判断 (与 DSL 语义同式)
+#   - 回撤时间戳用 1m bar stime (与 CPU kernel.step 同口径)
 _CUDA_SOURCE_GENERIC_TEMPLATE = r"""
 // ==== 策略段: DSL 渲染的 __device__ 函数 (编译期注入, 见 strategies/dsl.py) ====
 {STRATEGY_BODY}
@@ -363,7 +169,7 @@ extern "C" __global__ void sweep_kernel_generic(
         double price = cur_close;
         last_price = price;
 
-        // ---- 通道值 (与 _CUDA_SOURCE 同式) ----
+        // ---- 通道值 (与 kernel.py 同式) ----
         double up, dw;
         if (up_count < tf1 - 1) up = nan_bits;
         else if (up_count == tf1 - 1) up = (up_sum + cur_high) / (double)tf1;
@@ -379,7 +185,7 @@ extern "C" __global__ void sweep_kernel_generic(
                                     p0, p1, p2, p3, p4, p5, p6, p7);
         // =========================================================================
 
-        // ---- 模拟成交 (与 _CUDA_SOURCE 同式, 含倍投与比例模式) ----
+        // ---- 模拟成交 (与 kernel.py 同式, 含倍投与比例模式) ----
         if (signal != 0) {
             if (signal == last_side) {
                 cur_qty = cur_qty * scale;
@@ -416,7 +222,7 @@ extern "C" __global__ void sweep_kernel_generic(
             }
         }
 
-        // ---- 权益回撤 + 超额曲线 (与 _CUDA_SOURCE 同式; 回撤时间戳用 1m bar
+        // ---- 权益回撤 + 超额曲线 (与 kernel.py 同式; 回撤时间戳用 1m bar
         //      stime, 与 CPU kernel.step 的 peak_eq_ts/valley_eq_ts 同口径) ----
         double eq = cash + position * last_price;
         long long stime_i = stime_arr[i];
@@ -457,7 +263,6 @@ extern "C" __global__ void sweep_kernel_generic(
 """
 
 _cp = None
-_kernel_cache = {}
 
 # GPU 缓存键: (strategy_name, source_hash, compute_capability, RENDERER_VERSION)
 # 三元 key 让 DSL docstring 改动 / 渲染器版本升级 / 换 GPU 算力时自动失效旧缓存。
@@ -546,23 +351,6 @@ def _ensure_cupy():
     _cp = cp
     return cp
 
-
-def _compile_kernel():
-    """编译 sweep_kernel (按设备架构, 失败回退 compute_90 PTX + 驱动 JIT)"""
-    cp = _ensure_cupy()
-    cc = cp.cuda.device.get_compute_capability()
-    if isinstance(cc, (tuple, list)):
-        archs = [f"compute_{cc[0]}{cc[1]}", "compute_90"]
-    else:
-        archs = ["compute_90"]
-    last_err = None
-    for arch in archs:
-        try:
-            return cp.RawKernel(_CUDA_SOURCE, "sweep_kernel",
-                                options=(f"--gpu-architecture={arch}", "--fmad=false"))
-        except Exception as e:  # NVRTC 不认识该架构时回退
-            last_err = e
-    raise last_err
 
 
 # ============ ts / mark 预计算 (numpy 向量化整数历法, 与 kernel.py 同式) ============
@@ -796,133 +584,47 @@ def _collect_gpu_results(bars, params_list, idxs, warmup_until,
 
 def cuda_sweep_window(bars: dict, params_list: list[dict],
                       warmup_until: int) -> list[dict]:
-    """GPU 批量回测: 一组参数 -> 一个线程, 按周期分组各一次 launch
+    """[向后兼容 shim] channel_deviation 专用冻结模板已废, 统一走通用 kernel。
 
-    params_list 元素含 period/tf1/low1/low2/high1/high2/trade_qty/init_cash/init_position。
+    旧调用方 (benchmark.py / __init__ 导出 / test_gpu) 按 channel_deviation 旧 API
+    传顶层 low1..high2 (无 params dict); 这里归一化到 params dict 后委托
+    cuda_sweep_window_generic。缺省 init_cash/init_position/trade_qty 沿用冻结路径
+    的 config 口径 (INIT_CASH/INIT_POSITION), 保持行为不变。
+
     返回与 kernel.summarize 同口径的绩效字典列表 (顺序同 params_list)。
     """
-    cp = _ensure_cupy()
-    if not params_list:
-        return []
-    kernel = _kernel_cache.get("sweep")
-    if kernel is None:
-        kernel = _compile_kernel()
-        _kernel_cache["sweep"] = kernel
-
-    num = len(params_list)
-    results = [None] * num
-
-    # 按周期分组: 同周期共享预计算的 ts/mark
-    groups: dict[str, list[int]] = {}
-    for i, p in enumerate(params_list):
-        groups.setdefault(p.get("period", "5m"), []).append(i)
-
-    d_o = cp.asarray(bars["open"])
-    d_h = cp.asarray(bars["high"])
-    d_l = cp.asarray(bars["low"])
-    d_c = cp.asarray(bars["close"])
-    d_v = cp.asarray(bars["volume"])
-    # 日 id (连续化), 供超额 Sharpe 的日切检测; 与 CPU 的 stime//10^6 切换点一致
-    day = bars["stime"] // 1_000_000
-    _, day_inv = np.unique(day, return_inverse=True)
-    d_day = cp.asarray(day_inv.astype(np.int32))
-    n = cp.int64(len(bars["stime"]))
-
-    for period, idxs in groups.items():
-        m = len(idxs)
-        ts_np, mark_np = precompute_ts_mark(bars, period, int(warmup_until))
-        d_ts = cp.asarray(ts_np)
-        d_mark = cp.asarray(mark_np)
-        tf1s = cp.empty(m, cp.int64)
-        scales = cp.empty(m, cp.float64)
-        low1s = cp.empty(m, cp.float64)
-        low2s = cp.empty(m, cp.float64)
-        high1s = cp.empty(m, cp.float64)
-        high2s = cp.empty(m, cp.float64)
-        for j, i in enumerate(idxs):
-            p = params_list[i]
-            tf1s[j] = int(p.get("tf1", 21))
-            scales[j] = float(p.get("scale", 1.0))
-            low1s[j] = float(p.get("low1", 1.5))
-            low2s[j] = float(p.get("low2", 1.0))
-            high1s[j] = float(p.get("high1", 1.5))
-            high2s[j] = float(p.get("high2", 0.5))
-        _out = _alloc_gpu_outputs(m)
-        out_cash = _out["out_cash"]; out_pos = _out["out_pos"]; out_last = _out["out_last"]
-        out_ntrades = _out["out_ntrades"]; out_nbuy = _out["out_nbuy"]; out_nsell = _out["out_nsell"]
-        out_mdd = _out["out_mdd"]; out_turnover = _out["out_turnover"]
-        out_dsum = _out["out_dsum"]; out_dsum2 = _out["out_dsum2"]; out_dn = _out["out_dn"]
-        out_xmdd = _out["out_xmdd"]; out_dneg_sum2 = _out["out_dneg_sum2"]; out_dneg_n = _out["out_dneg_n"]
-        out_init_equity = _out["out_init_equity"]
-        out_peak_ts = _out["out_peak_ts"]; out_valley_ts = _out["out_valley_ts"]; out_recovered = _out["out_recovered"]
-
-        threads = 256
-        blocks = (m + threads - 1) // threads
-        # 资金模式 (阶段 2): 按首组参数推断; --all-in 与显式比例都通过 buy_pct/sell_pct 注入
-        _buy_pct = float(params_list[idxs[0]].get("buy_pct", 0.0))
-        _sell_pct = float(params_list[idxs[0]].get("sell_pct", 0.0))
-        if bool(params_list[idxs[0]].get("all_in", False)):
-            _buy_pct = max(_buy_pct, 1.0)
-            _sell_pct = max(_sell_pct, 1.0)
-        kernel((blocks,), (threads,), (
-            d_ts, d_mark, d_day, d_o, d_h, d_l, d_c, d_v,
-            n, cp.int32(m),
-            cp.float64(float(params_list[idxs[0]].get("init_cash", INIT_CASH))),
-            cp.float64(float(params_list[idxs[0]].get("init_position", INIT_POSITION))),
-            cp.float64(float(params_list[idxs[0]].get("trade_qty", 10000.0))),
-            cp.float64(_buy_pct),
-            cp.float64(_sell_pct),
-            scales, tf1s, low1s, low2s, high1s, high2s,
-            out_cash, out_pos, out_last, out_ntrades, out_nbuy,
-            out_nsell, out_mdd, out_turnover,
-            out_dsum, out_dsum2, out_dn, out_xmdd,
-            out_dneg_sum2, out_dneg_n, out_init_equity,
-            out_peak_ts, out_valley_ts, out_recovered,
-        ))
-        cp.cuda.get_current_stream().synchronize()
-
-        cash = out_cash.get()
-        pos = out_pos.get()
-        last = out_last.get()
-        ntr = out_ntrades.get()
-        nbuy = out_nbuy.get()
-        nsell = out_nsell.get()
-        mdd = out_mdd.get()
-        turnover = out_turnover.get()
-        dsum = out_dsum.get()
-        dsum2 = out_dsum2.get()
-        dn = out_dn.get()
-        xmdd = out_xmdd.get()
-        dneg_sum2 = out_dneg_sum2.get()
-        dneg_n = out_dneg_n.get()
-        init_eq = out_init_equity.get()
-        peak_ts = out_peak_ts.get()
-        valley_ts = out_valley_ts.get()
-        recovered = out_recovered.get()
-
-        # 汇总: 与 kernel.summarize 同口径 (公式集中在 _collect_gpu_results)
-        for _i, _m in _collect_gpu_results(
-            bars, params_list, idxs, warmup_until,
-            cash, pos, last, ntr, nbuy, nsell, mdd, turnover,
-            dsum, dsum2, dn, xmdd, dneg_sum2, dneg_n, init_eq,
-            peak_ts, valley_ts, recovered).items():
-            results[_i] = _m
-    return results
+    from ..strategies import get_strategy_param_spec
+    spec = get_strategy_param_spec("channel_deviation")
+    keys = list(spec.keys())  # ['low1','low2','high1','high2']
+    norm = []
+    for p in params_list:
+        p2 = dict(p)
+        sp = dict(p2.get("params") or {})
+        for k in keys:
+            if k in p2 and k not in sp:
+                sp[k] = p2[k]
+        p2["params"] = sp
+        # 沿用冻结路径默认: 缺 init_cash/init_position/trade_qty 时取 config
+        p2.setdefault("init_cash", INIT_CASH)
+        p2.setdefault("init_position", INIT_POSITION)
+        p2.setdefault("trade_qty", 10000.0)
+        norm.append(p2)
+    return cuda_sweep_window_generic(bars, norm, warmup_until,
+                                     strategy_name="channel_deviation")
 
 
 # ============ 通用 CUDA sweep kernel (步骤 1) ============
-# 接受任意 strategies/ 子包策略 (有 DSL compute_signal docstring)
-# ctx 字段约定: p0..p7 是策略参数 (按 params_spec 顺序); 其余字段与 _CUDA_SOURCE 相同
+# 接受任意 strategies/ 子包策略 (含 channel_deviation; 需 DSL compute_signal docstring)
+# ctx 字段约定: p0..p7 是策略参数 (按 params_spec 顺序); 其余字段与 kernel.py 同式
 
 def cuda_sweep_window_generic(bars: dict, params_list: list[dict],
                                 warmup_until: int,
                                 strategy_name: str = None) -> list[dict]:
-    """GPU 批量回测 (任意 DSL 策略; 步骤 1/2 通用 kernel)
+    """GPU 批量回测 (任意 DSL 策略; 含 channel_deviation; 通用 kernel)
 
-    与 cuda_sweep_window 区别:
-      - params 不再写死 low1/low2/high1/high2; 改用 params["params"] dict
-        (按策略 params_spec 声明顺序映射到内核 p0..p7)
-      - 策略段用 DSL 注入 (render_cuda_device_function)
+    params 从 params["params"] dict 取 (按策略 params_spec 声明顺序映射到内核
+    p0..p7); 策略段由 DSL 注入 (render_cuda_device_function, 编译期 {STRATEGY_BODY})。
+    cuda_sweep_window (channel_deviation 旧 API) 是本函数的向后兼容 shim。
     strategy_name: 策略 key; 缺省时取 params_list[0]["strategy_name"]。
     """
     from ..strategies import get_strategy_param_spec
