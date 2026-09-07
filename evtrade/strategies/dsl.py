@@ -303,7 +303,7 @@ def render_cuda_body(strategy_class, method_name: str = "compute_signal") -> str
     """把 DSL 体渲染成 CUDA C99 函数体 (调试视图; 实际注入用 render_cuda_device_function)
 
     输出与 render_numba_body 字段名 + 表达式字面完全一致, 只做语法转换:
-      - ctx.xxx   -> 内核状态名 (映射表 _CTX_TO_KERNEL; 未映射 -> 局部变量名)
+      - ctx.xxx   -> 内核状态名 (build_ctx_to_kernel_map(strategy_class); 未映射 -> 局部变量名)
       - True/False -> 1/0  (C99 没有 bool)
       - and/or/not -> &&/||/! (C99)
       - 整数字面量在算术表达式里加 .0 当 double 算
@@ -313,19 +313,21 @@ def render_cuda_body(strategy_class, method_name: str = "compute_signal") -> str
     wrapped = f"def _f(ctx):\n{textwrap.indent(body, '    ')}"
     tree = ast.parse(wrapped)
     _validate(tree)
-    return _render_cuda_state_body(tree)
+    return _render_cuda_state_body(tree, strategy_class)
 
 
-def _render_cuda_state_body(tree: ast.Module) -> str:
+def _render_cuda_state_body(tree: ast.Module, strategy_class) -> str:
     """AST -> C99 函数体 (两遍: 局部变量 int/double 推断 -> 逐语句渲染)
 
     语义:
-      - ctx.xxx 按映射表 _CTX_TO_KERNEL 改成内核状态名; 未映射的 ctx.x 与裸名 x
-        是局部变量, 首赋值处声明 (纯整数字面量 -> int, 否则 double)
+      - ctx.xxx 按映射表 build_ctx_to_kernel_map(strategy_class) 改成内核状态名;
+        未映射的 ctx.x 与裸名 x 是局部变量, 首赋值处声明
       - True/False -> 1/0, and/or/not -> &&/||/!, 整数字面量加 .0 (比较右值除外)
       - 嵌套 if 的花括号/缩进由 _c99_stmt_state 递归处理
     """
     fn = tree.body[0]
+    ctx_map = build_ctx_to_kernel_map(strategy_class)
+    sig_fields = build_cuda_sig_fields(strategy_class)
 
     # 第一遍: 收集局部变量全部赋值的 RHS -> int/double 推断
     rhs_by_name: dict = {}
@@ -339,13 +341,13 @@ def _render_cuda_state_body(tree: ast.Module) -> str:
         elif isinstance(n, ast.Assign) and len(n.targets) == 1:
             t = n.targets[0]
             if isinstance(t, ast.Attribute):
-                field = _c99_attr(t)
+                field = _c99_attr(t, ctx_map)
             elif isinstance(t, ast.Name):
                 field = t.id
             else:
                 return
-            if field not in _CUDA_SIG_FIELDS:
-                rhs_by_name.setdefault(field, []).append(_c99_expr(n.value))
+            if field not in sig_fields:
+                rhs_by_name.setdefault(field, []).append(_c99_expr(n.value, ctx_map))
 
     for stmt in fn.body:
         _collect(stmt)
@@ -356,19 +358,19 @@ def _render_cuda_state_body(tree: ast.Module) -> str:
     }
 
     # 第二遍: 逐语句渲染 (内核字段已在签名里, 视为已声明)
-    declared = set(_CUDA_SIG_FIELDS)
-    lines = [_c99_stmt_state(s, declared, decl_kinds) for s in fn.body]
+    declared = set(sig_fields)
+    lines = [_c99_stmt_state(s, declared, decl_kinds, ctx_map) for s in fn.body]
     return "\n".join(line for line in lines if line)
 
 
-def _c99_attr(node: ast.Attribute) -> str:
-    """ctx.xxx -> 内核状态名 (映射表 _CTX_TO_KERNEL; 未映射字段视为局部变量)"""
+def _c99_attr(node: ast.Attribute, ctx_map: dict) -> str:
+    """ctx.xxx -> 内核状态名 (映射表 ctx_map; 未映射字段视为局部变量)"""
     if isinstance(node.value, ast.Name) and node.value.id == "ctx":
-        return _CTX_TO_KERNEL.get(node.attr, node.attr)
+        return ctx_map.get(node.attr, node.attr)
     raise CompileError("CUDA DSL 仅支持 ctx.xxx 形式访问")
 
 
-def _c99_expr(node) -> str:
+def _c99_expr(node, ctx_map: dict) -> str:
     """表达式节点 -> C99 字符串 (递归)"""
     if isinstance(node, ast.Constant):
         v = node.value
@@ -386,18 +388,18 @@ def _c99_expr(node) -> str:
             return "1" if node.id == "True" else "0"
         return node.id
     if isinstance(node, ast.Attribute):
-        return _c99_attr(node)
+        return _c99_attr(node, ctx_map)
     if isinstance(node, ast.Call):
         # 白名单 (min/max/abs); _validate 已拒绝关键字参数
         if not (isinstance(node.func, ast.Name)
                 and node.func.id in _CALL_WHITELIST):
             raise CompileError(f"CUDA DSL 不支持调用 {type(node.func).__name__}")
         if node.func.id == "abs" and len(node.args) == 1:
-            x = _c99_expr(node.args[0])
+            x = _c99_expr(node.args[0], ctx_map)
             return f"(({x}) < 0 ? -({x}) : ({x}))"
         if node.func.id in ("min", "max") and len(node.args) == 2:
-            a = _c99_expr(node.args[0])
-            b = _c99_expr(node.args[1])
+            a = _c99_expr(node.args[0], ctx_map)
+            b = _c99_expr(node.args[1], ctx_map)
             op = "<" if node.func.id == "min" else ">"
             return f"(({a}) {op} ({b}) ? ({a}) : ({b}))"
         raise CompileError(f"CUDA DSL 仅支持 min(a,b) / max(a,b) / abs(a)")
@@ -409,12 +411,12 @@ def _c99_expr(node) -> str:
         }
         if type(op) not in op_map:
             raise CompileError(f"CUDA DSL 不支持算子 {type(op).__name__}")
-        return f"({_c99_expr(node.left)} {op_map[type(op)]} {_c99_expr(node.right)})"
+        return f"({_c99_expr(node.left, ctx_map)} {op_map[type(op)]} {_c99_expr(node.right, ctx_map)})"
     if isinstance(node, ast.UnaryOp):
         if isinstance(node.op, ast.Not):
-            return f"(!{_c99_expr(node.operand)})"
+            return f"(!{_c99_expr(node.operand, ctx_map)})"
         if isinstance(node.op, ast.USub):
-            return f"(-{_c99_expr(node.operand)})"
+            return f"(-{_c99_expr(node.operand, ctx_map)})"
         raise CompileError(f"CUDA DSL 不支持一元算子 {type(node.op).__name__}")
     if isinstance(node, ast.Compare):
         # 单比较链: a < b < c 拆成 (a<b) && (b<c)
@@ -427,10 +429,10 @@ def _c99_expr(node) -> str:
         op = type(node.ops[0])
         if op not in op_map:
             raise CompileError(f"CUDA DSL 不支持比较 {op.__name__}")
-        return f"({_c99_expr(node.left)} {op_map[op]} {_c99_expr(node.comparators[0])})"
+        return f"({_c99_expr(node.left, ctx_map)} {op_map[op]} {_c99_expr(node.comparators[0], ctx_map)})"
     if isinstance(node, ast.BoolOp):
         kw = "&&" if isinstance(node.op, ast.And) else "||"
-        return f"({kw.join(_c99_expr(v) for v in node.values)})"
+        return f"({kw.join(_c99_expr(v, ctx_map) for v in node.values)})"
     raise CompileError(f"CUDA DSL 不支持表达式节点 {type(node).__name__}: {ast.unparse(node)}")
 
 
@@ -446,12 +448,26 @@ def compile_all(strategy_class, method_name: str = "compute_signal") -> dict:
 # ====================================================================
 # 内核状态映射 (步骤 2): DSL ctx 字段 -> 内核侧名字
 # ====================================================================
-# key   = DSL 里写的 ctx.<name>
-# value = 内核侧名字 (numba 端渲染成 st.<name>, CUDA 端为裸名);
-#         up/dw 是 _strategy_check / strategy_check 的函数参数 (两端都为裸名)。
-# 不在表内的 ctx.<name> 与裸名 x 都是策略局部变量 (内核端首赋值处声明,
-# 首次赋值前不可读)。
-_CTX_TO_KERNEL = {
+# 状态字段来源: strategy.state_spec (由策略类声明)。框架层无任何 baked-in 字段
+# 名; 跨所有 DSL 策略都存在的"bar info"字段列在 _FRAMEWORK_CTX_FIELDS,
+# 跨所有 DSL 策略的"参数寄存器"是 p0..p15 (numba) / p0..p7 (CUDA 通用模板)。
+#
+# 单名空间: ctx.<name> = 内核侧 <name> = state_spec[name], 全部 identity 映射
+# (旧版的 _bucket_ts -> lock_ts 等改名随 channel_deviation 迁移一并取消)。
+#
+# 向后兼容: 未声明 state_spec 的策略暂时使用 _LEGACY_STATE_SPEC 默认值,
+# 等所有 DSL 策略迁移完毕后移除。
+from .base import get_strategy_state_spec
+
+# 框架通用 ctx 字段 (每根 bar 由 dsl_check / kernel step 注入, 不在 state_spec)
+_FRAMEWORK_CTX_FIELDS = (
+    "cur_ts", "cur_open", "cur_high", "cur_low", "cur_close", "cur_volume",
+    "up", "dw",
+)
+
+# 历史 ctx -> 内核 映射 (含 _bucket_ts → lock_ts 等改名)。仅在策略未声明
+# state_spec 时使用 — 待所有 DSL 策略迁移完毕 (Commit 2) 后整体移除。
+_OLD_CTX_TO_KERNEL = {
     "cur_ts": "cur_ts", "cur_open": "cur_open", "cur_high": "cur_high",
     "cur_low": "cur_low", "cur_close": "cur_close", "cur_volume": "cur_volume",
     "up": "up", "dw": "dw",
@@ -460,46 +476,17 @@ _CTX_TO_KERNEL = {
     "_bucket_ts": "lock_ts",
 }
 for _i in range(16):
-    _CTX_TO_KERNEL[f"p{_i}"] = f"p{_i}"
+    _OLD_CTX_TO_KERNEL[f"p{_i}"] = f"p{_i}"
 
-# numba 端不加 st. 前缀的字段 (_strategy_check 的函数参数)
-_KERNEL_BARE = frozenset({"up", "dw"})
-
-# CUDA device 函数签名实际存在的字段 (模板寄存器/状态有限, 超出即拒绝)
-_CUDA_SIG_FIELDS = frozenset(
+# 历史 CUDA device 函数签名 (未声明 state_spec 的策略使用)。Commit 2 移除。
+_OLD_CUDA_SIG_FIELDS = frozenset(
     {"low_hit", "high_hit", "low_acted", "high_acted", "lock_ts",
      "cur_ts", "cur_open", "cur_high", "cur_low", "cur_close", "cur_volume",
      "up", "dw"}
     | {f"p{i}" for i in range(8)}
 )
 
-
-def render_numba_state_body(strategy_class, method_name: str = "compute_signal") -> str:
-    """DSL -> kernel._strategy_check 函数体 (st 形式, kernel_dsl.splice 用)
-
-    render_numba_body 的产物再做 ctx -> 内核状态改名:
-      ctx.up/ctx.dw   -> up / dw      (函数参数)
-      ctx.<表内字段>  -> st.<内核名>  (jitclass 字段)
-      其余 ctx.x / 裸名 x -> 局部变量 (名字不变)
-    表达式字面顺序保持不变 (浮点路径与 Python 端一致)。
-    """
-    body = render_numba_body(strategy_class, method_name)
-
-    def _sub(m: "re.Match") -> str:
-        name = m.group(1)
-        k = _CTX_TO_KERNEL.get(name)
-        if k is None:
-            return name              # 未映射 ctx 字段 = 局部变量
-        if k in _KERNEL_BARE:
-            return k
-        return f"st.{k}"
-
-    return re.sub(r"\bctx\.([A-Za-z_]\w*)", _sub, body)
-
-
-# CUDA device 函数: 状态字段按引用传入 (可写), 行情/参数为 const 引用。
-# return 语义与 DSL 完全一致 (device 函数返回即跳过本桶剩余策略逻辑)。
-_CUDA_DEVICE_HEADER = """\
+_OLD_CUDA_DEVICE_HEADER = """\
 __device__ __forceinline__ int strategy_check(
     int &low_hit, int &high_hit, int &low_acted, int &high_acted,
     long long &lock_ts,
@@ -511,28 +498,140 @@ __device__ __forceinline__ int strategy_check(
     const double &p4, const double &p5, const double &p6, const double &p7)
 {"""
 
+# 历史 state_spec (供 make_dsl_ctx 初始化未声明策略的 ctx)。
+_OLD_LEGACY_STATE_SPEC = {
+    "low_hit":    {"type": bool,  "default": False},
+    "high_hit":   {"type": bool,  "default": False},
+    "_bucket_ts": {"type": int,   "default": None},   # 默认 None (历史行为, 未迁移)
+    "_low_acted": {"type": bool,  "default": False},
+    "_high_acted": {"type": bool,  "default": False},
+}
 
-def _c99_stmt_state(node, declared: set, decl_kinds: dict) -> str:
+# Python 原生类型 -> numba 类型名 / CUDA 类型声明
+_PY_TYPE_TO_NUMBA = {bool: "boolean", int: "int64", float: "float64"}
+_PY_TYPE_TO_CUDA = {bool: "int", int: "long long", float: "double"}
+
+
+def _use_legacy_mode(strategy_class) -> bool:
+    """该策略是否走向后兼容路径 (未声明 state_spec)"""
+    cls = strategy_class if isinstance(strategy_class, type) else type(strategy_class)
+    return not (getattr(cls, "state_spec", None) or {})
+
+
+def build_ctx_to_kernel_map(strategy_class) -> dict[str, str]:
+    """DSL ctx 字段名 -> 内核状态字段名
+
+    - 未声明 state_spec 的策略: 返回历史映射 _OLD_CTX_TO_KERNEL (含
+      _bucket_ts → lock_ts 等改名, 等所有策略迁移后整段移除)
+    - 声明了 state_spec 的策略: 单名空间 identity 映射
+      (框架字段 + state_spec 字段 + p0..p15)
+    """
+    if _use_legacy_mode(strategy_class):
+        return dict(_OLD_CTX_TO_KERNEL)
+    m = {f: f for f in _FRAMEWORK_CTX_FIELDS}
+    cls = strategy_class if isinstance(strategy_class, type) else type(strategy_class)
+    for name in (getattr(cls, "state_spec", None) or {}):
+        m[name] = name
+    for i in range(16):
+        m[f"p{i}"] = f"p{i}"
+    return m
+
+
+def build_cuda_sig_fields(strategy_class) -> frozenset:
+    """CUDA __device__ 函数签名内可引用的字段集合 (DSL 字段引用校验用)
+
+    包含: 框架字段 + state_spec 字段 + p0..p7 (CUDA 通用模板上限)。
+    未声明 state_spec 时使用历史固定集合 _OLD_CUDA_SIG_FIELDS。
+    """
+    if _use_legacy_mode(strategy_class):
+        return _OLD_CUDA_SIG_FIELDS
+    cls = strategy_class if isinstance(strategy_class, type) else type(strategy_class)
+    return frozenset(
+        set(_FRAMEWORK_CTX_FIELDS)
+        | set(getattr(cls, "state_spec", None) or {})
+        | {f"p{i}" for i in range(8)}
+    )
+
+
+def build_cuda_device_header(strategy_class) -> str:
+    """生成 __device__ __forceinline__ int strategy_check(...) 的 C 签名头
+
+    - 未声明 state_spec: 返回 _OLD_CUDA_DEVICE_HEADER (历史固定签名)
+    - 声明了 state_spec: 按 state_spec 字段顺序追加到框架字段前,
+      int/bool → int, int → long long, float → double
+    """
+    if _use_legacy_mode(strategy_class):
+        return _OLD_CUDA_DEVICE_HEADER
+    cls = strategy_class if isinstance(strategy_class, type) else type(strategy_class)
+    state_args = [
+        f"{_PY_TYPE_TO_CUDA[schema['type']]} &{name}"
+        for name, schema in (getattr(cls, "state_spec", None) or {}).items()
+    ]
+    framework_args = [
+        "const long long &cur_ts",
+        "const double &cur_open", "const double &cur_high",
+        "const double &cur_low", "const double &cur_close",
+        "const double &cur_volume",
+        "const double &up", "const double &dw",
+    ]
+    p_args = [f"const double &p{i}" for i in range(8)]
+    args = state_args + framework_args + p_args
+    return ("__device__ __forceinline__ int strategy_check(\n    "
+            + ",\n    ".join(args) + "\n){")
+
+
+# numba 端不加 st. 前缀的字段 (_strategy_check 的函数参数)
+_KERNEL_BARE = frozenset({"up", "dw"})
+
+
+def render_numba_state_body(strategy_class, method_name: str = "compute_signal") -> str:
+    """DSL -> kernel._strategy_check 函数体 (st 形式, kernel_dsl.splice 用)
+
+    render_numba_body 的产物再做 ctx -> 内核状态改名:
+      ctx.up/ctx.dw   -> up / dw      (函数参数)
+      ctx.<表内字段>  -> st.<内核名>  (jitclass 字段)
+      其余 ctx.x / 裸名 x -> 局部变量 (名字不变)
+    表达式字面顺序保持不变 (浮点路径与 Python 端一致)。
+
+    字段映射按 build_ctx_to_kernel_map(strategy_class) — 单名空间 (identity),
+    state_spec 字段直接进入 map。
+    """
+    body = render_numba_body(strategy_class, method_name)
+    ctx_map = build_ctx_to_kernel_map(strategy_class)
+
+    def _sub(m: "re.Match") -> str:
+        name = m.group(1)
+        k = ctx_map.get(name)
+        if k is None:
+            return name              # 未映射 ctx 字段 = 局部变量
+        if k in _KERNEL_BARE:
+            return k
+        return f"st.{k}"
+
+    return re.sub(r"\bctx\.([A-Za-z_]\w*)", _sub, body)
+
+
+def _c99_stmt_state(node, declared: set, decl_kinds: dict, ctx_map: dict) -> str:
     """语句 -> C99 (内核状态映射版): 局部变量首赋值处按 decl_kinds 声明"""
     if isinstance(node, ast.If):
-        cond = _c99_expr(node.test)
+        cond = _c99_expr(node.test, ctx_map)
         lines = [f"if ({cond}) {{"]
         for s in node.body:
-            lines.append("  " + _c99_stmt_state(s, declared, decl_kinds))
+            lines.append("  " + _c99_stmt_state(s, declared, decl_kinds, ctx_map))
         lines.append("}")
         if node.orelse:
             lines.append("else {")
             for s in node.orelse:
-                lines.append("  " + _c99_stmt_state(s, declared, decl_kinds))
+                lines.append("  " + _c99_stmt_state(s, declared, decl_kinds, ctx_map))
             lines.append("}")
         return "\n".join(lines)
     if isinstance(node, ast.Assign):
         if len(node.targets) != 1:
             raise CompileError("CUDA DSL 不允许多元赋值")
         target = node.targets[0]
-        val = _c99_expr(node.value)
+        val = _c99_expr(node.value, ctx_map)
         if isinstance(target, ast.Attribute):
-            field = _c99_attr(target)
+            field = _c99_attr(target, ctx_map)
         elif isinstance(target, ast.Name):
             field = target.id
         else:
@@ -542,7 +641,7 @@ def _c99_stmt_state(node, declared: set, decl_kinds: dict) -> str:
         declared.add(field)
         return f"{decl_kinds.get(field, 'double')} {field} = {val};"
     if isinstance(node, ast.Return):
-        return f"return {_c99_expr(node.value)};"
+        return f"return {_c99_expr(node.value, ctx_map)};"
     raise CompileError(f"CUDA DSL 不支持语句 {type(node).__name__}")
 
 
@@ -556,6 +655,9 @@ def render_cuda_device_function(strategy_class, method_name: str = "compute_sign
       - params_spec 长度 > 8 时编译期即报错 (CUDA 通用模板只有 p0..p7 寄存器);
         CPU/numba 路径支持到 p15 (见 kernel_dsl.make_state_general 的 16 上限),
         想用更多参数必须拆分策略或走 CPU 路径。
+
+    函数签名由 build_cuda_device_header(strategy_class) 生成 (按 state_spec 字段
+    顺序追加到框架字段前; 单名空间, 不再做 ctx<->kernel 名字重映射)。
     """
     body = _extract_dsl_body(strategy_class, method_name)
     wrapped = f"def _f(ctx):\n{textwrap.indent(body, '    ')}"
@@ -575,19 +677,23 @@ def render_cuda_device_function(strategy_class, method_name: str = "compute_sign
         )
 
     # 引用校验: 映射后仍在 CUDA 签名之外的字段直接拒绝 (模板无此寄存器)
+    ctx_map = build_ctx_to_kernel_map(strategy_class)
+    sig_fields = build_cuda_sig_fields(strategy_class)
     used = {n.attr for n in ast.walk(fn)
             if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
             and n.value.id == "ctx"}
     overflow = sorted(
-        _CTX_TO_KERNEL.get(a, a) for a in used
-        if a in _CTX_TO_KERNEL and _CTX_TO_KERNEL[a] not in _CUDA_SIG_FIELDS)
+        ctx_map.get(a, a) for a in used
+        if a in ctx_map and ctx_map[a] not in sig_fields)
     if overflow:
+        # 列出实际生效的 sig_fields, 给用户明确诊断
+        sig_list = sorted(sig_fields)
         raise CompileError(
             f"CUDA 通用内核 ctx 契约不含 {overflow} (仅支持 "
-            f"cur_ts/cur_open/cur_high/cur_low/cur_close/cur_volume/up/dw/"
-            f"low_hit/high_hit/_low_acted/_high_acted/_bucket_ts/p0..p7)")
+            f"{', '.join(sig_list)})")
 
-    return _CUDA_DEVICE_HEADER + "\n" + _render_cuda_state_body(tree) + "\n}"
+    header = build_cuda_device_header(strategy_class)
+    return header + "\n" + _render_cuda_state_body(tree, strategy_class) + "\n}"
 
 
 # ====================================================================
@@ -595,10 +701,14 @@ def render_cuda_device_function(strategy_class, method_name: str = "compute_sign
 # ====================================================================
 
 class DSLCtx:
-    """通用 DSL 上下文: 字段 = 内核状态契约 (与 _CTX_TO_KERNEL 一致)
+    """通用 DSL 上下文: 框架字段 (bar info + 参数寄存器) + 状态字段 (state_spec)
 
-    状态字段 (low_hit/_bucket_ts/...) 在 ctx 上跨桶持久, 由策略实例持有;
-    DSL 里 ctx.low_dev 等临时字段会作为普通属性动态挂上 (无 __slots__ 限制)。
+    框架层只放 bar info 与 p0..p15 (不依赖具体策略); 状态字段 (低/高触发锁、
+    桶切换时间戳等) 由 make_dsl_ctx(strategy_class) 按 state_spec 投影后
+    注入, 与策略 class 一一对应。
+
+    DSL body 里 ctx.<临时变量> (e.g. ctx.low_dev) 会作为普通属性动态挂上,
+    不在 __slots__ 限制范围内。
     """
 
     def __init__(self):
@@ -612,11 +722,26 @@ class DSLCtx:
         self.dw = 0.0
         for i in range(16):
             setattr(self, f"p{i}", 0.0)
-        self.low_hit = False
-        self.high_hit = False
-        self._bucket_ts = None
-        self._low_acted = False
-        self._high_acted = False
+
+
+def make_dsl_ctx(strategy_class) -> DSLCtx:
+    """构造 DSL Python 端 ctx: 框架字段 + state_spec 字段 (按 default 初始化)
+
+    状态字段按 strategy.state_spec (或 _OLD_LEGACY_STATE_SPEC 向后兼容回退)
+    投影。未声明 state_spec 的旧策略仍按历史字段名 (_bucket_ts / _low_acted /
+    _high_acted / low_hit / high_hit) 初始化, 与 kernel 端 _OLD_CTX_TO_KERNEL
+    改名一致; 等所有策略迁移完毕后 _OLD_LEGACY_STATE_SPEC 与 _OLD_CTX_TO_KERNEL
+    一起移除。
+    """
+    ctx = DSLCtx()
+    if _use_legacy_mode(strategy_class):
+        spec = _OLD_LEGACY_STATE_SPEC
+    else:
+        cls = strategy_class if isinstance(strategy_class, type) else type(strategy_class)
+        spec = cls.state_spec
+    for name, schema in spec.items():
+        setattr(ctx, name, schema["default"])
+    return ctx
 
 
 def dsl_check(strategy, ctx: DSLCtx, cur: dict, up, dw) -> int:

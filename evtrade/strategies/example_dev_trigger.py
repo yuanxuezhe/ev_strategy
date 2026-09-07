@@ -16,7 +16,7 @@ docstring (DSL) 里, 三端自动可用:
 参数访问一律用 ctx.pN (按 params_spec 声明顺序), 与内核 p0..p15 对齐。
 """
 from .base import StrategyBase, register_strategy
-from .dsl import DSLCtx, dsl_check
+from .dsl import make_dsl_ctx, dsl_check
 
 
 @register_strategy("dev_trigger")
@@ -33,7 +33,7 @@ class DevTriggerStrategy(StrategyBase):
 
     def __init__(self, params: dict | None = None, **kwargs):
         super().__init__(params=params, **kwargs)
-        self._ctx = DSLCtx()          # 状态字段跨桶持久
+        self._ctx = make_dsl_ctx(type(self))   # 状态字段跨桶持久
 
     def compute_signal(self, ctx):
         """DSL 主逻辑 (dev_trigger)"""

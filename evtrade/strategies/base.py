@@ -14,16 +14,29 @@ from __future__ import annotations
   - get_strategy(name, params={...}) 或 get_strategy(name, k1=v1, k2=v2) 都可用
   - CLI 通过 --params "k1:v1;k2:v2" 传入, sweep 通过 --grid "k1=v1,v2;k2=v3,v4" 笛卡尔积
 
+DSL 策略状态字段 (2026-09-07): state_spec
+  - DSL 策略在三类之间共享的"持久状态字段" (跨 bar 持续, 桶切换可重置),
+    由策略声明, framework 投影到 Python ctx / numba jitclass / CUDA device 函数
+  - schema 与 params_spec 平行: {name: {"type": Python 原生类型 (bool/int/float),
+                                       "default": 标量初值}}
+  - 框架会自动:
+      * build_ctx_to_kernel_map(Cls)   把 state_spec 字段名映射到 kernel 状态
+      * build_cuda_sig_fields(Cls)     校验 DSL body 只引用签名内的字段
+      * build_cuda_device_header(Cls)  生成 __device__ 函数签名
+      * make_dsl_ctx(Cls)              构造 Python 端 ctx 实例 (字段初值 = default)
+  - 新增 DSL 策略: 在 state_spec 声明自己需要的持久字段; 不需要持久状态的策略
+    可以 state_spec = {} (空字典) 或省略。
+
 新增策略:
   1. 在 strategies/ 子目录写一个文件 (例 my_strategy.py)
-  2. 继承 StrategyBase, 声明类属性 params_spec
+  2. 继承 StrategyBase, 声明类属性 params_spec (必须) 与 state_spec (DSL 策略必须,
+     非 DSL 策略可省略)
   3. 类上加 @register_strategy("my_strategy")
   4. CLI 自动可用 --strategy my_strategy --params "..."
 
 当前实现限制 (2026-09-06):
   - 带 DSL docstring 的策略: 三端同源 (参考引擎 + numba 内核 + CUDA, 见 dsl.py
     与 core/kernel_dsl.py); 无 DSL 的策略仅参考引擎路径 (慢约 500x)
-  - DSL 状态契约固定 (low_hit/high_hit/_bucket_ts/... + p0..p15), 见 dsl._CTX_TO_KERNEL
 ================================================================
 """
 from typing import Any, Callable, Type
@@ -54,6 +67,12 @@ class StrategyBase:
 
     name: str = ""
     params_spec: dict[str, dict[str, Any]] = {}
+    # DSL 策略跨桶持久的状态字段 (framework 投影到 Python ctx / numba jitclass /
+    # CUDA device 函数); 非 DSL 策略可省略 (留空 dict)。schema:
+    #   {"field_name": {"type": bool | int | float, "default": <标量初值>}}
+    # 框架层 type 映射: bool → numba.boolean, int → numba.int64, float → numba.float64
+    # (在 dsl.py / kernel.py / gpu.py 的工厂函数中统一消费)
+    state_spec: dict[str, dict[str, Any]] = {}
 
     def __init__(self, params: dict[str, Any] | None = None, **kwargs):
         merged = dict(params or {})
@@ -194,6 +213,21 @@ def get_strategy_param_spec(name: str) -> dict[str, dict[str, Any]]:
     if name not in _STRATEGIES:
         raise ValueError(f"未知策略 {name!r}")
     return _STRATEGIES[name].params_spec
+
+
+def get_strategy_state_spec(name: str) -> dict[str, dict[str, Any]]:
+    """查策略的 state_spec (DSL framework 工厂函数用; 编译期/渲染期统一来源)
+
+    state_spec 为空 dict 表示该策略无跨桶持久状态字段 (DSL body 里只能写
+    局部变量, 不能写 ctx.<持久字段>)。
+
+    字段 schema: {name: {"type": bool | int | float, "default": <标量>}}
+      - type 必须是 Python 原生 bool/int/float (与 numba boolean/int64/float64 一一映射)
+      - default 必须与 type 一致
+    """
+    if name not in _STRATEGIES:
+        raise ValueError(f"未知策略 {name!r}")
+    return _STRATEGIES[name].state_spec or {}
 
 
 def available_strategies() -> list[str]:

@@ -19,6 +19,7 @@ from __future__ import annotations
 # 触发装饰器副作用
 from .base import (StrategyBase, register_strategy, get_strategy,
                    get_strategy_class, get_strategy_param_spec,
+                   get_strategy_state_spec,
                    available_strategies)
 from . import channel_deviation  # noqa: F401  注册 channel_deviation
 from . import example_breakout  # noqa: F401  注册 breakout (示例, 仅参考引擎)
@@ -27,13 +28,18 @@ from . import example_dev_trigger  # noqa: F401  注册 dev_trigger (DSL 三端�
 # DSL 转译器 (Python / numba / CUDA 三端)
 from .dsl import (compile_all, render_numba_body, render_cuda_body,
                   render_numba_state_body, render_cuda_device_function,
+                  build_ctx_to_kernel_map, build_cuda_sig_fields,
+                  build_cuda_device_header, make_dsl_ctx,
                   DSLCtx, dsl_check)
 
 __all__ = [
     "StrategyBase",
     "register_strategy", "get_strategy", "get_strategy_class",
-    "get_strategy_param_spec", "available_strategies",
+    "get_strategy_param_spec", "get_strategy_state_spec",
+    "available_strategies",
     "compile_all", "render_numba_body", "render_cuda_body",
     "render_numba_state_body", "render_cuda_device_function",
+    "build_ctx_to_kernel_map", "build_cuda_sig_fields",
+    "build_cuda_device_header", "make_dsl_ctx",
     "DSLCtx", "dsl_check",
 ]
