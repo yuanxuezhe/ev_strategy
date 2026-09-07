@@ -130,7 +130,7 @@ from .core.kernel_dsl import (
     strategy_has_dsl,
 )
 from .core.engine import Engine
-from .core.gpu import gpu_info, cuda_sweep_window, cuda_sweep_window_generic
+from .core.gpu import gpu_info, cuda_sweep_window_generic
 from .core.sweep import sweep, parse_grid, GRID_KEYS
 from .core.replay import replay_kernel, replay_engine, reconcile, append_bar, read_bars_log, write_bars_log
 from .core.permutation import permutation_test
@@ -184,7 +184,7 @@ __all__ = [
     "build_dsl_kernel", "dsl_kernel", "make_state_general", "run_one_dsl",
     "strategy_has_dsl",
     # GPU
-    "gpu_info", "cuda_sweep_window", "cuda_sweep_window_generic",
+    "gpu_info", "cuda_sweep_window_generic",
     # 扫描 / 评分
     "sweep", "parse_grid", "GRID_KEYS",
     # 回放 / 置换

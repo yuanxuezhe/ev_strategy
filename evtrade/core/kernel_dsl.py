@@ -12,7 +12,7 @@ from __future__ import annotations
   全套, numba 首次调用时编译)。
 
   dsl_kernel(name) = build_dsl_kernel(name), **所有策略同路径** (含 channel_deviation;
-  2026-09 重构前 channel_deviation 走"冻结本尊"快路, 已删除 —— 见 git log d1c5371)。
+  2026-09 重构后已无策略特殊路径)。
 
 语义保证 (三端同源):
   特化模块 = kernel.py 源码 + DSL 渲染产物, 表达式字面顺序与 DSL docstring 一致;
@@ -210,7 +210,8 @@ def run_one_dsl(bars: dict, period: str, warmup_until: int,
                 strategy_params: dict | None = None) -> dict:
     """任意 DSL 策略单窗回测 (numba 内核; 指标口径 = kernel.summarize)
 
-    sweep 对非 channel_deviation 的 DSL 策略走这里 (run_one 的通用版)。
+    sweep 对所有 DSL 策略 (含 channel_deviation) 走这里; run_one 是它
+    的 channel_deviation 顶层参数别名 (向后兼容 shim)。
     """
     st = make_state_general(strategy_name, period, warmup_until, tf1=tf1,
                             init_cash=init_cash, init_position=init_position,

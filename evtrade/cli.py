@@ -80,16 +80,11 @@ def _period_type(s: str) -> str:
     return s
 
 
-def _resolve_strategy_params(strategy_name: str, params_arg: str,
-                              legacy_low1: float | None = None,
-                              legacy_low2: float | None = None,
-                              legacy_high1: float | None = None,
-                              legacy_high2: float | None = None) -> dict:
+def _resolve_strategy_params(strategy_name: str, params_arg: str) -> dict:
     """解析策略参数, 优先级 (高 -> 低):
       1. CLI --params 显式传入 (params_arg 非空)
       2. evtrade/strategies/_defaults/<strategy_name>.json 落盘默认
-      3. 旧 CLI kwargs (low1/low2/high1/high2) — channel_deviation 兼容
-      4. 空 dict (后续 StrategyBase 用 params_spec 默认值)
+      3. 空 dict (后续 StrategyBase 用 params_spec 默认值)
 
     返回 dict; 顶层键与 StrategyBase.params_spec 对齐。
     """
@@ -101,11 +96,7 @@ def _resolve_strategy_params(strategy_name: str, params_arg: str,
     if exists(strategy_name):
         data = load(strategy_name)
         return dict(data.get("params") or {})
-    # 3. 旧 CLI kwargs 兼容 (channel_deviation 历史接口)
-    if strategy_name == "channel_deviation" and legacy_low1 is not None:
-        return {"low1": legacy_low1, "low2": legacy_low2,
-                "high1": legacy_high1, "high2": legacy_high2}
-    # 4. 空
+    # 3. 空
     return {}
 
 
@@ -142,10 +133,6 @@ def build_backtest_parser() -> argparse.ArgumentParser:
                     help="[阶段 2] SELL 时按当前持仓的该比例卖 (0=关闭走 --trade-qty, "
                          "1.0=清仓)")
     ap.add_argument("--code", default="159992.SZ", help="证券代码 (如 159992.SZ / 513120.SH)")
-    ap.add_argument("--low1", type=float, default=1.5, help="下轨极端偏离阈值(百分比)")
-    ap.add_argument("--low2", type=float, default=1.0, help="下轨回撤触发阈值(百分比)")
-    ap.add_argument("--high1", type=float, default=1.5, help="上轨极端偏离阈值(百分比)")
-    ap.add_argument("--high2", type=float, default=0.5, help="上轨回撤触发阈值(百分比)")
     ap.add_argument("--engine", default="kernel", choices=["kernel", "ref"],
                     help="kernel=numba流式内核(默认,与ref逐笔等价) / ref=原Python实现")
     ap.add_argument("--warmup-days", type=int, default=365,
@@ -170,11 +157,8 @@ def _f4(v) -> str:
 
 
 def _run_kernel(args):
-    # 策略参数: --params 显式 > _defaults 落盘 > 旧 CLI kwargs 兼容
-    strategy_params = _resolve_strategy_params(
-        args.strategy, args.params,
-        legacy_low1=args.low1, legacy_low2=args.low2,
-        legacy_high1=args.high1, legacy_high2=args.high2)
+    # 策略参数: --params 显式 > _defaults 落盘 > params_spec 默认
+    strategy_params = _resolve_strategy_params(args.strategy, args.params)
 
     from .core.data import load_bars
     from .core.kernel import bucket_table
@@ -197,9 +181,8 @@ def _run_kernel(args):
           f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}  "
           f"引擎: kernel (numba)\n", flush=True)
 
-    # 统一入口: channel_deviation 的 dsl_kernel 返回冻结本尊 (零额外编译),
-    # 其余 DSL 策略为渲染特化; 参数一律按 params_spec 顺序填 p0..pN
-    # (channel_deviation: low1..high2 = p0..p3 别名, KernelState 内互通)。
+    # 统一入口: 所有 DSL 策略 (含 channel_deviation) 同路径, 由 build_dsl_kernel 渲染;
+    # 参数按 params_spec 顺序填 p0..pN。
     st = make_state_general(args.strategy, period=args.period,
                             warmup_until=int(args.start) * 1_000_000,
                             tf1=args.tf1, init_cash=INIT_CASH,
@@ -316,18 +299,14 @@ def _run_ref(args):
                                  all_in=args.all_in)
     aggregator = BarAggregator(resolve_period_seconds(args.period), on_bars=None,
                                warmup_until=feed.warmup_until)
-    # 策略参数: --params 显式 > _defaults 落盘 > 旧 CLI kwargs 兼容
-    strategy_params = _resolve_strategy_params(
-        args.strategy, args.params,
-        legacy_low1=args.low1, legacy_low2=args.low2,
-        legacy_high1=args.high1, legacy_high2=args.high2)
+    # 策略参数: --params 显式 > _defaults 落盘 > params_spec 默认
+    strategy_params = _resolve_strategy_params(args.strategy, args.params)
     strategy = _gs(args.strategy, params=strategy_params)
     engine = Engine(feed, aggregator, strategy, executor, tf1=args.tf1, verbose=True)
     print(f"证券: {args.code}  周期: {args.period}  策略: {args.strategy}  "
           f"策略日期: {args.start}~{args.end}  "
           f"预热起点: {feed.warmup_start}  分段: {args.step_days}天/段(闭区间)  "
           f"TF1={args.tf1}  sleep={'OFF' if args.no_sleep else 'ON'}  "
-          f"low1/low2={args.low1}/{args.low2} high1/high2={args.high1}/{args.high2}  "
           f"scale={args.scale}  "
           f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}  "
           f"引擎: ref  Ctrl+C 停止\n")
@@ -357,10 +336,6 @@ def build_sweep_parser() -> argparse.ArgumentParser:
     ap.add_argument("--period", default="5m", type=_period_type,
                     help="K线周期, 任意 数字+m/h/d")
     ap.add_argument("--tf1", type=int, default=TF1)
-    ap.add_argument("--low1", type=float, default=1.5)
-    ap.add_argument("--low2", type=float, default=1.0)
-    ap.add_argument("--high1", type=float, default=1.5)
-    ap.add_argument("--high2", type=float, default=0.5)
     ap.add_argument("--trade-qty", type=float, default=TRADE_QTY)
     ap.add_argument("--scale", type=float, default=1.0,
                     help="倍投系数 (连续同向信号数量累乘, 反向重置; 1.0=关闭)")
@@ -372,7 +347,7 @@ def build_sweep_parser() -> argparse.ArgumentParser:
                     help="SELL 时按当前持仓的该比例卖 (0=关闭)")
     ap.add_argument("--grid", action="append", default=[],
                     help="参数网格, 可多次: --grid low1=1.0,1.5,2.0 "
-                         "(支持 low1/low2/high1/high2/tf1/period/trade_qty, "
+                         "(支持 tf1/period/trade_qty/scale/buy_pct/sell_pct/all_in, "
                          "及该策略 params_spec 声明的参数名)")
     ap.add_argument("--split", default=None,
                     help="单分割日 YYYYMMDD (等价 --splits 该值; 窗口名 train/test)")
@@ -432,16 +407,11 @@ def sweep_main(argv=None):
         bars = load_bars(args.code, args.start, args.end,
                          warmup_days=args.warmup_days, cache_dir=args.data_cache)
 
-    # 基础策略参数: --params 显式 > _defaults 落盘 > 旧 CLI kwargs 兼容 > 空
-    base_params = _resolve_strategy_params(
-        args.strategy, args.params,
-        legacy_low1=args.low1, legacy_low2=args.low2,
-        legacy_high1=args.high1, legacy_high2=args.high2)
+    # 基础策略参数: --params 显式 > _defaults 落盘 > params_spec 默认
+    base_params = _resolve_strategy_params(args.strategy, args.params)
 
     base = {"start": args.start, "period": args.period, "tf1": args.tf1,
-            "low1": args.low1, "low2": args.low2, "high1": args.high1,
-            "high2": args.high2, "trade_qty": args.trade_qty,
-            "scale": args.scale,
+            "trade_qty": args.trade_qty, "scale": args.scale,
             "buy_pct": args.buy_pct, "sell_pct": args.sell_pct,
             "all_in": args.all_in,
             "init_cash": INIT_CASH, "init_position": INIT_POSITION,
@@ -509,13 +479,15 @@ def build_replay_parser() -> argparse.ArgumentParser:
     ap.add_argument("--log", required=True,
                     help="bar 日志 (CSV: stime,code,open,high,low,close,volume; "
                          "由 append_bar/write_bars_log 产生)")
+    ap.add_argument("--strategy", default="channel_deviation",
+                    help="回放策略 key (默认 channel_deviation)")
     ap.add_argument("--period", default="5m", type=_period_type,
                     help="K线周期, 任意 数字+m/h/d")
     ap.add_argument("--tf1", type=int, default=TF1)
-    ap.add_argument("--low1", type=float, default=1.5)
-    ap.add_argument("--low2", type=float, default=1.0)
-    ap.add_argument("--high1", type=float, default=1.5)
-    ap.add_argument("--high2", type=float, default=0.5)
+    ap.add_argument("--params", default="",
+                    help="策略参数 (通用 dict 形式): 'k1:v1;k2:v2' (分号分隔 kv, "
+                         "类型自动推导 int/float/bool/str)。例: "
+                         "--params 'low1:1.5;low2:1.0;high1:1.5;high2:0.5'")
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--all-in", action="store_true",
                     help="全仓模式 (等价 buy_pct=sell_pct=1)")
@@ -533,19 +505,28 @@ def replay_main(argv=None):
     args = build_replay_parser().parse_args(argv)
     from .replay import (read_bars_log, reconcile, replay_kernel, write_bars_log)
 
+    # 回放策略名 (默认 channel_deviation; 与录制侧一致: 录制的是原始 bar,
+    # 但回放需要选一个策略来产生信号, 故固定 = 录制时的策略)
+    strategy_name = args.strategy
+    sp = _resolve_strategy_params(strategy_name, args.params)
+    # replay_kernel / replay_engine / reconcile 仍是 channel_deviation 风格的
+    # 顶层参数 (low1/low2/high1/high2); 从 sp 中抽出并展开
+    replay_kwargs = {k: sp[k] for k in ("low1", "low2", "high1", "high2") if k in sp}
+
     bars = read_bars_log(args.log)
     if not bars:
         raise SystemExit("日志为空")
     warm = int(args.warmup_until) * 1_000_000 if args.warmup_until else 0
     print(f"回放: {len(bars)} 根 bar [{bars[0].stime} ~ {bars[-1].stime}]  "
-          f"period={args.period} tf1={args.tf1} "
-          f"low1/low2={args.low1}/{args.low2} high1/high2={args.high1}/{args.high2} "
+          f"period={args.period} tf1={args.tf1} 策略={strategy_name} "
+          f"params={sp or '(默认)'}  "
           f"scale={args.scale}  "
           f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}\n",
           flush=True)
 
-    k = replay_kernel(bars, args.period, warm, args.tf1, args.low1, args.low2,
-                      args.high1, args.high2, scale=args.scale,
+    k = replay_kernel(bars, args.period, warm, args.tf1,
+                      **replay_kwargs,
+                      scale=args.scale,
                       buy_pct=args.buy_pct, sell_pct=args.sell_pct, all_in=args.all_in)
     s = k["summary"]
     print(f"信号 {int((k['sig'] != 0).sum())} 个 (BUY {s['n_buy']} / SELL {s['n_sell']}), "
@@ -562,8 +543,8 @@ def replay_main(argv=None):
 
     if args.against_ref:
         print()
-        reconcile(bars, args.period, warm, args.tf1, args.low1, args.low2,
-                  args.high1, args.high2, scale=args.scale,
+        reconcile(bars, args.period, warm, args.tf1,
+                  **replay_kwargs, scale=args.scale,
                   buy_pct=args.buy_pct, sell_pct=args.sell_pct, all_in=args.all_in)
 
 

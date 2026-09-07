@@ -51,7 +51,7 @@ def test_sweep_with_two_windows_returns_train_and_test():
             "init_cash": 200000.0, "init_position": 200000.0}
     combos = [{"period": "5m", "init_cash": 200000.0, "init_position": 200000.0,
                "trade_qty": 10000.0, "tf1": 21,
-               "low1": 1.5, "low2": 1.0, "high1": 1.5, "high2": 0.5}]
+               "params": {"low1": 1.5, "low2": 1.0, "high1": 1.5, "high2": 0.5}}]
 
     # split at bar 60
     split_ymd = str(bars["stime"][60] // 1_000_000)
@@ -78,10 +78,10 @@ def test_sweep_does_not_crash_when_one_combo_fails():
     combos = [
         {"period": "5m", "init_cash": 200000.0, "init_position": 200000.0,
          "trade_qty": 10000.0, "tf1": 21,
-         "low1": 1.5, "low2": 1.0, "high1": 1.5, "high2": 0.5},
+         "params": {"low1": 1.5, "low2": 1.0, "high1": 1.5, "high2": 0.5}},
         {"period": "5m", "init_cash": 200000.0, "init_position": 200000.0,
          "trade_qty": 10000.0, "tf1": 21,
-         "low1": 2.5, "low2": 1.5, "high1": 2.0, "high2": 1.0},
+         "params": {"low1": 2.5, "low2": 1.5, "high1": 2.0, "high2": 1.0}},
     ]
 
     # 注入 run_one_dsl 副作用: 让第二个 (wi=0, ci=1) 抛异常

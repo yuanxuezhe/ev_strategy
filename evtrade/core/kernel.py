@@ -9,8 +9,8 @@ from __future__ import annotations
     任何策略 (含 channel_deviation) 都通过 core.kernel_dsl.build_dsl_kernel(name)
     把本文件源码整段替换 DSL-STRATEGY-BEGIN/END 区间, exec 出该策略专用的模块。
   - 公共 API (make_state / run_backtest / step / _execute / summarize / bars_to_arrays
-    等): 留作兼容性引用, 但**走冻结本尊调用 step() 时信号为 0** (因 _strategy_check
-    函数体已空); 真实执行必须经 dsl_kernel(name) 返回的特化模块。
+    等): 留作兼容性引用, 但**直接调用 step() 时信号为 0** (因 _strategy_check 函数
+    体已清空, 渲染产物从 build_dsl_kernel 注入); 真实执行必须经 dsl_kernel(name)。
   - 72 项差分测试 (test_differential.py + test_kernel_unit.py) 现已改为走 dsl_kernel。
 
 DSL 渲染契约 (唯一真相源在 strategies/dsl.py::_CTX_TO_KERNEL):
@@ -171,7 +171,7 @@ _STATE_SPEC = [
     ("p8", float64), ("p9", float64), ("p10", float64), ("p11", float64),
     ("p12", float64), ("p13", float64), ("p14", float64), ("p15", float64),
     # 向后兼容别名: 显式传 pN (非零) 时 low1..high2 跟随 p0..p3, 否则保留构造值
-    # (channel_deviation 旧字段; _strategy_check 内部用 st.p0..p3)
+    # (channel_deviation 历史别名; 渲染产物 _strategy_check 内部统一用 st.p0..p3)
     ("low1", float64), ("low2", float64), ("high1", float64), ("high2", float64),
     ("init_cash", float64), ("init_position", float64), ("trade_qty", float64),
     ("scale", float64), ("last_side", int64), ("cur_qty", float64),
@@ -218,7 +218,7 @@ class KernelState:
     """单次回测/实盘会话的全部状态 (每线程独立, 天然并发安全)
 
     p0..p15: 通用策略参数 (按 params_spec 顺序填入)
-    low1..high2: 别名, 仅用于 channel_deviation (== p0..p3)
+    low1..high2: channel_deviation 历史别名 (== p0..p3)
     """
 
     def __init__(self, period_seconds, warmup_until, tf1,
@@ -241,7 +241,7 @@ class KernelState:
         self.p8, self.p9, self.p10, self.p11 = p8, p9, p10, p11
         self.p12, self.p13, self.p14, self.p15 = p12, p13, p14, p15
         # 向后兼容别名 (channel_deviation 历史): 显式传 pN (非零) 时别名跟随 pN,
-        # 否则保留构造参数值 (tests/test_kernel_dsl.py 锁定)
+        # 否则保留构造参数值 (test_kernel_dsl 锁定; 同名别名让旧代码不报错)
         self.low1 = self.p0 if self.p0 != 0.0 else low1
         self.low2 = self.p1 if self.p1 != 0.0 else low2
         self.high1 = self.p2 if self.p2 != 0.0 else high1
@@ -333,9 +333,9 @@ def make_state(period: str = "5m", warmup_until: int64 = 0, tf1: int = 21,
       all_in=True: 等价于 buy_pct=1.0 且 sell_pct=1.0 (便捷开关)
       三者优先级: --all-in 最低, 显式 --buy-pct/--sell-pct 优先于 --all-in
 
-    策略参数 (步骤 2):
-      low1..high2 与 p0..p3 互通 (旧 channel_deviation 兼容)
-      新策略用 p0..p15 (按 params_spec 顺序填入)
+    策略参数:
+      通用策略按 params_spec 顺序填 p0..p15 (channel_deviation 的 low1..high2
+      作为 p0..p3 的别名, 同名互通, 仅保留供旧 API 路径不报错)
     """
     period_seconds = resolve_period_seconds(period)
     if all_in:

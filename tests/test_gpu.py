@@ -22,7 +22,7 @@ except Exception as e:  # noqa: BLE001
 pytestmark = pytest.mark.skipif(not cupy_ready, reason=f"cupy/GPU 不可用: {_reason}")
 
 from evtrade.data import synthetic_bars  # noqa: E402
-from evtrade.gpu import cuda_sweep_window  # noqa: E402
+from evtrade.gpu import cuda_sweep_window_generic  # noqa: E402
 from evtrade.kernel import bars_to_arrays  # noqa: E402
 from evtrade.sweep import run_one  # noqa: E402
 
@@ -45,7 +45,9 @@ def _params_list():
                             "high1": high1, "high2": high2,
                             "scale": scales[i % 3],
                             "init_cash": 200000.0, "init_position": 200000.0,
-                            "trade_qty": 10000.0})
+                            "trade_qty": 10000.0,
+                            "params": {"low1": low1, "low2": round(low2, 4),
+                                       "high1": high1, "high2": high2}})
                 i += 1
                 if i >= 64:
                     return out
@@ -57,7 +59,8 @@ def test_gpu_matches_cpu_bitwise():
     params_list = _params_list()
     assert len(params_list) == 64
 
-    gpu_res = cuda_sweep_window(bars, params_list, WARMUP)
+    gpu_res = cuda_sweep_window_generic(bars, params_list, WARMUP,
+                                        strategy_name="channel_deviation")
     cpu_res = [run_one(bars, p["period"], WARMUP, p["tf1"], p["low1"], p["low2"],
                        p["high1"], p["high2"], p["init_cash"],
                        p["init_position"], p["trade_qty"], p["scale"])
@@ -84,10 +87,11 @@ def test_gpu_walkforward_window_isolation():
     from evtrade.kernel import make_state, run_backtest  # noqa: F401
     bars = bars_to_arrays(synthetic_bars(days=30, start_ymd="20250101", seed=23))
     split = 20250120000000
-    p = [{"period": "5m", "tf1": 21, "low1": 0.4, "low2": 0.25,
-          "high1": 0.4, "high2": 0.2, "init_cash": 200000.0,
-          "init_position": 200000.0, "trade_qty": 10000.0}]
-    res = cuda_sweep_window(bars, p, split)[0]
+    p = [{"period": "5m", "tf1": 21,
+          "params": {"low1": 0.4, "low2": 0.25, "high1": 0.4, "high2": 0.2},
+          "init_cash": 200000.0, "init_position": 200000.0, "trade_qty": 10000.0}]
+    res = cuda_sweep_window_generic(bars, p, split,
+                                    strategy_name="channel_deviation")[0]
     assert res["final_price"] > 0
 
 
@@ -102,6 +106,8 @@ def test_gpu_throughput_smoke():
             combos.append({"period": "5m", "tf1": 21,
                            "low1": low1, "low2": low1 * 0.6,
                            "high1": low1, "high2": high2,
+                           "params": {"low1": low1, "low2": low1 * 0.6,
+                                      "high1": low1, "high2": high2},
                            "init_cash": 200000.0, "init_position": 200000.0,
                            "trade_qty": 10000.0})
             k += 1
@@ -110,7 +116,8 @@ def test_gpu_throughput_smoke():
         if k >= 10000:
             break
     t0 = time.perf_counter()
-    res = cuda_sweep_window(bars, combos, 20250110000000)
+    res = cuda_sweep_window_generic(bars, combos, 20250110000000,
+                                    strategy_name="channel_deviation")
     dt = time.perf_counter() - t0
     assert len(res) == 10000
     total_bar_steps = 10000 * n

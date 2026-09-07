@@ -52,8 +52,8 @@ from .kernel import encoded_to_epoch, resolve_period_seconds
 from .kernel_dsl import _invalidate_cache, _source_hash as _source_hash_gpu
 
 # 旧的 _CUDA_SOURCE (channel_deviation 专用冻结模板) 已移除:
-# 所有 DSL 策略 (含 channel_deviation) 统一走下方 _CUDA_SOURCE_GENERIC_TEMPLATE。
-# 见 cuda_sweep_window (向后兼容 shim) 与 cuda_sweep_window_generic。
+# 所有 DSL 策略 (含 channel_deviation) 统一走下方 _CUDA_SOURCE_GENERIC_TEMPLATE
+# (cuda_sweep_window_generic)。
 
 
 
@@ -472,7 +472,7 @@ def gpu_info() -> dict:
 
 
 def _alloc_gpu_outputs(m: int):
-    """分配一组 GPU 输出数组 (cuda_sweep_window / _generic 共用, 17 个 cp.empty)。
+    """分配一组 GPU 输出数组 (cuda_sweep_window_generic 共用, 17 个 cp.empty)。
 
     返回 dict, key 与 _collect_gpu_results 形参同名。两处原先各写一份完全相同的
     cp.empty 序列; 提取后避免新增输出列时漏改其一。
@@ -505,7 +505,7 @@ def _collect_gpu_results(bars, params_list, idxs, warmup_until,
                          peak_ts, valley_ts, recovered) -> dict:
     """GPU kernel 输出 host 数组 -> {param_idx: 绩效字典}
 
-    cuda_sweep_window / cuda_sweep_window_generic 共用此汇总逻辑,
+    cuda_sweep_window_generic 共用此汇总逻辑,
     避免 sharpe/sortino/cagr/calmar/max_dd_days 公式在两处复制
     (公式与 kernel.summarize 同口径; 任一改动需同步 kernel.summarize)。
     """
@@ -582,37 +582,6 @@ def _collect_gpu_results(bars, params_list, idxs, warmup_until,
     return out
 
 
-def cuda_sweep_window(bars: dict, params_list: list[dict],
-                      warmup_until: int) -> list[dict]:
-    """[向后兼容 shim] channel_deviation 专用冻结模板已废, 统一走通用 kernel。
-
-    旧调用方 (benchmark.py / __init__ 导出 / test_gpu) 按 channel_deviation 旧 API
-    传顶层 low1..high2 (无 params dict); 这里归一化到 params dict 后委托
-    cuda_sweep_window_generic。缺省 init_cash/init_position/trade_qty 沿用冻结路径
-    的 config 口径 (INIT_CASH/INIT_POSITION), 保持行为不变。
-
-    返回与 kernel.summarize 同口径的绩效字典列表 (顺序同 params_list)。
-    """
-    from ..strategies import get_strategy_param_spec
-    spec = get_strategy_param_spec("channel_deviation")
-    keys = list(spec.keys())  # ['low1','low2','high1','high2']
-    norm = []
-    for p in params_list:
-        p2 = dict(p)
-        sp = dict(p2.get("params") or {})
-        for k in keys:
-            if k in p2 and k not in sp:
-                sp[k] = p2[k]
-        p2["params"] = sp
-        # 沿用冻结路径默认: 缺 init_cash/init_position/trade_qty 时取 config
-        p2.setdefault("init_cash", INIT_CASH)
-        p2.setdefault("init_position", INIT_POSITION)
-        p2.setdefault("trade_qty", 10000.0)
-        norm.append(p2)
-    return cuda_sweep_window_generic(bars, norm, warmup_until,
-                                     strategy_name="channel_deviation")
-
-
 # ============ 通用 CUDA sweep kernel (步骤 1) ============
 # 接受任意 strategies/ 子包策略 (含 channel_deviation; 需 DSL compute_signal docstring)
 # ctx 字段约定: p0..p7 是策略参数 (按 params_spec 顺序); 其余字段与 kernel.py 同式
@@ -624,7 +593,6 @@ def cuda_sweep_window_generic(bars: dict, params_list: list[dict],
 
     params 从 params["params"] dict 取 (按策略 params_spec 声明顺序映射到内核
     p0..p7); 策略段由 DSL 注入 (render_cuda_device_function, 编译期 {STRATEGY_BODY})。
-    cuda_sweep_window (channel_deviation 旧 API) 是本函数的向后兼容 shim。
     strategy_name: 策略 key; 缺省时取 params_list[0]["strategy_name"]。
     """
     from ..strategies import get_strategy_param_spec
@@ -721,7 +689,7 @@ def cuda_sweep_window_generic(bars: dict, params_list: list[dict],
         ))
         cp.cuda.get_current_stream().synchronize()
 
-        # 拉回 host, 与 cuda_sweep_window 同样的口径汇总
+        # 拉回 host, 公式集中在 _collect_gpu_results
         cash = out_cash.get(); pos = out_pos.get(); last = out_last.get()
         ntr = out_ntrades.get(); nbuy = out_nbuy.get(); nsell = out_nsell.get()
         mdd = out_mdd.get(); turnover = out_turnover.get()
@@ -732,7 +700,7 @@ def cuda_sweep_window_generic(bars: dict, params_list: list[dict],
         peak_ts = out_peak_ts.get(); valley_ts = out_valley_ts.get()
         recovered = out_recovered.get()
 
-        # 拉回 host, 与 cuda_sweep_window 同样的口径汇总 (公式集中在 _collect_gpu_results)
+        # 拉回 host, 公式集中在 _collect_gpu_results (公式集中在 _collect_gpu_results)
         for _i, _m in _collect_gpu_results(
             bars, params_list, idxs, warmup_until,
             cash, pos, last, ntr, nbuy, nsell, mdd, turnover,

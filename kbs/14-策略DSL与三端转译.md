@@ -57,13 +57,12 @@ CUDA 端参数上限 8 个 (`p0..p7`), numba 端 16 个 (`p0..p15`); 超限在�
 机制 —— **一份内核源, N 个策略特化**:
 
 1. `kernel.py` 的 `_strategy_check` 函数体位于
-   `# ==== DSL-STRATEGY-BEGIN/END ====` 标记之间, 是 channel_deviation DSL 的
-   手写 st 形式 (与 `frozen/strategy.py` 逐位锁定, 72 项差分测试不受影响);
+   `# ==== DSL-STRATEGY-BEGIN/END ====` 标记之间, 是空模板 (占位 `pass`);
 2. `core/kernel_dsl.build_dsl_kernel(name)` 读 kernel.py 源码, 把标记之间的整段
    函数体替换成该策略 DSL 渲染出的同形代码, `exec` 出一个**独立内核模块**
    (jitclass / step / run_backtest / summarize 全套; numba 惰性编译, 进程内缓存);
-3. `dsl_kernel(name)`: channel_deviation 直接返回冻结 kernel 本尊 (零额外编译);
-   其他 DSL 策略返回特化模块。
+3. `dsl_kernel(name) = build_dsl_kernel(name)`: 所有 DSL 策略 (含 channel_deviation)
+   走同一渲染路径; 进程内按策略名缓存, 二次调用零额外编译。
 
 上层 API:
 
@@ -95,8 +94,7 @@ strategy_name=...)`, 参数矩阵按 params_spec 顺序填充 (一线程一组�
 
 | 策略 | device=cpu | device=gpu |
 |---|---|---|
-| channel_deviation | 冻结内核 `_run_window` | 旧 CUDA kernel |
-| 其他 **带 DSL** 的策略 | **DSL 特化内核** `run_one_dsl` | **通用 CUDA kernel** |
+| **带 DSL** 的策略 (含 channel_deviation) | **DSL 特化内核** `run_one_dsl` | **通用 CUDA kernel** `cuda_sweep_window_generic` |
 | 无 DSL (如 breakout) | 参考引擎 `run_one_general` (兜底) | 同左 |
 
 CLI:
@@ -142,6 +140,6 @@ python -m evtrade backtest --strategy dev_trigger --params "entry_dev:0.5" ...
 - CUDA device 函数签名的局部变量类型按字面推断 (纯整数字面量 → int, 其余 →
   double); 策略里不要用与内核字段同名的局部变量名;
 - GPU 一律走通用 kernel (`cuda_sweep_window_generic`), 所有 DSL 策略 (含
-  channel_deviation) 同路径; `cuda_sweep_window` 保留为向后兼容 shim (顶层
-  low1..high2 归一化到 params dict 后委托 generic)。回撤时间戳用 1m bar stime,
+  channel_deviation) 同路径; 旧 `cuda_sweep_window` 顶层 shim 已删除 (channel_deviation
+  旧 API 的顶层 low1..high2 现在直接装入 params dict 即可)。回撤时间戳用 1m bar stime,
   与 CPU `kernel.step` 同口径。旧冻结模板 (`_CUDA_SOURCE`, 桶 ts 口径) 已移除。

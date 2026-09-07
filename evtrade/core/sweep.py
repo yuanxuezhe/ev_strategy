@@ -275,9 +275,8 @@ def sweep(bars: dict, base: dict, combos: list[dict],
              (兼容旧 --split), 多个时为 train/test1..testK。None=单窗 (列名无前缀)。
 
     strategy_name: 策略 key (默认 channel_deviation)。路径选择 (三端同源):
-      - 带 DSL docstring 的策略 (含 channel_deviation, 其 dsl_kernel 返回冻结
-        本尊) -> numba 特化内核 (run_one_dsl); device="gpu" 时走通用 CUDA
-        kernel (cuda_sweep_window_generic, channel_deviation 与其余 DSL 策略同路径)
+      - 带 DSL docstring 的策略 -> numba 特化内核 (run_one_dsl);
+        device="gpu" 时走通用 CUDA kernel (cuda_sweep_window_generic)
       - 无 DSL 的策略 (如 breakout) -> 参考引擎 (run_one_general, 慢约 500x)
 
     参数传递 (统一路径): 策略参数以 params dict 为唯一事实源
@@ -333,16 +332,9 @@ def sweep(bars: dict, base: dict, combos: list[dict],
 
     win_data = [(nm, window_bars(e), int(w) * 1_000_000) for nm, e, w in wins]
 
-    # 统一参数路径: 策略参数以 params dict 为唯一事实源 (--params > _defaults > 旗标)。
-    # channel_deviation 的历史接口是顶层 low1..high2 —— 并入基础 params dict
-    # (params dict 已显式给出的键优先); 所有 GPU 路径 (含 channel_deviation) 都读
-    # p["params"], 不再读顶层别名。
+    # 统一参数路径: 策略参数以 params dict 为唯一事实源 (--params > _defaults 落盘);
+    # 所有 GPU/CPU 路径 (含 channel_deviation) 都读 p["params"]。
     base_params = dict(base.get("params") or {})
-    if strategy_name == "channel_deviation":
-        for k in ("low1", "low2", "high1", "high2"):
-            if k in base:
-                base_params.setdefault(k, base[k])
-        base["params"] = base_params
     # 网格 key 覆盖到 base["params"] 上; 缺失的参数继承基础值
     #   语义: --params 提供基础参数, --grid 在指定 key 上扫描, 未指定 key 沿用基础值
     new_combos = []
@@ -356,9 +348,8 @@ def sweep(bars: dict, base: dict, combos: list[dict],
     params_list = [{**base, **c} for c in combos]
 
     t0 = time.perf_counter()
-    # 路径选择: dsl_fast (含 channel_deviation, 其 dsl_kernel 返回冻结本尊) ->
-    # numba 内核; 无 DSL -> 参考引擎兜底。GPU 一律走通用 CUDA kernel
-    # (channel_deviation 经 cuda_sweep_window_generic, 与其余 DSL 策略同路径)。
+    # 路径选择: dsl_fast -> numba 内核; 无 DSL -> 参考引擎兜底。
+    # GPU 一律走通用 CUDA kernel (cuda_sweep_window_generic, 所有 DSL 策略同路径)。
     dsl_fast = strategy_has_dsl(strategy_name)
     metrics = [None] * len(win_data)
     if device == "gpu" and dsl_fast:
@@ -370,7 +361,6 @@ def sweep(bars: dict, base: dict, combos: list[dict],
         # 主线程预热: 把首次 numba specialization 串行化在主线程, 避免并发
         # worker 同时第一次调用 dsl_kernel(name).run_backtest 时各自触发
         # numba type specialization, 浪费 CPU 且扭曲冷启动延迟。
-        # channel_deviation 的冻结本尊同样是 numba 首调编译, 一并预热。
         if dsl_fast:
             try:
                 from .kernel_dsl import dsl_kernel, make_state_general
@@ -407,7 +397,7 @@ def sweep(bars: dict, base: dict, combos: list[dict],
             for wi, (nm, wb, warm) in enumerate(win_data):
                 for ci, p in enumerate(params_list):
                     if dsl_fast:
-                        # DSL 策略 (含 channel_deviation -> 冻结本尊): numba 内核
+                        # DSL 策略: numba 内核
                         fut = ex.submit(
                             run_one_dsl, wb, p["period"], warm,
                             p["init_cash"], p["init_position"], p["trade_qty"],

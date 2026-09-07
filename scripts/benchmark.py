@@ -107,17 +107,29 @@ def main():
 
     # ---- GPU 对比 (需 cupy; 与 CPU 结果按网格顺序逐组核对) ----
     try:
-        from evtrade.gpu import cuda_sweep_window
+        from evtrade.gpu import cuda_sweep_window_generic
         from evtrade.sweep import _run_window
     except Exception as e:
         print(f"\n[GPU] cupy 不可用, 跳过 ({e})")
         return
+    # 通用 CUDA kernel 走 params dict; 把基准 base + grid key 装进 "params"
+    # (channel_deviation 的 params_spec = low1..high2, 由 _run_window 走 run_one_dsl)。
+    def _to_param_list(combo_iter):
+        out = []
+        for c in combo_iter:
+            p = dict(base, **c)
+            p["params"] = {k: p[k] for k in ("low1", "low2", "high1", "high2")}
+            p["strategy_name"] = "channel_deviation"
+            out.append(p)
+        return out
+
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=workers) as ex:
         cpu_res = list(ex.map(lambda c: _run_window(arr, dict(base, **c), 20250301000000),
                               grid))
     t0 = time.perf_counter()
-    gpu_res = cuda_sweep_window(arr, [dict(base, **c) for c in grid], 20250301000000)
+    gpu_res = cuda_sweep_window_generic(arr, _to_param_list(grid), 20250301000000,
+                                        strategy_name="channel_deviation")
     t_gpu = time.perf_counter() - t0
     mism = sum(1 for g, c in zip(gpu_res, cpu_res)
                if g["n_trades"] != c["n_trades"] or g["excess"] != c["excess"])
@@ -132,7 +144,8 @@ def main():
         "high2=0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50,0.55",
     ])
     t0 = time.perf_counter()
-    cuda_sweep_window(arr, [dict(base, **c) for c in big], 20250301000000)
+    cuda_sweep_window_generic(arr, _to_param_list(big), 20250301000000,
+                              strategy_name="channel_deviation")
     t_big = time.perf_counter() - t0
     total = len(big) * n
     print(f"GPU {len(big)} 组 x {n} 根 = {total / 1e9:.2f} G bar-steps: {t_big:.1f}s "

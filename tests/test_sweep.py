@@ -22,9 +22,10 @@ def _bars():
 
 
 def _base():
+    """统一 base: 策略参数以 params dict 为唯一事实源 (2026-09 重构后无顶层别名兼容)"""
     return {"start": "20241210", "period": "5m", "tf1": 21,
-            "low1": 0.4, "low2": 0.25, "high1": 0.4, "high2": 0.2,
-            "trade_qty": 10000.0, "init_cash": 200000.0, "init_position": 200000.0}
+            "trade_qty": 10000.0, "init_cash": 200000.0, "init_position": 200000.0,
+            "params": {"low1": 0.4, "low2": 0.25, "high1": 0.4, "high2": 0.2}}
 
 
 def test_parse_grid_cartesian():
