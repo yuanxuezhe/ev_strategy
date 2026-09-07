@@ -41,8 +41,8 @@ def _parse_params(spec: str) -> dict:
     """'k1:v1;k2:v2' -> dict (类型自动推导: int / float / bool / str)
 
     用例:
-      --params "low1:1.5;low2:1.0;tf1:21"
-      --params "all_in:true;buy_pct:0.5"
+      --params "k1:1.5;k2:1.0;k3:21"
+      --params "flag:true;ratio:0.5"
     """
     out: dict = {}
     if not spec:
@@ -104,19 +104,19 @@ def _resolve_strategy_params(strategy_name: str, params_arg: str) -> dict:
 
 def build_backtest_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        description="minute_bars 周期合并 + 通达信通道轨 (回测/实盘统一)")
+        description="minute_bars 周期合并 + 策略信号 (回测/实盘统一)")
     ap.add_argument("--period", default="5m", type=_period_type,
                     help="K线周期, 任意 数字+m/h/d: 5m/7m/15m/30m/90m/2h/4h/6h/1d/3d ...")
     ap.add_argument("--strategy", default="channel_deviation",
                     help="策略 key (来自 evtrade.strategies.available_strategies())")
     ap.add_argument("--params", default="",
                     help="策略参数 (通用 dict 形式): 'k1:v1;k2:v2' (分号分隔 kv, "
-                         "类型自动推导 int/float/bool/str)。"
-                         "例: --params 'low1:1.5;low2:1.0;high1:1.5;high2:0.5'")
+                         "类型自动推导 int/float/bool/str)。具体键名见所选策略的 "
+                         "params_spec (StrategyBase.params_spec)。")
     ap.add_argument("--start", default="20250101", help="策略起始日期 YYYYMMDD")
     ap.add_argument("--end", default="20260903", help="策略结束日期 YYYYMMDD")
     ap.add_argument("--step-days", type=int, default=7, help="[ref] 分段查询天数(闭区间)")
-    ap.add_argument("--tf1", type=int, default=TF1, help="通道轨 EMA 周期")
+    ap.add_argument("--tf1", type=int, default=TF1, help="EMA 周期 (策略/指标层)")
     ap.add_argument("--no-sleep", action="store_true",
                     help="[ref] 去掉每根 bar 的 sleep; kernel 引擎本就全速")
     ap.add_argument("--trade-qty", type=float, default=TRADE_QTY, help="每次信号交易股数")
@@ -140,7 +140,7 @@ def build_backtest_parser() -> argparse.ArgumentParser:
     ap.add_argument("--data-cache", default=None,
                     help="[kernel] 行情 npz 缓存目录 (命中后不访问数据库)")
     ap.add_argument("--show-bars", action="store_true",
-                    help="打印每根周期K线 (桶闭合时点) 的 OHLCV、EMA 上下轨与四个偏离值")
+                    help="打印每根周期K线 (桶闭合时点) 的 OHLCV 与策略额外列")
     ap.add_argument("--bars-out", default=None,
                     help="同 --show-bars 内容输出 CSV (大数据量建议用这个)")
     return ap
@@ -361,7 +361,7 @@ def build_sweep_parser() -> argparse.ArgumentParser:
     ap.add_argument("--sell-pct", type=float, default=0.0,
                     help="SELL 时按当前持仓的该比例卖 (0=关闭)")
     ap.add_argument("--grid", action="append", default=[],
-                    help="参数网格, 可多次: --grid low1=1.0,1.5,2.0 "
+                    help="参数网格, 可多次: --grid key=v1,v2,v3 "
                          "(支持 tf1/period/trade_qty/scale/buy_pct/sell_pct/all_in, "
                          "及该策略 params_spec 声明的参数名)")
     ap.add_argument("--split", default=None,
@@ -501,8 +501,8 @@ def build_replay_parser() -> argparse.ArgumentParser:
     ap.add_argument("--tf1", type=int, default=TF1)
     ap.add_argument("--params", default="",
                     help="策略参数 (通用 dict 形式): 'k1:v1;k2:v2' (分号分隔 kv, "
-                         "类型自动推导 int/float/bool/str)。例: "
-                         "--params 'low1:1.5;low2:1.0;high1:1.5;high2:0.5'")
+                         "类型自动推导 int/float/bool/str)。具体键名见所选策略的 "
+                         "params_spec (StrategyBase.params_spec)。")
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--all-in", action="store_true",
                     help="全仓模式 (等价 buy_pct=sell_pct=1)")
@@ -519,9 +519,9 @@ def build_replay_parser() -> argparse.ArgumentParser:
 def replay_main(argv=None):
     args = build_replay_parser().parse_args(argv)
     from .replay import (read_bars_log, reconcile, replay_kernel, write_bars_log)
+    from .strategies import get_strategy
 
-    # 回放策略名 (默认 channel_deviation; 与录制侧一致: 录制的是原始 bar,
-    # 但回放需要选一个策略来产生信号, 故固定 = 录制时的策略)
+    # 回放策略: 录制侧只写原始 bar, 回放需选一个策略产信号
     strategy_name = args.strategy
     sp = _resolve_strategy_params(strategy_name, args.params)
 
@@ -546,11 +546,21 @@ def replay_main(argv=None):
           f"(基线 {s['baseline']:,.2f}, 超额 {s['excess_pct']:+.2f}%)")
 
     if args.signals_out:
+        # 框架默认只写 (stime, signal); 策略可通过 hook get_extra_signal_columns
+        # 追加自己的 per-bar 列 (e.g. 通道 up/dw、信号评分等)。
+        strategy = get_strategy(strategy_name, params=sp or {})
+        extra_cols = strategy.get_extra_signal_columns(
+            sig=k["sig"], up=k["up"], dw=k["dw"],
+        )
         with open(args.signals_out, "w", encoding="utf-8-sig") as f:
-            f.write("stime,signal,up,dw\n")
-            for b, sig, up, dw in zip(bars, k["sig"].tolist(), k["up"].tolist(),
-                                      k["dw"].tolist()):
-                f.write(f"{b.stime},{sig},{up},{dw}\n")
+            cols = ["stime", "signal"] + list(extra_cols.keys())
+            f.write(",".join(cols) + "\n")
+            extras = [v.tolist() for v in extra_cols.values()]
+            for i, b in enumerate(bars):
+                row = f"{b.stime},{int(k['sig'][i])}"
+                for arr in extras:
+                    row += f",{arr[i]}"
+                f.write(row + "\n")
         print(f"信号轨迹已保存: {args.signals_out}")
 
     if args.against_ref:

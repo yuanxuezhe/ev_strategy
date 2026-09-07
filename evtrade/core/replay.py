@@ -123,8 +123,8 @@ def replay_engine(bars, period: str, warmup_until: int, tf1: int,
     """参考引擎 (Engine 全链路) 回放: 输出与 replay_kernel 同构 (全 bar 对齐)
 
     任意 DSL 策略; 策略实例从 strategies registry 取 (按 strategy_name +
-    strategy_params)。记录 wrapper (_RecStrategy) 协议 strategy-agnostic
-    (只调 inner.check(cur, up, dw) 收集 sig/up/dw)。
+    strategy_params)。记录 wrapper (_RecStrategy) 透传 Engine → strategy.check
+    的指标参数 (kernel 中间产物, 用于与 replay_kernel 输出对齐 / 供 hook 消费)。
     """
     from ..strategies import get_strategy
     from evtrade.account import Account

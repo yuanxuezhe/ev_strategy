@@ -39,8 +39,8 @@ class StrategyBase:
 
     params_spec 格式:
       {
-        "low1":  {"default": 1.5, "type": float, "min": 0.0, "max": 100.0},
-        "tf1":   {"default": 21,  "type": int,   "min": 2,    "max": 1000},
+        "key1":  {"default": 1.5, "type": float, "min": 0.0, "max": 100.0},
+        "key2":  {"default": 21,  "type": int,   "min": 2,    "max": 1000},
         ...
       }
       至少声明 default (可不写 type / min / max)。
@@ -60,7 +60,7 @@ class StrategyBase:
         for k, v in kwargs.items():
             merged.setdefault(k, v)
         self.params = self._resolve_params(merged)
-        # 把每个参数也设为实例属性, 方便 self.low1 / self.tf1 直接访问
+        # 把每个参数也设为实例属性, 方便 self.<key> 直接访问
         for k, v in self.params.items():
             setattr(self, k, v)
 
@@ -123,6 +123,17 @@ class StrategyBase:
         已按 tab['count'] 桶聚合)。默认空 dict, 即仅展示 framework 字段;
         framework 不假定任何策略有额外列。CLI/复盘工具按 key->value 形式
         迭代展示, 不感知具体列名。
+        """
+        return {}
+
+    def get_extra_signal_columns(self, *, sig, **per_bar) -> dict:
+        """策略在 framework 信号轨迹之上追加的 per-bar 列 (CLI --signals-out 用)
+
+        framework 默认 --signals-out CSV 仅写 (stime, signal); 策略可覆写
+        本方法追加 per-bar 列 (e.g. 通道 up/dw、信号评分、过滤标志等)。
+        per_bar 是 caller 提供的 per-bar 数组 (e.g. up=..., dw=... 来自
+        replay_kernel 输出), 长度与 sig 相同; 框架对返回值的内容形式
+        没有假定, 只按 key->array 写入 CSV。
         """
         return {}
 

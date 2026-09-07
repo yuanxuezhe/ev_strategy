@@ -11,10 +11,10 @@ from __future__ import annotations
 当前已注册:
   - channel_deviation  通道偏离回撤 (与 evtrade.strategy.ChannelDeviationStrategy 等价)
 
-用法 (未来 2b 阶段接 numba/CUDA 后):
+用法 (DSL 三端同源: Python / numba / CUDA):
   from evtrade.strategies import get_strategy
-  s = get_strategy("channel_deviation", low1=1.5, low2=1.0, high1=1.5, high2=0.5)
-  signal, info = s.check(cur, {"up": up, "dw": dw})
+  s = get_strategy("strategy_name", k1=v1, k2=v2)   # 具体键名见策略 params_spec
+  signal, info = s.check(cur, {"up": up, "dw": dw})  # 或 positional up, dw
 """
 # 触发装饰器副作用
 from .base import (StrategyBase, register_strategy, get_strategy,

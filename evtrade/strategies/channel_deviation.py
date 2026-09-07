@@ -149,6 +149,19 @@ class ChannelDeviationStrategy(StrategyBase):
         last_idx = np.cumsum(tab["count"]) - 1
         return {k: v[last_idx] for k, v in per_bar_dev.items()}
 
+    def get_extra_signal_columns(self, *, sig, **per_bar) -> dict:
+        """策略信号轨迹额外列: EMA 通道 up/dw (per-bar)
+
+        framework --signals-out 默认仅写 (stime, signal); channel_deviation
+        额外暴露 per-bar 通道值, 便于离线复盘脚本画图。per_bar 由 caller
+        (replay_main) 通过 kwargs 透传 (通常来自 replay_kernel 的 up/dw 输出)。
+        """
+        up = per_bar.get("up")
+        dw = per_bar.get("dw")
+        if up is None or dw is None:
+            return {}
+        return {"up": up, "dw": dw}
+
 
 class _ChannelDevCtx:
     """DSL 上下文: 字段顺序与 GPU 通用 kernel 的 p0..p7 寄存器对齐
