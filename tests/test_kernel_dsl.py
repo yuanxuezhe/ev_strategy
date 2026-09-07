@@ -209,8 +209,8 @@ def test_dev_trigger_kernel_vs_ref_engine_bitwise():
     """dev_trigger (DSL 三端同源): numba 特化内核 与 参考引擎 逐 bar 信号 + 绩效一致"""
     from evtrade.core.kernel_dsl import dsl_kernel, make_state_general, run_one_dsl
     from evtrade.core.sweep import run_one_general
+    from evtrade.core.aggregator import BarAggregator
     from evtrade.frozen.account import Account
-    from evtrade.frozen.aggregator import BarAggregator
     from evtrade.core.engine import Engine
     from evtrade.execution.base import SimulatedExecutor
 

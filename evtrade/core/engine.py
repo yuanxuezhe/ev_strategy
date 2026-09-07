@@ -19,7 +19,7 @@ from __future__ import annotations
 ================================================================
 """
 
-from ..frozen.aggregator import BarAggregator
+from ..core.aggregator import BarAggregator
 from ..frozen.incremental_indicators import EMAChannel
 from ..primitives import fmt
 from ..execution.base import Executor
