@@ -167,6 +167,30 @@ class _ChannelDevCtx:
 ChannelDeviationStrategy.compute_signal.__doc__ = _CHANNEL_DEVIATION_DSL
 
 
+def compute_deviation_columns(up: np.ndarray, dw: np.ndarray,
+                              h: np.ndarray, l: np.ndarray) -> dict[str, np.ndarray]:
+    """四个偏离值 (策略层公式, 与 DSL body 同式)
+
+    输入: 全轨迹或桶级数组 (等长)
+    输出: dict 含 low_dev / high_dev / low_dev_h / high_dev_l, 长度同输入。
+          up/dw 无效 (NaN 或 0) 处偏离值为 NaN。
+
+    这是策略专属的"指标计算"函数 (channel_deviation 的语义: 通道上下轨对
+    当根 bar high/low 的偏离百分比), 不应放在 framework.bucket_table 里;
+    调用方 (CLI 展示 / 复盘工具 / 测试) 需要时自行调用本函数。
+    """
+    import numpy as np
+    valid = np.isfinite(up) & np.isfinite(dw) & (up != 0.0) & (dw != 0.0)
+    upv = np.where(valid, up, np.nan)
+    dwv = np.where(valid, dw, np.nan)
+    return {
+        "low_dev":    (dwv - l) / dwv * 100.0,
+        "high_dev":   (h - upv) / upv * 100.0,
+        "low_dev_h":  (dwv - h) / dwv * 100.0,
+        "high_dev_l": (l - upv) / upv * 100.0,
+    }
+
+
 # 注册 sweep 网格允许的参数名 (框架层 GRID_KEYS 只放引擎级, 策略参数自注册)
 from ..core.sweep import register_grid_keys
 register_grid_keys(set(ChannelDeviationStrategy.params_spec.keys()))

@@ -133,7 +133,12 @@ def test_scale_martingale_sequence():
 
 
 def test_bucket_table():
-    """桶表: OHLCV 聚合 / 偏离公式与 _strategy_check 同式 / 信号计数"""
+    """桶表 (framework 层): OHLCV 聚合 / 通道轨 / 信号计数
+
+    策略专属偏离指标 (channel_deviation 的 low_dev / high_dev / ...) 不在框架中,
+    改由 strategies/channel_deviation.py::compute_deviation_columns 提供,
+    这里只校验框架桶聚合本身。
+    """
     from evtrade.kernel import bucket_table, run_backtest_trace
     bars = synthetic_bars(days=10, start_ymd="20250101", seed=5)
     arr = bars_to_arrays(bars)
@@ -156,6 +161,12 @@ def test_bucket_table():
     tab = bucket_table(arr["stime"], sig, up, dw,
                        ts_out, o_out, h_out, l_out, c_out, v_out)
 
+    # 框架只输出: OHLCV + count + up/dw + sig + n_sig
+    expected_keys = {"ts", "open", "high", "low", "close", "volume", "count",
+                     "up", "dw", "sig", "n_sig"}
+    assert set(tab.keys()) == expected_keys, \
+        f"bucket_table 应只输出 framework 字段, 多了: {set(tab.keys()) - expected_keys}"
+
     uniq_ts, first_idx, counts = np.unique(ts_out, return_index=True,
                                            return_counts=True)
     assert np.array_equal(tab["ts"], uniq_ts)
@@ -170,13 +181,10 @@ def test_bucket_table():
                        np.add.reduceat(arr["volume"], first_idx))
     # 信号计数守恒
     assert int(tab["n_sig"].sum()) == int((sig != 0).sum())
-    # 偏离公式: 与 traced up/dw 重算一致 (与 _strategy_check 同式, NaN 处同为 NaN)
-    m = np.isfinite(tab["up"]) & np.isfinite(tab["dw"]) & (tab["up"] != 0)
-    ld = (tab["dw"][m] - tab["low"][m]) / tab["dw"][m] * 100.0
-    hd = (tab["high"][m] - tab["up"][m]) / tab["up"][m] * 100.0
-    assert np.allclose(tab["low_dev"][m], ld)
-    assert np.allclose(tab["high_dev"][m], hd)
-    assert np.isnan(tab["low_dev"][~m]).all()
+    # 通道轨在 up/dw 无效处 (未就绪) 为 NaN (frame 层面提供原值过滤)
+    invalid = ~(np.isfinite(tab["up"]) & np.isfinite(tab["dw"]) & (tab["up"] != 0))
+    assert np.isnan(tab["up"][invalid]).all()
+    assert np.isnan(tab["dw"][invalid]).all()
 
 
 def test_period_1d_bucket_example():

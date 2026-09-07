@@ -4,8 +4,8 @@ from __future__ import annotations
 ================================================================
 本模块的 CUDA sweep_kernel_generic 与 evtrade.kernel.step 是**等价**的两个实现
 (tests/test_dsl_cuda.py::test_generic_cuda_matches_cpu_channel_deviation 锁定,
---fmad=false 强制禁止 FMA 合并)。所有 DSL 策略 (含 channel_deviation) 统一走
-通用模板; 策略段由 render_cuda_device_function 编译期注入 {STRATEGY_BODY}。
+--fmad=false 强制禁止 FMA 合并)。所有 DSL 策略统一走通用模板;
+策略段由 render_cuda_device_function 编译期注入 {STRATEGY_BODY}。
 
 新增 GPU 输出数组的步骤:
   1. _CUDA_SOURCE_GENERIC_TEMPLATE 函数签名末尾加指针参数
@@ -583,13 +583,13 @@ def _collect_gpu_results(bars, params_list, idxs, warmup_until,
 
 
 # ============ 通用 CUDA sweep kernel (步骤 1) ============
-# 接受任意 strategies/ 子包策略 (含 channel_deviation; 需 DSL compute_signal docstring)
+# 接受任意 strategies/ 子包策略 (需 DSL compute_signal docstring)
 # ctx 字段约定: p0..p7 是策略参数 (按 params_spec 顺序); 其余字段与 kernel.py 同式
 
 def cuda_sweep_window_generic(bars: dict, params_list: list[dict],
                                 warmup_until: int,
                                 strategy_name: str = None) -> list[dict]:
-    """GPU 批量回测 (任意 DSL 策略; 含 channel_deviation; 通用 kernel)
+    """GPU 批量回测 (任意 DSL 策略; 通用 kernel)
 
     params 从 params["params"] dict 取 (按策略 params_spec 声明顺序映射到内核
     p0..p7); 策略段由 DSL 注入 (render_cuda_device_function, 编译期 {STRATEGY_BODY})。
@@ -610,7 +610,7 @@ def cuda_sweep_window_generic(bars: dict, params_list: list[dict],
 
     # 提取策略参数 spec 顺序
     spec = get_strategy_param_spec(strategy_name)
-    param_keys = list(spec.keys())  # strategy params in spec order (e.g. channel_deviation -> low1..high2)
+    param_keys = list(spec.keys())  # strategy params in spec order
     if len(param_keys) > 8:
         raise ValueError(f"策略 {strategy_name} 参数 > 8 个, CUDA kernel 通用模板不支持")
 

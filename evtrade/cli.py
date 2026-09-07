@@ -251,31 +251,47 @@ def _run_kernel(args):
     print("=" * 60)
 
     if show_bars:
+        # 策略专属偏离列 (channel_deviation 提供, 其它策略跳过);
+        # 框架只负责行情+通道+信号的桶聚合, 策略指标由策略模块提供。
+        dev_cols = {}
+        if args.strategy == "channel_deviation":
+            from .strategies.channel_deviation import compute_deviation_columns
+            dev_cols = compute_deviation_columns(tab["up"], tab["dw"],
+                                                 tab["high"], tab["low"])
         if args.show_bars:
             print("\n周期K线明细 (每行 = 一个桶在闭合时点; ts 为右端点; sig 为该桶最后一根 bar 的信号):")
             ts_l = tab["ts"].tolist()
             cols = {k: tab[k].tolist() for k in
-                    ("open", "high", "low", "close", "volume", "count", "up", "dw",
-                     "low_dev", "high_dev", "low_dev_h", "high_dev_l", "sig", "n_sig")}
+                    ("open", "high", "low", "close", "volume", "count", "up", "dw", "sig", "n_sig")}
+            cols.update({k: v.tolist() for k, v in dev_cols.items()})
             for i in range(len(ts_l)):
+                dev_line = ""
+                if dev_cols:
+                    dev_line = (f"low_dev={_f4(cols['low_dev'][i])} "
+                                f"high_dev={_f4(cols['high_dev'][i])} "
+                                f"low_dev_h={_f4(cols['low_dev_h'][i])} "
+                                f"high_dev_l={_f4(cols['high_dev_l'][i])} | ")
                 print(f"[{ts_l[i]}] O:{_f4(cols['open'][i])} H:{_f4(cols['high'][i])} "
                       f"L:{_f4(cols['low'][i])} C:{_f4(cols['close'][i])} "
                       f"V:{cols['volume'][i]:.0f} x{cols['count'][i]} | "
-                      f"UP={_f4(cols['up'][i])} DW={_f4(cols['dw'][i])} | "
-                      f"low_dev={_f4(cols['low_dev'][i])} high_dev={_f4(cols['high_dev'][i])} "
-                      f"low_dev_h={_f4(cols['low_dev_h'][i])} high_dev_l={_f4(cols['high_dev_l'][i])} | "
+                      f"UP={_f4(cols['up'][i])} DW={_f4(cols['dw'][i])} | {dev_line}"
                       f"sig={cols['sig'][i]} n_sig={cols['n_sig'][i]}", flush=True)
         if args.bars_out:
             with open(args.bars_out, "w", encoding="utf-8-sig") as f:
-                f.write("ts,open,high,low,close,volume,count,up,dw,"
-                        "low_dev,high_dev,low_dev_h,high_dev_l,signal,n_sig\n")
+                header = "ts,open,high,low,close,volume,count,up,dw"
+                if dev_cols:
+                    header += ",low_dev,high_dev,low_dev_h,high_dev_l"
+                header += ",signal,n_sig\n"
+                f.write(header)
                 for i in range(len(tab["ts"])):
-                    f.write(f"{tab['ts'][i]},{tab['open'][i]},{tab['high'][i]},"
-                            f"{tab['low'][i]},{tab['close'][i]},{tab['volume'][i]},"
-                            f"{tab['count'][i]},{tab['up'][i]},{tab['dw'][i]},"
-                            f"{tab['low_dev'][i]},{tab['high_dev'][i]},"
-                            f"{tab['low_dev_h'][i]},{tab['high_dev_l'][i]},"
-                            f"{tab['sig'][i]},{tab['n_sig'][i]}\n")
+                    row = (f"{tab['ts'][i]},{tab['open'][i]},{tab['high'][i]},"
+                           f"{tab['low'][i]},{tab['close'][i]},{tab['volume'][i]},"
+                           f"{tab['count'][i]},{tab['up'][i]},{tab['dw'][i]}")
+                    if dev_cols:
+                        row += (f",{dev_cols['low_dev'][i]},{dev_cols['high_dev'][i]},"
+                                f"{dev_cols['low_dev_h'][i]},{dev_cols['high_dev_l'][i]}")
+                    row += f",{tab['sig'][i]},{tab['n_sig'][i]}\n"
+                    f.write(row)
             print(f"\nK线明细已保存: {args.bars_out} ({len(tab['ts'])} 行)")
 
 

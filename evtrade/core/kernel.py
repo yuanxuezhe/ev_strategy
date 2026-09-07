@@ -6,7 +6,7 @@ from __future__ import annotations
 ================================================================
 本文件是**DSL splice 的模板源**:
   - 通用部分: KernelState / step / _execute / summarize / 时间桶 / EMA 增量
-    任何策略 (含 channel_deviation) 都通过 core.kernel_dsl.build_dsl_kernel(name)
+    任何 DSL 策略都通过 core.kernel_dsl.build_dsl_kernel(name)
     把本文件源码整段替换 DSL-STRATEGY-BEGIN/END 区间, exec 出该策略专用的模块。
   - 公共 API (make_state / run_backtest / step / _execute / summarize / bars_to_arrays
     等): 留作兼容性引用, 但**直接调用 step() 时信号为 0** (因 _strategy_check 函数
@@ -304,13 +304,13 @@ def _strategy_check(st, up: float64, dw: float64) -> int64:
     """策略检查: 返回 0=无信号 / 1=BUY / -1=SELL
 
     本函数体由 kernel_dsl.build_dsl_kernel 通过 DSL-STRATEGY-BEGIN/END 标记
-    整段注入渲染产物。**所有策略** (含 channel_deviation) 都走 build_dsl_kernel
+    整段注入渲染产物。**所有 DSL 策略**都走 build_dsl_kernel
     路径, 此函数体为空是正常的 (本尊上的 step() 会返回 0); 真实执行请用
     `dsl_kernel(name)` 返回的特化模块。
 
-    历史: 2026-09 重构前, 此函数体内嵌 channel_deviation 的手写 st 形式;
-    现已删除, channel_deviation 走 dsl_kernel("channel_deviation") 与其他策略
-    共用渲染管线 —— 一份 DSL docstring 派生 Python/numba/CUDA 三端。
+    历史: 2026-09 重构前, 此函数体内嵌特定策略的手写 st 形式;
+    现已删除, 所有策略走 dsl_kernel(name) 共用渲染管线
+    —— 一份 DSL docstring 派生 Python/numba/CUDA 三端。
     """
     # ==== DSL-STRATEGY-BEGIN (kernel_dsl.py 按此标记整段替换) ====
     pass    # body 由 build_dsl_kernel 注入
@@ -544,15 +544,18 @@ def run_backtest_trace(st, stime, o, h, l, c, v,
 
 def bucket_table(stime: np.ndarray, sig: np.ndarray, up: np.ndarray, dw: np.ndarray,
                  ts_out, o_out, h_out, l_out, c_out, v_out) -> dict:
-    """从全轨迹构建"每根周期K线"表格 (纯 numpy 向量化)。
+    """从全轨迹构建"每根周期K线"表格 (纯 numpy 向量化, framework 层)。
 
     每行 = 一个周期桶在**闭合时点**的状态:
       ts/open/high/low/close/volume/count  桶的最终 OHLCV 与含 1m 根数
       up/dw                                通道轨 (该桶最后一根 bar 时点, 含未闭合桶)
-      low_dev/high_dev/low_dev_h/high_dev_l  四个偏离值 (与 _strategy_check 同式)
       sig                                  桶最后一根 bar 的信号 (0/1/-1)
       n_sig                                桶内信号总数
-    up/dw 无效 (未就绪 NaN 或 0) 时偏离值为 NaN。
+    up/dw 无效 (未就绪 NaN 或 0) 处通道值为 NaN。
+
+    **策略专属的偏离指标** (如 channel_deviation 的 low_dev/high_dev/...) **不在此处
+    计算**; 框架只提供行情 + 通道 + 信号轨迹的桶聚合, 调用方按需调用
+    `strategies/<name>.<compute_indicator_columns>(...)` 拼接。
     """
     n = len(ts_out)
     new_bucket = np.r_[True, ts_out[1:] != ts_out[:-1]]
@@ -564,10 +567,6 @@ def bucket_table(stime: np.ndarray, sig: np.ndarray, up: np.ndarray, dw: np.ndar
     valid = np.isfinite(up) & np.isfinite(dw) & (up != 0.0) & (dw != 0.0)
     upv = np.where(valid, up, np.nan)
     dwv = np.where(valid, dw, np.nan)
-    low_dev = (dwv - l_out) / dwv * 100.0
-    high_dev = (h_out - upv) / upv * 100.0
-    low_dev_h = (dwv - h_out) / dwv * 100.0
-    high_dev_l = (l_out - upv) / upv * 100.0
 
     return {
         "ts": ts_out[last_idx],
@@ -579,10 +578,6 @@ def bucket_table(stime: np.ndarray, sig: np.ndarray, up: np.ndarray, dw: np.ndar
         "count": count,
         "up": upv[last_idx],
         "dw": dwv[last_idx],
-        "low_dev": low_dev[last_idx],
-        "high_dev": high_dev[last_idx],
-        "low_dev_h": low_dev_h[last_idx],
-        "high_dev_l": high_dev_l[last_idx],
         "sig": sig[last_idx],
         "n_sig": n_sig,
     }

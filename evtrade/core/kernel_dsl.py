@@ -11,8 +11,8 @@ from __future__ import annotations
   内容, exec 出一个独立内核模块 (jitclass / step / run_backtest / summarize
   全套, numba 首次调用时编译)。
 
-  dsl_kernel(name) = build_dsl_kernel(name), **所有策略同路径** (含 channel_deviation;
-  2026-09 重构后已无策略特殊路径)。
+  dsl_kernel(name) = build_dsl_kernel(name), **所有策略同路径**
+  (2026-09 重构后已无策略特殊路径)。
 
 语义保证 (三端同源):
   特化模块 = kernel.py 源码 + DSL 渲染产物, 表达式字面顺序与 DSL docstring 一致;
@@ -64,7 +64,7 @@ def _source_hash(strategy_cls) -> str:
 def strategy_has_dsl(strategy_name: str) -> bool:
     """策略是否带可渲染的 DSL compute_signal docstring (未知策略抛 ValueError)
 
-    仅做编译期探针: 取类不实例化, 避免触发 channel_deviation.__init__
+    仅做编译期探针: 取类不实例化, 避免触发策略 __init__ 副作用
     内的 make_python_runner/exec。
     """
     from ..strategies import get_strategy_class
@@ -236,7 +236,7 @@ def run_one_dsl(bars: dict, period: str, warmup_until: int,
     """任意 DSL 策略单窗回测 (numba 内核; 指标口径 = kernel.summarize)
 
     strategy_name: 必填 (策略 key)。sweep 对所有 DSL 策略走这里 (历史曾有
-    channel_deviation 专用的 run_one shim, 已并入 sweep.run_one_from_dict 入口)。
+    特定策略专用的 run_one shim, 已并入 sweep.run_one_from_dict 统一入口)。
     """
     if not strategy_name:
         raise ValueError("run_one_dsl: strategy_name is required")

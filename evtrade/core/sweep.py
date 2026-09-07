@@ -321,7 +321,7 @@ def sweep(bars: dict, base: dict, combos: list[dict],
     win_data = [(nm, window_bars(e), int(w) * 1_000_000) for nm, e, w in wins]
 
     # 统一参数路径: 策略参数以 params dict 为唯一事实源 (--params > _defaults 落盘);
-    # 所有 GPU/CPU 路径 (含 channel_deviation) 都读 p["params"]。
+    # 所有 GPU/CPU 路径都读 p["params"]。
     base_params = dict(base.get("params") or {})
     # 网格 key 覆盖到 base["params"] 上; 缺失的参数继承基础值
     #   语义: --params 提供基础参数, --grid 在指定 key 上扫描, 未指定 key 沿用基础值
