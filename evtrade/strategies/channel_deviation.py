@@ -4,7 +4,8 @@ from __future__ import annotations
 ================================================================
 ✅  可改层 (strategies 子包)  ✅
 ================================================================
-DSL 版 (走参考引擎)。冻结版在 evtrade.frozen.strategy (kernel 锁定)。
+DSL 版 (走参考引擎 + numba kernel + CUDA, 三端同源)。
+唯一 ChannelDeviationStrategy; frozen/strategy.py 已删除 (2026-09 重构)。
 
 参数通过 params_spec + params dict 传递, 不再靠固定 __init__ 关键字。
 """

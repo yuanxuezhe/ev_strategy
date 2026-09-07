@@ -83,7 +83,7 @@ from .frozen.models import Bar, fmt
 from .frozen.timeutils import compute_bucket, compute_bucket_general, daterange, resolve_period_seconds
 from .frozen.aggregator import BarAggregator
 from .frozen.account import Account
-from .frozen.strategy import ChannelDeviationStrategy
+from .strategies.channel_deviation import ChannelDeviationStrategy
 from .frozen.incremental_indicators import EMAChannel, IncrementalEMA, ema, ema_channel
 
 # ---- 向后兼容 shim: 让 `from evtrade.data import ...` / `from evtrade.config import ...` 继续可用 ----
@@ -101,9 +101,9 @@ from .frozen import (
     timeutils as _timeutils_mod,
     models as _models_mod,
     account as _account_mod,
-    strategy as _strategy_mod,
     incremental_indicators as _incr_indicators_mod,
 )
+from .strategies import channel_deviation as _strategy_mod  # 旧 evtrade.strategy shim (向后兼容)
 from .execution import base as _execution_mod
 _sys.modules.setdefault("evtrade.data", _data_mod)
 _sys.modules.setdefault("evtrade.config", _config_mod)

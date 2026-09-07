@@ -51,8 +51,7 @@ def main():
     account = Account(cash=200000.0, position=200000.0)
     executor = RecExec(account, qty=10000.0, verbose=False)
     aggregator = BarAggregator(PERIODS_CFG["5m"], on_bars=None, warmup_until="20250301000000")
-    strategy = ChannelDeviationStrategy(low1=params["low1"], low2=params["low2"],
-                                        high1=params["high1"], high2=params["high2"])
+    strategy = ChannelDeviationStrategy(params=params)
     engine = Engine(ListFeed(bars), aggregator, strategy, executor, tf1=21, verbose=False)
     engine.run()
     t_ref = time.perf_counter() - t0

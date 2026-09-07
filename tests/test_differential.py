@@ -66,7 +66,7 @@ def run_reference(bars, period, warmup_until, tf1, params, init_cash, init_posit
     feed = ListFeed(bars)
     account = Account(cash=init_cash, position=init_position)
     executor = RecordingExecutor(account, qty=trade_qty, scale=scale)
-    strategy = RecordingStrategy(ChannelDeviationStrategy(**params))
+    strategy = RecordingStrategy(ChannelDeviationStrategy(params=params))
     aggregator = BarAggregator(resolve_period_seconds(period), on_bars=None,
                                warmup_until=warmup_until)
     engine = Engine(feed, aggregator, strategy, executor, tf1=tf1, verbose=False)
