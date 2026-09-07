@@ -231,13 +231,15 @@ def run_one_dsl(bars: dict, period: str, warmup_until: int,
                 tf1: int = 21, scale: float = 1.0,
                 buy_pct: float = 0.0, sell_pct: float = 0.0,
                 all_in: bool = False,
-                strategy_name: str = "channel_deviation",
+                strategy_name: str | None = None,
                 strategy_params: dict | None = None) -> dict:
     """任意 DSL 策略单窗回测 (numba 内核; 指标口径 = kernel.summarize)
 
-    sweep 对所有 DSL 策略走这里 (历史曾有 channel_deviation 专用的 run_one
-    shim, 已并入本入口, 详见 sweep.run_one_from_dict)。
+    strategy_name: 必填 (策略 key)。sweep 对所有 DSL 策略走这里 (历史曾有
+    channel_deviation 专用的 run_one shim, 已并入 sweep.run_one_from_dict 入口)。
     """
+    if not strategy_name:
+        raise ValueError("run_one_dsl: strategy_name is required")
     st = make_state_general(strategy_name, period, warmup_until, tf1=tf1,
                             init_cash=init_cash, init_position=init_position,
                             trade_qty=trade_qty, scale=scale,

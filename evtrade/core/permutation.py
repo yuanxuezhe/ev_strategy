@@ -24,6 +24,7 @@ from .sweep import run_one_from_dict
 
 def permutation_test(bars: dict, params: dict, warmup_until: int,
                      n: int = 500, fee_bp: float = 5.0, seed: int = 42,
+                     strategy_name: str | None = None,
                      verbose: bool = False) -> dict:
     """对单组参数做置换检验 (日块自助置换), 返回真实年化超额 (费前) 与 p 值。
 
@@ -34,8 +35,10 @@ def permutation_test(bars: dict, params: dict, warmup_until: int,
 
     统计量用**费前**年化超额: 费用影响由确定性评分 (ann_net, sweep 层) 单独衡量,
     置换检验只回答"多日维度的择时方向是否异于运气"。
+
+    strategy_name: 必填, 透传给 run_one_from_dict (框架与具体策略解耦后, 不再有默认)。
     """
-    real_m = run_one_from_dict(bars, params, warmup_until)
+    real_m = run_one_from_dict(bars, params, warmup_until, strategy_name=strategy_name)
     real = real_m.get("ann_excess_pct", 0.0)
 
     stime = bars["stime"]
@@ -60,7 +63,7 @@ def permutation_test(bars: dict, params: dict, warmup_until: int,
         shuffled = dict(bars)
         for k in price_keys:
             shuffled[k] = bars[k][new_idx]
-        m = run_one_from_dict(shuffled, params, warmup_until)
+        m = run_one_from_dict(shuffled, params, warmup_until, strategy_name=strategy_name)
         vals[j] = m.get("ann_excess_pct", 0.0)
         if vals[j] >= real:
             ge += 1
