@@ -84,26 +84,27 @@ def read_bars_log(path: str) -> list[Bar]:
 # ============ 回放 (两条引擎路径, 同一数据各跑一遍) ============
 
 def replay_kernel(bars, period: str, warmup_until: int, tf1: int,
-                  low1: float, low2: float, high1: float, high2: float = 0.5,
+                  strategy_name: str, strategy_params: dict,
                   init_cash: float = 200000.0, init_position: float = 200000.0,
                   trade_qty: float = 10000.0, scale: float = 1.0,
                   buy_pct: float = 0.0, sell_pct: float = 0.0,
                   all_in: bool = False) -> dict:
     """内核回放: 返回逐 bar 信号轨迹 (全 bar 对齐) + 成交流 + 绩效
 
-    走 dsl_kernel("channel_deviation") 特化模块 (2026-09 重构后, 冻结本尊的
-    _strategy_check 已清空, 真实执行必须经 dsl_kernel)。
+    任意 DSL 策略; strategy_params 走策略自己的 params_spec (核心 API 不绑任何
+    具体策略参数名)。真实执行经 dsl_kernel(strategy_name) 特化模块 (2026-09
+    重构后, 冻结本尊的 _strategy_check 已清空, 必须经 dsl_kernel)。
     """
-    from .kernel_dsl import dsl_kernel
+    from .kernel_dsl import dsl_kernel, make_state_general
     arr = bars_to_arrays(bars)
     n = len(bars)
-    kmod = dsl_kernel("channel_deviation")
-    st = kmod.make_state(period=period, warmup_until=warmup_until, tf1=tf1,
-                         low1=low1, low2=low2, high1=high1, high2=high2,
-                         init_cash=init_cash, init_position=init_position,
-                         trade_qty=trade_qty, scale=scale,
-                         buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in,
-                         record_trades=True, trade_cap=n)
+    kmod = dsl_kernel(strategy_name)
+    st = make_state_general(strategy_name, period=period, warmup_until=warmup_until,
+                            tf1=tf1, init_cash=init_cash, init_position=init_position,
+                            trade_qty=trade_qty, scale=scale,
+                            buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in,
+                            strategy_params=strategy_params,
+                            record_trades=True, trade_cap=n)
     sig = np.zeros(n, np.int8)
     up = np.full(n, np.nan)
     dw = np.full(n, np.nan)
@@ -114,13 +115,18 @@ def replay_kernel(bars, period: str, warmup_until: int, tf1: int,
 
 
 def replay_engine(bars, period: str, warmup_until: int, tf1: int,
-                  low1: float, low2: float, high1: float, high2: float,
+                  strategy_name: str, strategy_params: dict,
                   init_cash: float = 200000.0, init_position: float = 200000.0,
                   trade_qty: float = 10000.0, scale: float = 1.0,
                   buy_pct: float = 0.0, sell_pct: float = 0.0,
                   all_in: bool = False) -> dict:
-    """参考引擎 (Engine 全链路) 回放: 输出与 replay_kernel 同构 (全 bar 对齐)"""
-    from evtrade import ChannelDeviationStrategy
+    """参考引擎 (Engine 全链路) 回放: 输出与 replay_kernel 同构 (全 bar 对齐)
+
+    任意 DSL 策略; 策略实例从 strategies registry 取 (按 strategy_name +
+    strategy_params)。记录 wrapper (_RecStrategy) 协议 strategy-agnostic
+    (只调 inner.check(cur, up, dw) 收集 sig/up/dw)。
+    """
+    from ..strategies import get_strategy
     from evtrade.account import Account
     from evtrade.aggregator import BarAggregator
     from evtrade.engine import Engine
@@ -163,8 +169,7 @@ def replay_engine(bars, period: str, warmup_until: int, tf1: int,
     account = Account(cash=init_cash, position=init_position)
     executor = _RecExec(account, qty=trade_qty, scale=scale,
                         buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in)
-    strategy = _RecStrategy(ChannelDeviationStrategy(
-        params={"low1": low1, "low2": low2, "high1": high1, "high2": high2}))
+    strategy = _RecStrategy(get_strategy(strategy_name, params=strategy_params or {}))
     aggregator = BarAggregator(resolve_period_seconds(period), on_bars=None,
                                warmup_until=str(warmup_until) if warmup_until else None)
     engine = Engine(feed, aggregator, strategy, executor, tf1=tf1,
@@ -207,16 +212,16 @@ def diff_signals(sig_a: np.ndarray, sig_b: np.ndarray) -> dict:
 
 
 def reconcile(bars, period: str, warmup_until: int, tf1: int,
-              low1: float, low2: float, high1: float, high2: float,
+              strategy_name: str, strategy_params: dict,
               init_cash: float = 200000.0, init_position: float = 200000.0,
               trade_qty: float = 10000.0, scale: float = 1.0,
               buy_pct: float = 0.0, sell_pct: float = 0.0, all_in: bool = False,
               verbose: bool = True) -> dict:
-    """内核 vs 参考引擎 全面对账: 信号 / 通道值 / 成交 / 终态"""
-    k = replay_kernel(bars, period, warmup_until, tf1, low1, low2, high1, high2,
+    """内核 vs 参考引擎 全面对账: 信号 / 通道值 / 成交 / 终态 (任意 DSL 策略)"""
+    k = replay_kernel(bars, period, warmup_until, tf1, strategy_name, strategy_params,
                       init_cash, init_position, trade_qty, scale,
                       buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in)
-    r = replay_engine(bars, period, warmup_until, tf1, low1, low2, high1, high2,
+    r = replay_engine(bars, period, warmup_until, tf1, strategy_name, strategy_params,
                       init_cash, init_position, trade_qty, scale,
                       buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in)
     d_sig = diff_signals(k["sig"], r["sig"])

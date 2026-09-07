@@ -58,3 +58,8 @@ class BreakoutStrategy(StrategyBase):
             self._acted = True
             return "SELL", info
         return None, info
+
+
+# 注册 sweep 网格允许的参数名 (框架层 GRID_KEYS 只放引擎级, 策略参数自注册)
+from ..core.sweep import register_grid_keys
+register_grid_keys(set(BreakoutStrategy.params_spec.keys()))

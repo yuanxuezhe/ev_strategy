@@ -136,7 +136,6 @@ def _build_dsl_kernel_impl(strategy_name: str, source_hash: str):
     # 新代码请用 make_state_general(..., strategy_params=...)。
     KS = mod.KernelState
     def make_state(period="5m", warmup_until=0, tf1=21,
-                   low1=1.5, low2=1.0, high1=1.5, high2=0.5,
                    init_cash=200000.0, init_position=200000.0,
                    trade_qty=10000.0, scale=1.0,
                    buy_pct=0.0, sell_pct=0.0, all_in=False,
@@ -150,7 +149,6 @@ def _build_dsl_kernel_impl(strategy_name: str, source_hash: str):
             buy_pct = max(buy_pct, 1.0)
             sell_pct = max(sell_pct, 1.0)
         return KS(resolve_period_seconds(period), warmup_until, tf1,
-                  low1, low2, high1, high2,
                   init_cash, init_position, trade_qty, scale,
                   float(buy_pct), float(sell_pct), bool(all_in),
                   bool(record_trades), int(trade_cap),
@@ -221,7 +219,6 @@ def make_state_general(strategy_name: str, period: str, warmup_until: int,
              for k, schema in spec.items()]
     return dsl_kernel(strategy_name).make_state(
         period=period, warmup_until=warmup_until, tf1=int(tf1),
-        low1=0.0, low2=0.0, high1=0.0, high2=0.0,
         init_cash=init_cash, init_position=init_position,
         trade_qty=trade_qty, scale=scale,
         buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in,
@@ -238,8 +235,8 @@ def run_one_dsl(bars: dict, period: str, warmup_until: int,
                 strategy_params: dict | None = None) -> dict:
     """任意 DSL 策略单窗回测 (numba 内核; 指标口径 = kernel.summarize)
 
-    sweep 对所有 DSL 策略 (含 channel_deviation) 走这里; run_one 是它
-    的 channel_deviation 顶层参数别名 (向后兼容 shim)。
+    sweep 对所有 DSL 策略走这里 (历史曾有 channel_deviation 专用的 run_one
+    shim, 已并入本入口, 详见 sweep.run_one_from_dict)。
     """
     st = make_state_general(strategy_name, period, warmup_until, tf1=tf1,
                             init_cash=init_cash, init_position=init_position,

@@ -610,7 +610,7 @@ def cuda_sweep_window_generic(bars: dict, params_list: list[dict],
 
     # 提取策略参数 spec 顺序
     spec = get_strategy_param_spec(strategy_name)
-    param_keys = list(spec.keys())  # ['low1', 'low2', 'high1', 'high2']
+    param_keys = list(spec.keys())  # strategy params in spec order (e.g. channel_deviation -> low1..high2)
     if len(param_keys) > 8:
         raise ValueError(f"策略 {strategy_name} 参数 > 8 个, CUDA kernel 通用模板不支持")
 

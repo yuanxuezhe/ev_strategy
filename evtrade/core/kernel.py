@@ -170,9 +170,6 @@ _STATE_SPEC = [
     ("p4", float64), ("p5", float64), ("p6", float64), ("p7", float64),
     ("p8", float64), ("p9", float64), ("p10", float64), ("p11", float64),
     ("p12", float64), ("p13", float64), ("p14", float64), ("p15", float64),
-    # 向后兼容别名: 显式传 pN (非零) 时 low1..high2 跟随 p0..p3, 否则保留构造值
-    # (channel_deviation 历史别名; 渲染产物 _strategy_check 内部统一用 st.p0..p3)
-    ("low1", float64), ("low2", float64), ("high1", float64), ("high2", float64),
     ("init_cash", float64), ("init_position", float64), ("trade_qty", float64),
     ("scale", float64), ("last_side", int64), ("cur_qty", float64),
     # -- 资金模式 (阶段 2: --all-in / --buy-pct / --sell-pct) --
@@ -217,12 +214,10 @@ _STATE_SPEC = [
 class KernelState:
     """单次回测/实盘会话的全部状态 (每线程独立, 天然并发安全)
 
-    p0..p15: 通用策略参数 (按 params_spec 顺序填入)
-    low1..high2: channel_deviation 历史别名 (== p0..p3)
+    p0..p15: 通用策略参数 (按策略的 params_spec 声明顺序填入; 任意 DSL 策略同路径)
     """
 
     def __init__(self, period_seconds, warmup_until, tf1,
-                 low1, low2, high1, high2,
                  init_cash, init_position, trade_qty, scale,
                  buy_pct, sell_pct, all_in,
                  record_trades, trade_cap,
@@ -233,19 +228,10 @@ class KernelState:
         self.period_seconds = period_seconds
         self.warmup_until = warmup_until
         self.tf1 = tf1
-        # p0..p3 默认映射到 low1..high2 (向后兼容)
-        if p0 == 0.0 and p1 == 0.0 and p2 == 0.0 and p3 == 0.0:
-            p0 = low1; p1 = low2; p2 = high1; p3 = high2
         self.p0, self.p1, self.p2, self.p3 = p0, p1, p2, p3
         self.p4, self.p5, self.p6, self.p7 = p4, p5, p6, p7
         self.p8, self.p9, self.p10, self.p11 = p8, p9, p10, p11
         self.p12, self.p13, self.p14, self.p15 = p12, p13, p14, p15
-        # 向后兼容别名 (channel_deviation 历史): 显式传 pN (非零) 时别名跟随 pN,
-        # 否则保留构造参数值 (test_kernel_dsl 锁定; 同名别名让旧代码不报错)
-        self.low1 = self.p0 if self.p0 != 0.0 else low1
-        self.low2 = self.p1 if self.p1 != 0.0 else low2
-        self.high1 = self.p2 if self.p2 != 0.0 else high1
-        self.high2 = self.p3 if self.p3 != 0.0 else high2
         self.init_cash = init_cash
         self.init_position = init_position
         self.trade_qty = trade_qty
@@ -311,7 +297,7 @@ class KernelState:
         self.trade_cash_after = np.empty(trade_cap, np.float64)
 
 
-# ============ 策略状态机 (与 ChannelDeviationStrategy.check 逐行等价) ============
+# ============ 策略状态机 (DSL 渲染目标; 本尊函数体为空) ============
 
 @njit(nogil=True)
 def _strategy_check(st, up: float64, dw: float64) -> int64:

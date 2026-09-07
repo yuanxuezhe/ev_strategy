@@ -509,9 +509,6 @@ def replay_main(argv=None):
     # 但回放需要选一个策略来产生信号, 故固定 = 录制时的策略)
     strategy_name = args.strategy
     sp = _resolve_strategy_params(strategy_name, args.params)
-    # replay_kernel / replay_engine / reconcile 仍是 channel_deviation 风格的
-    # 顶层参数 (low1/low2/high1/high2); 从 sp 中抽出并展开
-    replay_kwargs = {k: sp[k] for k in ("low1", "low2", "high1", "high2") if k in sp}
 
     bars = read_bars_log(args.log)
     if not bars:
@@ -525,7 +522,7 @@ def replay_main(argv=None):
           flush=True)
 
     k = replay_kernel(bars, args.period, warm, args.tf1,
-                      **replay_kwargs,
+                      strategy_name=strategy_name, strategy_params=sp,
                       scale=args.scale,
                       buy_pct=args.buy_pct, sell_pct=args.sell_pct, all_in=args.all_in)
     s = k["summary"]
@@ -544,7 +541,8 @@ def replay_main(argv=None):
     if args.against_ref:
         print()
         reconcile(bars, args.period, warm, args.tf1,
-                  **replay_kwargs, scale=args.scale,
+                  strategy_name=strategy_name, strategy_params=sp,
+                  scale=args.scale,
                   buy_pct=args.buy_pct, sell_pct=args.sell_pct, all_in=args.all_in)
 
 

@@ -24,7 +24,9 @@ import numpy as np
 
 from .kernel_dsl import _EMPTY_F, _EMPTY_SIG, run_one_dsl, strategy_has_dsl
 
-GRID_KEYS = ("low1", "low2", "high1", "high2", "tf1", "period", "trade_qty", "scale",
+# 引擎级 grid key (框架自带); 策略参数名由各策略 import 时通过
+# register_grid_keys() 注入 (见 evtrade/strategies/<name>.py 末尾)
+GRID_KEYS = ("tf1", "period", "trade_qty", "scale",
              "buy_pct", "sell_pct", "all_in")
 # 网格扫描允许的额外 key (按 strategy_name 的 params_spec 动态加入)
 _GRID_EXTRA_KEYS: set[str] = set()
@@ -36,7 +38,7 @@ def register_grid_keys(keys: set[str]) -> None:
 
 
 def parse_grid(specs: list, extra_keys: set[str] | None = None) -> list[dict]:
-    """["low1=1.0,1.5", "high2=0.3,0.5"] -> 笛卡尔积参数组合列表
+    """["k1=1.0,1.5", "k2=0.3,0.5"] -> 笛卡尔积参数组合列表
 
     extra_keys: 额外允许的 grid key (由策略的 params_spec 提供)。
                  None 时只允许 GRID_KEYS 白名单; 传非空集合时扩展。
@@ -71,12 +73,15 @@ def parse_grid(specs: list, extra_keys: set[str] | None = None) -> list[dict]:
 
 
 def run_one_from_dict(bars: dict, p: dict, warmup_until: int,
-                      strategy_name: str = "channel_deviation") -> dict:
-    """单组参数单窗回测 (统一入口, dict 形式)
+                      strategy_name: str | None = None) -> dict:
+    """单组参数单窗回测 (统一入口, dict 形式; 任意 DSL 策略)
 
+    strategy_name: 必填 (策略 key), 见 evtrade.strategies.available_strategies()
     p 必含键: period / init_cash / init_position / trade_qty / params
     可选:    tf1 (默认 21) / scale / buy_pct / sell_pct / all_in
     """
+    if not strategy_name:
+        raise ValueError("run_one_from_dict: strategy_name is required")
     return run_one_dsl(bars, p["period"], warmup_until,
                        p["init_cash"], p["init_position"], p["trade_qty"],
                        tf1=p.get("tf1", 21), scale=p.get("scale", 1.0),
@@ -84,29 +89,6 @@ def run_one_from_dict(bars: dict, p: dict, warmup_until: int,
                        all_in=p.get("all_in", False),
                        strategy_name=strategy_name,
                        strategy_params=p.get("params") or {})
-
-
-def run_one(bars: dict, period: str, warmup_until: int, tf1: int,
-            low1: float, low2: float, high1: float, high2: float,
-            init_cash: float, init_position: float, trade_qty: float,
-            scale: float = 1.0,
-            buy_pct: float = 0.0, sell_pct: float = 0.0,
-            all_in: bool = False) -> dict:
-    """channel_deviation 单组参数单窗回测 (向后兼容 shim, 顶层 low1..high2 位置参数)
-
-    历史公开 API; 内部转 dict 走 run_one_from_dict。
-    新代码请直接用 run_one_dsl(strategy_name="channel_deviation", strategy_params={...})。
-    """
-    return run_one_from_dict(
-        bars,
-        {"period": period, "tf1": tf1, "scale": scale,
-         "buy_pct": buy_pct, "sell_pct": sell_pct, "all_in": all_in,
-         "init_cash": init_cash, "init_position": init_position,
-         "trade_qty": trade_qty,
-         "params": {"low1": low1, "low2": low2,
-                    "high1": high1, "high2": high2}},
-        warmup_until,
-        strategy_name="channel_deviation")
 
 
 def _empty_metrics(init_cash: float, init_position: float) -> dict:
@@ -129,16 +111,17 @@ def run_one_general(bars: dict, period: str, warmup_until: int,
                      scale: float = 1.0,
                      buy_pct: float = 0.0, sell_pct: float = 0.0,
                      all_in: bool = False,
-                     strategy_name: str = "channel_deviation",
+                     strategy_name: str | None = None,
                      strategy_params: dict | None = None) -> dict:
-    """通用策略单组参数单窗回测 (走参考引擎, 不依赖 kernel._strategy_check)
+    """通用策略单组参数单窗回测 (走参考引擎, 任意 strategies/ 子包策略)
 
-    与 run_one 的区别:
-      - 不依赖 channel_deviation 的 4 个固定参数 (low1/low2/high1/high2/tf1)
-      - 任何 strategies/ 子包的策略都可跑 (channel_deviation / breakout / ...)
-      - 走参考引擎 (慢约 500x), 不进 numba/CUDA 加速路径
-      - 用于参数空间探索 / 新策略验证
+    strategy_name: 必填 (策略 key); 通过策略的 params_spec 解析所有参数,
+                   不绑定任何具体策略的参数名。
+    走参考引擎 (慢约 500x), 不进 numba/CUDA 加速路径; 用于参数空间探索 /
+    新策略验证。
     """
+    if not strategy_name:
+        raise ValueError("run_one_general: strategy_name is required")
     from .engine import build_engine
     from ._harness import NumpyDictFeed
 
@@ -268,23 +251,26 @@ def sweep(bars: dict, base: dict, combos: list[dict],
           split_ymd: str = None, n_workers: int = None, verbose: bool = True,
           device: str = "cpu", splits: list = None, fee_bp: float = 5.0,
           lam: float = 1.0, min_trades: int = 30, max_mdd: float = 1.0,
-          strategy_name: str = "channel_deviation"):
-    """并发扫描 + 鲁棒评分; 返回 pandas.DataFrame (按 score 降序)
+          strategy_name: str | None = None):
+    """并发扫描 + 鲁棒评分; 返回 pandas.DataFrame (按 score 降序; 任意 DSL 策略)
+
+    strategy_name: 必填 (策略 key); 通过 params_spec 解析所有策略参数。
 
     base 键: start/period/trade_qty/init_cash/init_position + strategy_params
     combos:  parse_grid 的输出, 覆盖 base 中的对应键 (策略参数键)。
     splits:  滚动 WFO 分割日列表 ["20260101","20260401"]; 1 个时窗口名为 train/test
              (兼容旧 --split), 多个时为 train/test1..testK。None=单窗 (列名无前缀)。
 
-    strategy_name: 策略 key (默认 channel_deviation)。路径选择 (三端同源):
+    路径选择 (三端同源):
       - 带 DSL docstring 的策略 -> numba 特化内核 (run_one_dsl);
         device="gpu" 时走通用 CUDA kernel (cuda_sweep_window_generic)
-      - 无 DSL 的策略 (如 breakout) -> 参考引擎 (run_one_general, 慢约 500x)
+      - 无 DSL 的策略 -> 参考引擎 (run_one_general, 慢约 500x)
 
     参数传递 (统一路径): 策略参数以 params dict 为唯一事实源
-    (--params > _defaults 落盘 > CLI 旗标 > params_spec 默认);
-    channel_deviation 的顶层 low1..high2 旗标兼容并存 (见下方合并逻辑)。
+    (--params > _defaults 落盘 > params_spec 默认)。
     """
+    if not strategy_name:
+        raise ValueError("sweep: strategy_name is required")
     import pandas as pd
 
     # 能力探测: requested device + 策略参数上限 + gpu_available
@@ -410,7 +396,7 @@ def sweep(bars: dict, base: dict, combos: list[dict],
                             strategy_name=strategy_name,
                             strategy_params=p.get("params", {}))
                     else:
-                        # 无 DSL 策略: 走参考引擎, 不依赖 low1/low2/... 等固定参数
+                        # 无 DSL 策略: 走参考引擎, 通用 params dict 透传
                         sp = p.get("params", {})
                         fut = ex.submit(
                             run_one_general, wb, p["period"], warm,
