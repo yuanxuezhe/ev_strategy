@@ -49,7 +49,7 @@ from numba import njit
 from numba.experimental import jitclass
 from numba.types import boolean, float64, int64, int8
 
-from ..frozen.timeutils import resolve_period_seconds  # 委托冻结层; 保留此名供 ``from evtrade.kernel import resolve_period_seconds`` 路径导入
+from .timeutils import resolve_period_seconds  # 同包导入; 保留 ``from evtrade.kernel import resolve_period_seconds`` 路径
 
 
 # ============ 时间戳: 14位整数 <-> epoch 秒 (纯整数历法) ============

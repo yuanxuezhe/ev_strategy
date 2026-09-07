@@ -80,7 +80,7 @@ import sys as _sys
 
 # ---- frozen 冻结层 ----
 from .primitives import Bar, fmt
-from .frozen.timeutils import compute_bucket, compute_bucket_general, daterange, resolve_period_seconds
+from .core.timeutils import compute_bucket, compute_bucket_general, daterange, resolve_period_seconds
 from .frozen.aggregator import BarAggregator
 from .frozen.account import Account
 from .strategies.channel_deviation import ChannelDeviationStrategy
@@ -97,9 +97,9 @@ from .core import replay as _replay_mod
 from .core import permutation as _permutation_mod
 from .core import gpu as _gpu_mod
 from . import primitives as _primitives_mod
+from .core import timeutils as _timeutils_mod
 from .frozen import (
     aggregator as _aggregator_mod,
-    timeutils as _timeutils_mod,
     account as _account_mod,
     incremental_indicators as _incr_indicators_mod,
 )

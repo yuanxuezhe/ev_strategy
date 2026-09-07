@@ -2,7 +2,7 @@ from __future__ import annotations
 """周期桶时间戳计算与分段区间 (自 mysql_analyze_demo.py 原样迁移 + 任意周期支持)
 
 ================================================================
-⚠️  冻结层模块  ⚠️
+⚠️  差分锁定参考实现  ⚠️  (原 frozen/timeutils.py, 2026-09 重构迁移)
 ================================================================
 本文件的 compute_bucket_general 与 evtrade.kernel.bucket_ts_encoded
 是**逐例等价**的两个实现 (tests/test_timeutils.py 锁定)。
@@ -11,9 +11,9 @@ from __future__ import annotations
 对任意周期 (90m/7m/3d) 是 kbs/04 第 5 节支持的扩展。
 
 任何修改必须**同步**改:
-  - evtrade/timeutils.py (本文件, datetime 字符串版, 给人/参考引擎用)
-  - evtrade/kernel.py bucket_ts_encoded (njit, 整数版, 给内核用)
-  - evtrade/gpu.py _encoded_to_epoch_np / _epoch_to_encoded_np / precompute_ts_mark
+  - evtrade/core/timeutils.py (本文件, datetime 字符串版, 给人/参考引擎用)
+  - evtrade/core/kernel.py bucket_ts_encoded (njit, 整数版, 给内核用)
+  - evtrade/core/gpu.py _encoded_to_epoch_np / _epoch_to_encoded_np / precompute_ts_mark
   - kbs/04-周期合并机制.md
 ================================================================
 

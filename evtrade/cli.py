@@ -34,7 +34,7 @@ import time
 import numpy as np
 
 from .core.config import INIT_CASH, INIT_POSITION, INTERVAL, TF1, TRADE_QTY
-from .frozen.timeutils import resolve_period_seconds
+from .core.timeutils import resolve_period_seconds
 
 
 def _parse_params(spec: str) -> dict:
