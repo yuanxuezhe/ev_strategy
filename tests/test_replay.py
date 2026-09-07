@@ -57,8 +57,10 @@ def test_replay_kernel_vs_engine_signals_equal():
     d = diff_signals(k["sig"], r["sig"])
     assert d["n_diff"] == 0, d
     # 内核在预热期也输出通道值; 参考引擎只记录策略期 -> 策略期区间内逐元素比较
-    assert np.array_equal(k["up"][offset:], r["up"][offset:], equal_nan=True)
-    assert np.array_equal(k["dw"][offset:], r["dw"][offset:], equal_nan=True)
+    assert np.array_equal(k["per_bar"]["up"][offset:],
+                          r["per_bar"]["up"][offset:], equal_nan=True)
+    assert np.array_equal(k["per_bar"]["dw"][offset:],
+                          r["per_bar"]["dw"][offset:], equal_nan=True)
     assert len(k["trades"]) == len(r["trades"]) > 0
 
 

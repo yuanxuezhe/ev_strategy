@@ -130,13 +130,13 @@ class ChannelDeviationStrategy(StrategyBase):
                 f"low_hit_prev={fmt(info.get('low_hit_prev'))} "
                 f"high_hit_prev={fmt(info.get('high_hit_prev'))}")
 
-    def get_extra_bucket_columns(self, *, tab: dict, **per_bar) -> dict:
+    def get_extra_bucket_columns(self, *, tab: dict, per_bar: dict) -> dict:
         """策略额外列: 4 个偏离百分比 (与 DSL body 同式)
 
         framework.bucket_table() 只提供 OHLCV + 信号轨迹 (不输出指标);
-        per-bar up/dw/h/l 由 caller 通过 per_bar={"up":..., "dw":..., "h":..., "l":...}
-        传入 (来自 run_backtest_trace)。策略按 per-bar 计算偏离, 再按
-        tab['count'] 桶聚合到与 tab['ts'] 等长。
+        per_bar 由 framework 统一打包 (core.kernel.bundle_per_bar / replay),
+        策略按需取 per_bar["up"] / ["dw"] / ["h"] / ["l"] 等 per-bar 数组
+        计算偏离, 再按 tab['count'] 桶聚合到与 tab['ts'] 等长。
         """
         import numpy as np
         up = per_bar.get("up")
@@ -149,12 +149,12 @@ class ChannelDeviationStrategy(StrategyBase):
         last_idx = np.cumsum(tab["count"]) - 1
         return {k: v[last_idx] for k, v in per_bar_dev.items()}
 
-    def get_extra_signal_columns(self, *, sig, **per_bar) -> dict:
+    def get_extra_signal_columns(self, *, sig, per_bar: dict) -> dict:
         """策略信号轨迹额外列: EMA 通道 up/dw (per-bar)
 
         framework --signals-out 默认仅写 (stime, signal); channel_deviation
-        额外暴露 per-bar 通道值, 便于离线复盘脚本画图。per_bar 由 caller
-        (replay_main) 通过 kwargs 透传 (通常来自 replay_kernel 的 up/dw 输出)。
+        额外暴露 per-bar 通道值, 便于离线复盘脚本画图。per_bar 由 framework
+        统一打包 (replay_kernel 返回值), 策略按需取值。
         """
         up = per_bar.get("up")
         dw = per_bar.get("dw")

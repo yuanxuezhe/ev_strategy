@@ -113,27 +113,29 @@ class StrategyBase:
                 f"H:{cur['high']} L:{cur['low']} C:{cur['close']} | "
                 f"vol:{cur['volume']} x{cur['count']}")
 
-    def get_extra_bucket_columns(self, *, tab: dict, **per_bar) -> dict:
+    def get_extra_bucket_columns(self, *, tab: dict, per_bar: dict) -> dict:
         """策略在 framework 桶表之上追加的展示列 (CLI --show-bars / --bars-out 用)
 
         tab 是 framework.bucket_table() 的输出 (OHLCV + sig + n_sig,
-        不含 up/dw 等指标); per_bar 是 caller 提供的 per-bar 数组 (e.g.
-        up=..., dw=..., h=..., l=..., 来自 run_backtest_trace)。
-        策略覆写此方法追加自己的指标列 (numpy 数组, 长度与 tab['ts'] 一致, 即
+        不含策略专属指标); per_bar 是 caller 提供的 per-bar 数组 dict
+        (e.g. {"up": ..., "dw": ..., "h": ..., "l": ...} 来自内核 /
+        策略模块, 由 framework 的 bundle_per_bar 统一封装, 调用方不
+        直接命名指标字段)。
+
+        策略覆写此方法追加自己的指标列 (numpy 数组, 长度与 tab['ts'] 一致,
         已按 tab['count'] 桶聚合)。默认空 dict, 即仅展示 framework 字段;
         framework 不假定任何策略有额外列。CLI/复盘工具按 key->value 形式
         迭代展示, 不感知具体列名。
         """
         return {}
 
-    def get_extra_signal_columns(self, *, sig, **per_bar) -> dict:
+    def get_extra_signal_columns(self, *, sig, per_bar: dict) -> dict:
         """策略在 framework 信号轨迹之上追加的 per-bar 列 (CLI --signals-out 用)
 
         framework 默认 --signals-out CSV 仅写 (stime, signal); 策略可覆写
         本方法追加 per-bar 列 (e.g. 通道 up/dw、信号评分、过滤标志等)。
-        per_bar 是 caller 提供的 per-bar 数组 (e.g. up=..., dw=... 来自
-        replay_kernel 输出), 长度与 sig 相同; 框架对返回值的内容形式
-        没有假定, 只按 key->array 写入 CSV。
+        per_bar 是 caller 提供的 per-bar 数组 dict (框架 bundle 形式,
+        具体键名策略自己解; framework 不假定), 长度与 sig 相同。
         """
         return {}
 

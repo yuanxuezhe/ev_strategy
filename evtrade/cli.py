@@ -161,7 +161,7 @@ def _run_kernel(args):
     strategy_params = _resolve_strategy_params(args.strategy, args.params)
 
     from .core.data import load_bars
-    from .core.kernel import bucket_table
+    from .core.kernel import bucket_table, bundle_per_bar
     from .core.kernel_dsl import dsl_kernel, make_state_general, strategy_has_dsl
     from .strategies import get_strategy
 
@@ -209,8 +209,14 @@ def _run_kernel(args):
                                 bars["low"], bars["close"], bars["volume"],
                                 sig_out, up_out, dw_out,
                                 ts_out, o_out, h_out, l_out, c_out, v_out)
+        # framework 不在 CLI 层命名指标字段: per-bar 数组由 kernel.bundle_per_bar
+        # 打包为通用契约 dict, 透传给策略钩子。
+        trace = bundle_per_bar(sig_out, up_out, dw_out,
+                               ts_out, o_out, h_out, l_out, c_out, v_out)
+        per_bar = trace["per_bar"]
         tab = bucket_table(bars["stime"], sig_out,
-                           ts_out, o_out, h_out, l_out, c_out, v_out)
+                           per_bar["ts"], per_bar["o"], per_bar["h"],
+                           per_bar["l"], per_bar["c"], per_bar["v"])
         # 只保留策略期 (--start 起) 的桶; 预热期仅用于指标准备, 不输出
         mask = tab["ts"] >= int(args.start) * 1_000_000
         tab = {k: v[mask] for k, v in tab.items()}
@@ -255,11 +261,10 @@ def _run_kernel(args):
         # 策略额外列: 由 StrategyBase.get_extra_bucket_columns 钩子提供,
         # framework 只负责 OHLCV + sig 轨迹; 策略如需展示指标 (e.g. EMA
         # 通道 up/dw、偏离百分比) 在其自己的 hook 里追加, framework 不假定
-        # 任何特定指标。per-bar 数组由 caller (此处为 _run_kernel) 透传。
+        # 任何特定指标。per-bar 数组由 framework 统一打包 (per_bar dict)
+        # 透传, CLI 不命名指标字段。
         strategy = get_strategy(args.strategy, params=strategy_params)
-        extra_cols = strategy.get_extra_bucket_columns(
-            tab=tab, up=up_out, dw=dw_out, h=h_out, l=l_out,
-        )
+        extra_cols = strategy.get_extra_bucket_columns(tab=tab, per_bar=per_bar)
         if args.show_bars:
             print("\n周期K线明细 (每行 = 一个桶在闭合时点; ts 为右端点; sig 为该桶最后一根 bar 的信号):")
             ts_l = tab["ts"].tolist()
@@ -547,10 +552,10 @@ def replay_main(argv=None):
 
     if args.signals_out:
         # 框架默认只写 (stime, signal); 策略可通过 hook get_extra_signal_columns
-        # 追加自己的 per-bar 列 (e.g. 通道 up/dw、信号评分等)。
+        # 在 per_bar 字典内自己取需要展示的指标字段 (CLI 不命名指标键)。
         strategy = get_strategy(strategy_name, params=sp or {})
         extra_cols = strategy.get_extra_signal_columns(
-            sig=k["sig"], up=k["up"], dw=k["dw"],
+            sig=k["sig"], per_bar=k["per_bar"],
         )
         with open(args.signals_out, "w", encoding="utf-8-sig") as f:
             cols = ["stime", "signal"] + list(extra_cols.keys())

@@ -578,6 +578,27 @@ def bucket_table(stime: np.ndarray, sig: np.ndarray,
     }
 
 
+def bundle_per_bar(sig, up, dw, ts_arr, o_arr, h_arr, l_arr, c_arr, v_arr) -> dict:
+    """把内核填充的 per-bar 数组打包为 framework 通用契约 dict
+
+    返回:
+      {"sig": per-bar 信号轨迹 (int8),
+       "per_bar": {"up": ..., "dw": ..., "ts": ..., "o": ..., "h": ..., "l": ..., "c": ..., "v": ...}}
+
+    框架约定 per-bar 子字典的键名 (kernel 输出通道), 用于让调用方 (CLI /
+    钩子) 不必逐项命名; 策略在自己 hook 内按需取值。框架 CLI 不出现
+    up/dw 等指标键作为函数关键字参数。
+    """
+    return {
+        "sig": sig,
+        "per_bar": {
+            "up": up, "dw": dw,
+            "ts": ts_arr, "o": o_arr, "h": h_arr,
+            "l": l_arr, "c": c_arr, "v": v_arr,
+        },
+    }
+
+
 # ============ Python 侧工具 (状态 -> 结果) ============
 
 def summarize(st: KernelState) -> dict:

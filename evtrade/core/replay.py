@@ -89,11 +89,17 @@ def replay_kernel(bars, period: str, warmup_until: int, tf1: int,
                   trade_qty: float = 10000.0, scale: float = 1.0,
                   buy_pct: float = 0.0, sell_pct: float = 0.0,
                   all_in: bool = False) -> dict:
-    """内核回放: 返回逐 bar 信号轨迹 (全 bar 对齐) + 成交流 + 绩效
+    """内核回放: 返回逐 bar 信号轨迹 (全 bar 对齐) + per-bar 数组 + 成交流 + 绩效
 
     任意 DSL 策略; strategy_params 走策略自己的 params_spec (核心 API 不绑任何
     具体策略参数名)。真实执行经 dsl_kernel(strategy_name) 特化模块 (2026-09
     重构后, 冻结本尊的 _strategy_check 已清空, 必须经 dsl_kernel)。
+
+    返回 dict:
+      "sig"        per-bar 信号轨迹 (int8)
+      "per_bar"    per-bar 中间产物 dict (e.g. EMA 通道 up/dw 等, 框架不假定具体键名)
+      "trades"     成交流 (list)
+      "summary"    绩效摘要 (dict)
     """
     from .kernel_dsl import dsl_kernel, make_state_general
     arr = bars_to_arrays(bars)
@@ -110,7 +116,8 @@ def replay_kernel(bars, period: str, warmup_until: int, tf1: int,
     dw = np.full(n, np.nan)
     kmod.run_backtest(st, arr["stime"], arr["open"], arr["high"], arr["low"],
                       arr["close"], arr["volume"], sig, up, dw)
-    return {"sig": sig, "up": up, "dw": dw,
+    return {"sig": sig,
+            "per_bar": {"up": up, "dw": dw},
             "trades": trades_to_list(st), "summary": summarize(st)}
 
 
@@ -193,7 +200,8 @@ def replay_engine(bars, period: str, warmup_until: int, tf1: int,
         sig[offset:offset + mm] = np.array(strategy.sig[:mm], dtype=np.int8)
         up[offset:offset + mm] = np.array(strategy.up[:mm], dtype=np.float64)
         dw[offset:offset + mm] = np.array(strategy.dw[:mm], dtype=np.float64)
-    return {"sig": sig, "up": up, "dw": dw,
+    return {"sig": sig,
+            "per_bar": {"up": up, "dw": dw},
             "trades": executor.records, "summary": None}
 
 
