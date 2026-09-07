@@ -84,7 +84,7 @@ from .core.timeutils import compute_bucket, compute_bucket_general, daterange, r
 from .core.aggregator import BarAggregator
 from .execution.account import Account
 from .strategies.channel_deviation import ChannelDeviationStrategy
-from .frozen.incremental_indicators import EMAChannel, IncrementalEMA, ema, ema_channel
+from .core.incremental_indicators import EMAChannel, IncrementalEMA, ema, ema_channel
 
 # ---- 向后兼容 shim: 让 `from evtrade.data import ...` / `from evtrade.config import ...` 继续可用 ----
 # 测试文件 (tests/test_*.py) 用顶层路径, 顶层 `__init__.py` 把它们映射到真实位置
@@ -97,11 +97,9 @@ from .core import replay as _replay_mod
 from .core import permutation as _permutation_mod
 from .core import gpu as _gpu_mod
 from . import primitives as _primitives_mod
-from .core import timeutils as _timeutils_mod, aggregator as _aggregator_mod
+from .core import (timeutils as _timeutils_mod, aggregator as _aggregator_mod,
+                   incremental_indicators as _incr_indicators_mod)
 from .execution import account as _account_mod, base as _execution_mod
-from .frozen import (
-    incremental_indicators as _incr_indicators_mod,
-)
 from .strategies import channel_deviation as _strategy_mod  # 旧 evtrade.strategy shim (向后兼容)
 _sys.modules.setdefault("evtrade.data", _data_mod)
 _sys.modules.setdefault("evtrade.config", _config_mod)
@@ -118,7 +116,8 @@ _sys.modules.setdefault("evtrade.models", _primitives_mod)  # 向后兼容旧路
 _sys.modules.setdefault("evtrade.account", _account_mod)
 _sys.modules.setdefault("evtrade.strategy", _strategy_mod)
 _sys.modules.setdefault("evtrade.execution", _execution_mod)
-_sys.modules.setdefault("evtrade._incremental_indicators", _incr_indicators_mod)
+_sys.modules.setdefault("evtrade._incremental_indicators", _incr_indicators_mod)  # 旧名向后兼容
+_sys.modules.setdefault("evtrade.incremental_indicators", _incr_indicators_mod)
 
 # ---- core 主调度 ----
 from .core.kernel import (
