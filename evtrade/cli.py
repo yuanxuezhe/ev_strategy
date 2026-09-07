@@ -163,6 +163,7 @@ def _run_kernel(args):
     from .core.data import load_bars
     from .core.kernel import bucket_table
     from .core.kernel_dsl import dsl_kernel, make_state_general, strategy_has_dsl
+    from .strategies import get_strategy
 
     # 无 DSL docstring 的策略不能进内核路径 (numba/CUDA 都由 DSL 渲染)
     if not strategy_has_dsl(args.strategy):
@@ -181,7 +182,7 @@ def _run_kernel(args):
           f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}  "
           f"引擎: kernel (numba)\n", flush=True)
 
-    # 统一入口: 所有 DSL 策略 (含 channel_deviation) 同路径, 由 build_dsl_kernel 渲染;
+    # 统一入口: 所有 DSL 策略同路径, 由 build_dsl_kernel 渲染;
     # 参数按 params_spec 顺序填 p0..pN。
     st = make_state_general(args.strategy, period=args.period,
                             warmup_until=int(args.start) * 1_000_000,
@@ -251,45 +252,40 @@ def _run_kernel(args):
     print("=" * 60)
 
     if show_bars:
-        # 策略专属偏离列 (channel_deviation 提供, 其它策略跳过);
-        # 框架只负责行情+通道+信号的桶聚合, 策略指标由策略模块提供。
-        dev_cols = {}
-        if args.strategy == "channel_deviation":
-            from .strategies.channel_deviation import compute_deviation_columns
-            dev_cols = compute_deviation_columns(tab["up"], tab["dw"],
-                                                 tab["high"], tab["low"])
+        # 策略额外列: 由 StrategyBase.get_extra_bucket_columns 钩子提供,
+        # framework 不假定任何特定策略; 策略可覆写此方法追加自己的指标列
+        # (例如偏离百分比、信号评分等)。
+        strategy = get_strategy(args.strategy, params=strategy_params)
+        extra_cols = strategy.get_extra_bucket_columns(tab)
         if args.show_bars:
             print("\n周期K线明细 (每行 = 一个桶在闭合时点; ts 为右端点; sig 为该桶最后一根 bar 的信号):")
             ts_l = tab["ts"].tolist()
             cols = {k: tab[k].tolist() for k in
                     ("open", "high", "low", "close", "volume", "count", "up", "dw", "sig", "n_sig")}
-            cols.update({k: v.tolist() for k, v in dev_cols.items()})
+            cols.update({k: v.tolist() for k, v in extra_cols.items()})
+            extra_keys = list(extra_cols.keys())
             for i in range(len(ts_l)):
-                dev_line = ""
-                if dev_cols:
-                    dev_line = (f"low_dev={_f4(cols['low_dev'][i])} "
-                                f"high_dev={_f4(cols['high_dev'][i])} "
-                                f"low_dev_h={_f4(cols['low_dev_h'][i])} "
-                                f"high_dev_l={_f4(cols['high_dev_l'][i])} | ")
+                extra_line = ""
+                if extra_cols:
+                    extra_line = " ".join(f"{k}={_f4(cols[k][i])}" for k in extra_keys) + " | "
                 print(f"[{ts_l[i]}] O:{_f4(cols['open'][i])} H:{_f4(cols['high'][i])} "
                       f"L:{_f4(cols['low'][i])} C:{_f4(cols['close'][i])} "
                       f"V:{cols['volume'][i]:.0f} x{cols['count'][i]} | "
-                      f"UP={_f4(cols['up'][i])} DW={_f4(cols['dw'][i])} | {dev_line}"
+                      f"UP={_f4(cols['up'][i])} DW={_f4(cols['dw'][i])} | {extra_line}"
                       f"sig={cols['sig'][i]} n_sig={cols['n_sig'][i]}", flush=True)
         if args.bars_out:
             with open(args.bars_out, "w", encoding="utf-8-sig") as f:
                 header = "ts,open,high,low,close,volume,count,up,dw"
-                if dev_cols:
-                    header += ",low_dev,high_dev,low_dev_h,high_dev_l"
+                if extra_cols:
+                    header += "," + ",".join(extra_cols.keys())
                 header += ",signal,n_sig\n"
                 f.write(header)
                 for i in range(len(tab["ts"])):
                     row = (f"{tab['ts'][i]},{tab['open'][i]},{tab['high'][i]},"
                            f"{tab['low'][i]},{tab['close'][i]},{tab['volume'][i]},"
                            f"{tab['count'][i]},{tab['up'][i]},{tab['dw'][i]}")
-                    if dev_cols:
-                        row += (f",{dev_cols['low_dev'][i]},{dev_cols['high_dev'][i]},"
-                                f"{dev_cols['low_dev_h'][i]},{dev_cols['high_dev_l'][i]}")
+                    if extra_cols:
+                        row += "," + ",".join(str(extra_cols[k][i]) for k in extra_cols)
                     row += f",{tab['sig'][i]},{tab['n_sig'][i]}\n"
                     f.write(row)
             print(f"\nK线明细已保存: {args.bars_out} ({len(tab['ts'])} 行)")

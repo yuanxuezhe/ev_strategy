@@ -130,6 +130,16 @@ class ChannelDeviationStrategy(StrategyBase):
                 f"low_hit_prev={fmt(info.get('low_hit_prev'))} "
                 f"high_hit_prev={fmt(info.get('high_hit_prev'))}")
 
+    def get_extra_bucket_columns(self, tab: dict) -> dict:
+        """策略额外列: 4 个偏离百分比 (与 DSL body 同式)
+
+        framework.bucket_table() 只提供 OHLCV + 通道 + 信号轨迹; 策略
+        在此钩子上追加自己的展示指标。CLI/复盘工具按 key->value 迭代,
+        无需感知具体列名。
+        """
+        return compute_deviation_columns(tab["up"], tab["dw"],
+                                         tab["high"], tab["low"])
+
 
 class _ChannelDevCtx:
     """DSL 上下文: 字段顺序与 GPU 通用 kernel 的 p0..p7 寄存器对齐

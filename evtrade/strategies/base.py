@@ -113,6 +113,16 @@ class StrategyBase:
                 f"H:{cur['high']} L:{cur['low']} C:{cur['close']} | "
                 f"vol:{cur['volume']} x{cur['count']}")
 
+    def get_extra_bucket_columns(self, tab: dict) -> dict:
+        """策略在 framework 桶表之上追加的展示列 (CLI --show-bars / --bars-out 用)
+
+        tab 是 framework.bucket_table() 的输出 (OHLCV + up/dw + sig + n_sig);
+        策略覆写此方法追加自己的指标列 (numpy 数组, 长度与 tab['ts'] 一致)。
+        默认空 dict, 即仅展示 framework 字段; framework 不假定任何策略有额外列。
+        CLI/复盘工具按 key->value 形式迭代展示, 不感知具体列名。
+        """
+        return {}
+
     def get_param(self, key: str, default=None):
         """从 self.params 取参数, 缺则 default"""
         return self.params.get(key, default)
