@@ -1,7 +1,7 @@
-"""步骤 2 测试: kernel._strategy_check 通用化 (channel_deviation 用 p0..p3 别名)
+"""步骤 2 测试: kernel._strategy_check 通用化 (任意 DSL 策略走 p0..pN)
 
 锁定: 72 项差分测试通过 (向后兼容);
-       DSL 字段映射 (p0/p1/p2/p3 = low1/low2/high1/high2)
+       策略参数按 params_spec 声明顺序填 p0..pN (不绑定任何具体策略参数名)
        新策略参数化路径正确
        DSL 渲染特化内核与冻结内核 bitwise 一致 (kernel_dsl)
 """
@@ -27,46 +27,31 @@ def _synthetic():
     return synthetic_bars(days=30, start_ymd="20241101", seed=42)
 
 
-# ============ KernelState p0..p3 别名正确性 ============
+# ============ KernelState p0..pN 通用参数 ============
 
-def test_kernelstate_p0p3_alias_low1high2():
-    """KernelState 构造时若 p0..p3=0 默认, 用 low1..high2 填 p0..p3"""
+def test_kernelstate_p0p3_default_zeros():
+    """KernelState 不传 p0..p3 时, 默认全 0 (与策略层无关)"""
     from evtrade.core.kernel import KernelState
     st = KernelState(
         period_seconds=300, warmup_until=0, tf1=21,
-        low1=1.5, low2=1.0, high1=2.0, high2=0.8,
         init_cash=200000., init_position=200000., trade_qty=10000.,
         scale=1.0, buy_pct=0., sell_pct=0., all_in=False,
         record_trades=False, trade_cap=0,
     )
-    # 默认映射: p0..p3 = low1..high2
-    assert st.p0 == 1.5 and st.p1 == 1.0
-    assert st.p2 == 2.0 and st.p3 == 0.8
-    # low1..high2 别名仍然存在
-    assert st.low1 == st.p0
-    assert st.high2 == st.p3
+    assert st.p0 == 0.0 and st.p1 == 0.0 and st.p2 == 0.0 and st.p3 == 0.0
 
 
-def test_kernelstate_explicit_p0_overrides_low1():
-    """显式传 p0..p3 时, 覆盖 low1..high2 (不再用 low1 填 p0)"""
+def test_kernelstate_explicit_p0_kept():
+    """显式传 p0..p3 时, 框架原样保留 (无别名映射)"""
     from evtrade.core.kernel import KernelState
     st = KernelState(
         period_seconds=300, warmup_until=0, tf1=21,
-        low1=1.5, low2=1.0, high1=2.0, high2=0.8,
         init_cash=200000., init_position=200000., trade_qty=10000.,
         scale=1.0, buy_pct=0., sell_pct=0., all_in=False,
         record_trades=False, trade_cap=0,
-        p0=9.9,  # 显式传 p0
+        p0=9.9, p1=0.0, p2=0.0, p3=0.0,
     )
-    assert st.p0 == 9.9
-    assert st.low1 == 9.9   # low1 别名也跟着 p0
-    # p1/p2/p3 未传, 仍默认 0; 不再映射到 low2/high1
-    # (因为 p0 != 0, 触发"非默认"路径)
-    assert st.p1 == 0.0
-    # low2 仍是显式 1.0 (顶层参数, 独立于 p)
-    assert st.low2 == 1.0
-    # high1, high2 也是显式传
-    assert st.high1 == 2.0 and st.high2 == 0.8
+    assert st.p0 == 9.9 and st.p1 == 0.0 and st.p2 == 0.0 and st.p3 == 0.0
 
 
 # ============ make_state 接受 p0..p15 ============
@@ -76,7 +61,7 @@ def test_make_state_with_explicit_p0p3():
     bars = bars_to_arrays(_synthetic())
     n = len(bars)
     st = make_state(period="5m", warmup_until=int("20241110")*1_000_000,
-                    tf1=21, low1=1.5, low2=1.0, high1=2.0, high2=0.8,
+                    tf1=21,
                     init_cash=200000., init_position=200000., trade_qty=10000.,
                     p0=1.7, p1=0.9, p2=1.7, p3=0.6)  # 显式参数
     run_backtest(st, bars["stime"], bars["open"], bars["high"], bars["low"],
@@ -86,23 +71,13 @@ def test_make_state_with_explicit_p0p3():
     assert s["n_trades"] >= 0
 
 
-def test_make_state_no_p0p3_uses_low1high2():
-    """make_state 不传 p0..p3, 自动用 low1..high2 填 (向后兼容)"""
+def test_make_state_no_p0p3_default_zeros():
+    """make_state 不传 p0..p3 时, 默认全 0 (策略无关)"""
     bars = bars_to_arrays(_synthetic())
-    n = len(bars)
-    st_a = make_state(period="5m", warmup_until=int("20241110")*1_000_000,
-                    tf1=21, low1=1.5, low2=1.0, high1=1.5, high2=0.5)
-    st_b = make_state(period="5m", warmup_until=int("20241110")*1_000_000,
-                    tf1=21, low1=1.5, low2=1.0, high1=1.5, high2=0.5,
-                    p0=1.5, p1=1.0, p2=1.5, p3=0.5)   # 显式相同
-    run_backtest(st_a, bars["stime"], bars["open"], bars["high"], bars["low"],
-                 bars["close"], bars["volume"],
-                 np.empty(0, np.int8), np.empty(0), np.empty(0))
-    run_backtest(st_b, bars["stime"], bars["open"], bars["high"], bars["low"],
-                 bars["close"], bars["volume"],
-                 np.empty(0, np.int8), np.empty(0), np.empty(0))
-    # n_trades 应相同 (参数一致)
-    assert summarize(st_a)["n_trades"] == summarize(st_b)["n_trades"]
+    st = make_state(period="5m", warmup_until=int("20241110")*1_000_000,
+                    tf1=21,
+                    init_cash=200000., init_position=200000., trade_qty=10000.)
+    assert st.p0 == 0.0 and st.p1 == 0.0 and st.p2 == 0.0 and st.p3 == 0.0
 
 
 # ============ kernel 路径与 ref 引擎 bitwise 一致 ============
@@ -115,7 +90,9 @@ def test_kernel_vs_ref_engine_bitwise():
     # kernel 路径: dsl_kernel("channel_deviation") 特化模块 (走 build_dsl_kernel 渲染管线)
     arr = bars_to_arrays(bars)
     kmod = dsl_kernel("channel_deviation")
-    st = kmod.make_state(period="5m", warmup_until=warm, tf1=21, **params,
+    st = kmod.make_state(period="5m", warmup_until=warm, tf1=21,
+                         p0=params["low1"], p1=params["low2"],
+                         p2=params["high1"], p3=params["high2"],
                          init_cash=200000., init_position=200000., trade_qty=10000.,
                          record_trades=True, trade_cap=len(arr["stime"]))
     sig_k = np.zeros(len(arr["stime"]), np.int8)
@@ -124,7 +101,8 @@ def test_kernel_vs_ref_engine_bitwise():
     kmod.run_backtest(st, arr["stime"], arr["open"], arr["high"], arr["low"],
                       arr["close"], arr["volume"], sig_k, up, dw)
     # ref 路径: replay_engine (frozen 策略)
-    rep = replay_engine(bars, "5m", warm, 21, **params,
+    rep = replay_engine(bars, "5m", warm, 21,
+                        strategy_name="channel_deviation", strategy_params=params,
                         init_cash=200000., init_position=200000.,
                         trade_qty=10000., scale=1.0)
     # 逐 bar 信号对齐 (rep 的 sig/up/dw 已是全 bar 对齐: 预热段为 0/NaN)
@@ -166,7 +144,6 @@ def test_dsl_spliced_channel_deviation_vs_ref_engine_bitwise():
     # DSL 渲染特化模块 (p0..p3 路径, 含倍投)
     kmod = build_dsl_kernel("channel_deviation")
     st_d = kmod.make_state(period="5m", warmup_until=warm, tf1=21,
-                           low1=0.0, low2=0.0, high1=0.0, high2=0.0,
                            init_cash=200000., init_position=200000.,
                            trade_qty=10000., scale=2.0,
                            p0=1.5, p1=1.0, p2=1.5, p3=0.5)
@@ -177,7 +154,10 @@ def test_dsl_spliced_channel_deviation_vs_ref_engine_bitwise():
 
     # Python ref 引擎: ChannelDeviationStrategy.check (走 DSL docstring exec 路径)
     # replay_engine 接受原始 Bar 对象列表 (不是 numpy dict)
-    rep = replay_engine(bars_list, "5m", warm, 21, 1.5, 1.0, 1.5, 0.5,
+    rep = replay_engine(bars_list, "5m", warm, 21,
+                        strategy_name="channel_deviation",
+                        strategy_params={"low1": 1.5, "low2": 1.0,
+                                         "high1": 1.5, "high2": 0.5},
                         init_cash=200000., init_position=200000.,
                         trade_qty=10000., scale=2.0)
     sig_ref = rep["sig"]
@@ -186,7 +166,7 @@ def test_dsl_spliced_channel_deviation_vs_ref_engine_bitwise():
     assert np.array_equal(sig_d, sig_ref), \
         "DSL 渲染特化内核 与 Python ref 引擎 信号轨迹不一致"
     # 信号序列 bitwise 一致即说明渲染产物忠实于 DSL docstring (核心锁定)。
-    # 绩效汇总由 run_one_dsl vs run_one 单独锁定 (test_run_one_dsl_channel_deviation_matches_run_one)
+    # 绩效汇总由 run_one_dsl 单独锁定 (test_run_one_dsl_vs_run_one_from_dict)
 
 
 def test_make_state_general_maps_spec_order():
@@ -200,18 +180,24 @@ def test_make_state_general_maps_spec_order():
     assert st.init_cash == 100000.0 and st.trade_qty == 5000.0
 
 
-def test_run_one_dsl_channel_deviation_matches_run_one():
-    """run_one_dsl(channel_deviation) 与冻结 run_one 核心指标 bitwise 一致"""
+def test_run_one_dsl_vs_run_one_from_dict():
+    """run_one_dsl 与 run_one_from_dict (strategy-agnostic 入口) 核心指标 bitwise 一致"""
     from evtrade.core.kernel_dsl import run_one_dsl
-    from evtrade.core.sweep import run_one
+    from evtrade.core.sweep import run_one_from_dict
     bars = bars_to_arrays(_synthetic())
     warm = int("20241110") * 1_000_000
+    params = {"low1": 1.5, "low2": 1.0, "high1": 1.5, "high2": 0.5}
     m_dsl = run_one_dsl(bars, "5m", warm, 200000., 200000., 10000.,
                         strategy_name="channel_deviation",
-                        strategy_params={"low1": 1.5, "low2": 1.0,
-                                         "high1": 1.5, "high2": 0.5})
-    m_ref = run_one(bars, "5m", warm, 21, 1.5, 1.0, 1.5, 0.5,
-                    200000., 200000., 10000.)
+                        strategy_params=params)
+    m_ref = run_one_from_dict(
+        bars,
+        {"period": "5m", "tf1": 21,
+         "init_cash": 200000., "init_position": 200000.,
+         "trade_qty": 10000.,
+         "params": params},
+        warm,
+        strategy_name="channel_deviation")
     for k in ("n_trades", "final_cash", "final_position", "final_equity",
               "final_price", "excess", "excess_pct", "turnover", "max_drawdown"):
         assert m_dsl[k] == m_ref[k], k

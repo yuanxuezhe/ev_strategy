@@ -21,7 +21,7 @@ def _bars():
 def test_summarize_has_new_keys():
     bars = _bars()
     st = make_state(period="5m", warmup_until=int("20241120") * 1_000_000,
-                    tf1=21, low1=1.5, low2=1.0, high1=1.5, high2=0.5)
+                    tf1=21, p0=1.5, p1=1.0, p2=1.5, p3=0.5)
     run_backtest(st, bars["stime"], bars["open"], bars["high"], bars["low"],
                  bars["close"], bars["volume"],
                  np.empty(0, np.int8), np.empty(0), np.empty(0))
@@ -40,7 +40,7 @@ def test_cagr_matches_manual():
     """CAGR = (终值/初值)^(1/年) - 1, 与手工核对"""
     bars = _bars()
     st = make_state(period="5m", warmup_until=int("20241120") * 1_000_000,
-                    tf1=21, low1=1.5, low2=1.0, high1=1.5, high2=0.5)
+                    tf1=21, p0=1.5, p1=1.0, p2=1.5, p3=0.5)
     run_backtest(st, bars["stime"], bars["open"], bars["high"], bars["low"],
                  bars["close"], bars["volume"],
                  np.empty(0, np.int8), np.empty(0), np.empty(0))
@@ -56,7 +56,7 @@ def test_cagr_matches_manual():
 def test_max_dd_days_non_negative_and_recovered_flag():
     bars = _bars()
     st = make_state(period="5m", warmup_until=int("20241120") * 1_000_000,
-                    tf1=21, low1=1.5, low2=1.0, high1=1.5, high2=0.5)
+                    tf1=21, p0=1.5, p1=1.0, p2=1.5, p3=0.5)
     run_backtest(st, bars["stime"], bars["open"], bars["high"], bars["low"],
                  bars["close"], bars["volume"],
                  np.empty(0, np.int8), np.empty(0), np.empty(0))
@@ -71,7 +71,7 @@ def test_sortino_ge_zero_when_no_drawdown_days():
     """没有下行日时 Sortino = 0"""
     bars = _bars()
     st = make_state(period="5m", warmup_until=int("20241120") * 1_000_000,
-                    tf1=21, low1=1.5, low2=1.0, high1=1.5, high2=0.5)
+                    tf1=21, p0=1.5, p1=1.0, p2=1.5, p3=0.5)
     run_backtest(st, bars["stime"], bars["open"], bars["high"], bars["low"],
                  bars["close"], bars["volume"],
                  np.empty(0, np.int8), np.empty(0), np.empty(0))
@@ -84,7 +84,7 @@ def test_old_keys_unchanged():
     """确保旧指标(cash/position/turnover/excess_pct/ann_excess_pct/...)数值不变"""
     bars = _bars()
     st = make_state(period="5m", warmup_until=int("20241120") * 1_000_000,
-                    tf1=21, low1=1.5, low2=1.0, high1=1.5, high2=0.5,
+                    tf1=21, p0=1.5, p1=1.0, p2=1.5, p3=0.5,
                     record_trades=True, trade_cap=len(bars["stime"]))
     run_backtest(st, bars["stime"], bars["open"], bars["high"], bars["low"],
                  bars["close"], bars["volume"],

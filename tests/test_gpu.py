@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(not cupy_ready, reason=f"cupy/GPU 不可用: {_r
 from evtrade.data import synthetic_bars  # noqa: E402
 from evtrade.gpu import cuda_sweep_window_generic  # noqa: E402
 from evtrade.kernel import bars_to_arrays  # noqa: E402
-from evtrade.sweep import run_one  # noqa: E402
+from evtrade.sweep import run_one_from_dict  # noqa: E402
 
 WARMUP = 20250110000000
 
@@ -41,8 +41,6 @@ def _params_list():
                 low2 = low1 * 0.6
                 high1 = low1
                 out.append({"period": period, "tf1": tf1,
-                            "low1": low1, "low2": round(low2, 4),
-                            "high1": high1, "high2": high2,
                             "scale": scales[i % 3],
                             "init_cash": 200000.0, "init_position": 200000.0,
                             "trade_qty": 10000.0,
@@ -61,9 +59,7 @@ def test_gpu_matches_cpu_bitwise():
 
     gpu_res = cuda_sweep_window_generic(bars, params_list, WARMUP,
                                         strategy_name="channel_deviation")
-    cpu_res = [run_one(bars, p["period"], WARMUP, p["tf1"], p["low1"], p["low2"],
-                       p["high1"], p["high2"], p["init_cash"],
-                       p["init_position"], p["trade_qty"], p["scale"])
+    cpu_res = [run_one_from_dict(bars, p, WARMUP, strategy_name="channel_deviation")
                for p in params_list]
 
     n_sig = sum(1 for g in gpu_res if g["n_trades"] > 0)
@@ -103,8 +99,6 @@ def test_gpu_throughput_smoke():
     for low1 in (0.3 + 0.01 * j for j in range(100)):
         for high2 in (0.1 + 0.01 * j for j in range(100)):
             combos.append({"period": "5m", "tf1": 21,
-                           "low1": low1, "low2": low1 * 0.6,
-                           "high1": low1, "high2": high2,
                            "params": {"low1": low1, "low2": low1 * 0.6,
                                       "high1": low1, "high2": high2},
                            "init_cash": 200000.0, "init_position": 200000.0,

@@ -49,8 +49,11 @@ def test_replay_kernel_vs_engine_signals_equal():
     stime = np.array([int(b.stime) for b in bars])
     warm = 20250106000000
     offset = int(np.searchsorted(stime, warm))
-    k = replay_kernel(bars, "5m", warm, 5, 0.4, 0.25, 0.4, 0.2)
-    r = replay_engine(bars, "5m", warm, 5, 0.4, 0.25, 0.4, 0.2)
+    params = {"low1": 0.4, "low2": 0.25, "high1": 0.4, "high2": 0.2}
+    k = replay_kernel(bars, "5m", warm, 5,
+                      strategy_name="channel_deviation", strategy_params=params)
+    r = replay_engine(bars, "5m", warm, 5,
+                      strategy_name="channel_deviation", strategy_params=params)
     d = diff_signals(k["sig"], r["sig"])
     assert d["n_diff"] == 0, d
     # 内核在预热期也输出通道值; 参考引擎只记录策略期 -> 策略期区间内逐元素比较
@@ -61,7 +64,10 @@ def test_replay_kernel_vs_engine_signals_equal():
 
 def test_reconcile_pass():
     bars = synthetic_bars(days=15, start_ymd="20250101", seed=19)
-    report = reconcile(bars, "5m", 20250105000000, 21, 0.4, 0.25, 0.4, 0.2,
+    report = reconcile(bars, "5m", 20250105000000, 21,
+                       strategy_name="channel_deviation",
+                       strategy_params={"low1": 0.4, "low2": 0.25,
+                                        "high1": 0.4, "high2": 0.2},
                        verbose=False)
     assert report["pass"] is True
     assert report["sig"]["n_a"] == report["sig"]["n_b"]
@@ -79,5 +85,8 @@ def test_diff_signals_counts():
 def test_replay_period_validation():
     bars = synthetic_bars(days=5, start_ymd="20250101", seed=5)
     with pytest.raises(ValueError):
-        replay_kernel(bars, "5x", 0, 21, 1.5, 1.0, 1.5, 0.5)
+        replay_kernel(bars, "5x", 0, 21,
+                      strategy_name="channel_deviation",
+                      strategy_params={"low1": 1.5, "low2": 1.0,
+                                       "high1": 1.5, "high2": 0.5})
     assert resolve_period_seconds("5m") == 300

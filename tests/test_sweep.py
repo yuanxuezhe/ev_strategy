@@ -7,7 +7,7 @@ from evtrade.data import synthetic_bars
 from evtrade.kernel import bars_to_arrays
 from evtrade.core.kernel_dsl import dsl_kernel
 from evtrade.sweep import (_ann_net, _neighbor_decay, _pareto_flag, parse_grid,
-                           run_one, sweep)
+                           run_one_from_dict, sweep)
 
 
 # 单源: 走 dsl_kernel("channel_deviation") 特化模块 (2026-09 重构后冻结本尊 _strategy_check 已清空)
@@ -63,7 +63,7 @@ def test_parse_grid_rejects_unknown():
 def test_sweep_small_grid():
     bars = _bars()
     combos = parse_grid(["low1=0.3,0.4", "high1=0.3,0.4"])
-    df = sweep(bars, _base(), combos, n_workers=4)
+    df = sweep(bars, _base(), combos, n_workers=4, strategy_name="channel_deviation")
     assert len(df) == 4
     for col in ("n_trades", "final_equity", "baseline", "excess", "excess_pct",
                 "years", "ann_excess_pct", "sharpe_excess", "x_mdd",
@@ -78,8 +78,15 @@ def test_sweep_small_grid():
     assert df["score"].is_monotonic_decreasing
     # 抽一组与直接调用核对 (原始指标 + 年化扣费口径)
     row = df[(df["low1"] == 0.3) & (df["high1"] == 0.3)].iloc[0]
-    direct = run_one(bars, "5m", int(_base()["start"]) * 1_000_000, 21,
-                     0.3, 0.25, 0.3, 0.2, 200000.0, 200000.0, 10000.0)
+    direct = run_one_from_dict(
+        bars,
+        {"period": "5m", "tf1": 21,
+         "init_cash": 200000.0, "init_position": 200000.0,
+         "trade_qty": 10000.0,
+         "params": {"low1": 0.3, "low2": 0.25,
+                    "high1": 0.3, "high2": 0.2}},
+        int(_base()["start"]) * 1_000_000,
+        strategy_name="channel_deviation")
     assert row["n_trades"] == direct["n_trades"]
     assert row["excess"] == direct["excess"]
     assert row["ann_net"] == _ann_net(direct, 5.0)
@@ -91,7 +98,8 @@ def test_sweep_walk_forward():
     bars = _bars()
     base = {**_base(), "start": "20241201"}
     combos = parse_grid(["low1=0.3,0.5"])
-    df = sweep(bars, base, combos, split_ymd="20241220", n_workers=2)
+    df = sweep(bars, base, combos, split_ymd="20241220", n_workers=2,
+               strategy_name="channel_deviation")
     assert len(df) == 2
     assert "train_excess_pct" in df.columns and "test_excess_pct" in df.columns
     assert "test_ann_net" in df.columns and "score" in df.columns
@@ -99,8 +107,15 @@ def test_sweep_walk_forward():
     assert 0 < row["train_n_trades"]
     assert 0 < row["test_n_trades"]
     # 测试窗与全窗口都终于同一根 bar -> 期末价一致
-    total = run_one(bars, "5m", int(base["start"]) * 1_000_000, 21,
-                    0.3, 0.25, 0.4, 0.2, 200000.0, 200000.0, 10000.0)
+    total = run_one_from_dict(
+        bars,
+        {"period": "5m", "tf1": 21,
+         "init_cash": 200000.0, "init_position": 200000.0,
+         "trade_qty": 10000.0,
+         "params": {"low1": 0.3, "low2": 0.25,
+                    "high1": 0.4, "high2": 0.2}},
+        int(base["start"]) * 1_000_000,
+        strategy_name="channel_deviation")
     assert row["test_final_price"] == total["final_price"]
     # 注: train_n + test_n 与总窗口成交数可差分界处的锁存跨越成交——
     # 测试窗从 split 起算时锁存状态全新, 属预期 (正是 walk-forward 想要的独立起算)。
@@ -110,7 +125,8 @@ def test_sweep_rolling_splits():
     bars = _bars()
     base = {**_base(), "start": "20241201"}
     combos = parse_grid(["low1=0.3,0.5"])
-    df = sweep(bars, base, combos, splits=["20241215", "20241222"], n_workers=2)
+    df = sweep(bars, base, combos, splits=["20241215", "20241222"], n_workers=2,
+               strategy_name="channel_deviation")
     assert len(df) == 2
     for col in ("train_excess_pct", "test1_excess_pct", "test2_excess_pct",
                 "test1_ann_net", "test2_ann_net", "ann_net_min", "pos_ratio",
@@ -157,12 +173,12 @@ def test_permutation_sanity():
     bars = _bars()
     params = {**_base()}
     warm = int(_base()["start"]) * 1_000_000
-    r = permutation_test(bars, params, warm, n=30, fee_bp=5.0, seed=7)
+    r = permutation_test(bars, params, warm, n=30, fee_bp=5.0, seed=7,
+                         strategy_name="channel_deviation")
     assert 0.0 < r["p_value"] <= 1.0
     assert r["n"] == 30
     assert r["null_p95"] >= r["null_mean"]
-    direct = run_one(bars, "5m", warm, 21, 0.4, 0.25, 0.4, 0.2,
-                     200000.0, 200000.0, 10000.0)
+    direct = run_one_from_dict(bars, params, warm, strategy_name="channel_deviation")
     assert r["real_ann_net"] == direct["ann_excess_pct"]
 
 
@@ -171,7 +187,7 @@ def test_test_window_trades_only_after_split():
     bars = _bars()
     split_int = 20241220000000
     st = make_state(period="5m", warmup_until=split_int, tf1=21,
-                    low1=0.4, low2=0.25, high1=0.4, high2=0.2,
+                    p0=0.4, p1=0.25, p2=0.4, p3=0.2,
                     record_trades=True, trade_cap=len(bars["stime"]))
     run_backtest(st, bars["stime"], bars["open"], bars["high"], bars["low"],
                  bars["close"], bars["volume"],

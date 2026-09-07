@@ -35,7 +35,7 @@ def test_trade_capacity_guard():
     bars = synthetic_bars(days=20, start_ymd="20250101", seed=11)
     arr = bars_to_arrays(bars)
     st = make_state(period="5m", warmup_until=20250106000000, tf1=5,
-                    low1=0.3, low2=0.2, high1=0.3, high2=0.15,
+                    p0=0.3, p1=0.2, p2=0.3, p3=0.15,
                     record_trades=True, trade_cap=1)
     run_backtest(st, arr["stime"], arr["open"], arr["high"], arr["low"],
                  arr["close"], arr["volume"],
@@ -51,13 +51,13 @@ def test_live_step_equals_batch():
     n = len(bars)
 
     st_batch = make_state(period="5m", warmup_until=20250106000000, tf1=21,
-                          low1=0.4, low2=0.25, high1=0.4, high2=0.2)
+                          p0=0.4, p1=0.25, p2=0.4, p3=0.2)
     run_backtest(st_batch, arr["stime"], arr["open"], arr["high"], arr["low"],
                  arr["close"], arr["volume"],
                  np.empty(0, np.int8), np.empty(0), np.empty(0))
 
     st_live = make_state(period="5m", warmup_until=20250106000000, tf1=21,
-                         low1=0.4, low2=0.25, high1=0.4, high2=0.2)
+                         p0=0.4, p1=0.25, p2=0.4, p3=0.2)
     signals = []
     for i in range(n):
         sig, up, dw = step(st_live, int(arr["stime"][i]), float(arr["open"][i]),
@@ -82,7 +82,7 @@ def test_scale_martingale_sequence():
     n = len(bars)
     trade_qty, scale = 1000.0, 2.0
     st = make_state(period="5m", warmup_until=20250106000000, tf1=5,
-                    low1=0.3, low2=0.2, high1=0.3, high2=0.15,
+                    p0=0.3, p1=0.2, p2=0.3, p3=0.15,
                     init_cash=200000.0, init_position=200000.0,
                     trade_qty=trade_qty, scale=scale,
                     record_trades=True, trade_cap=n)
@@ -139,7 +139,7 @@ def test_bucket_table():
     arr = bars_to_arrays(bars)
     n = len(bars)
     st = make_state(period="5m", warmup_until=0, tf1=3,
-                    low1=0.5, low2=0.3, high1=0.5, high2=0.3,
+                    p0=0.5, p1=0.3, p2=0.5, p3=0.3,
                     trade_qty=1000.0, scale=2.0)
     sig = np.zeros(n, np.int8)
     up = np.full(n, np.nan)
@@ -194,7 +194,7 @@ def test_excess_curve_metrics():
     """
     # step 已通过模块顶部 _KMOD = dsl_kernel("channel_deviation") 引入
     st = make_state(period="5m", warmup_until=0, tf1=5,
-                    low1=99.0, low2=98.0, high1=99.0, high2=98.0)
+                    p0=99.0, p1=98.0, p2=99.0, p3=98.0)
 
     def feed(ts, c):
         step(st, ts, c, c, c, c, 1000.0)

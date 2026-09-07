@@ -83,8 +83,8 @@ def run_kernel(bars, period, warmup_until_int, tf1, params, init_cash, init_posi
     n = len(bars)
     kmod = dsl_kernel("channel_deviation")
     st = kmod.make_state(period=period, warmup_until=warmup_until_int, tf1=tf1,
-                         low1=params["low1"], low2=params["low2"],
-                         high1=params["high1"], high2=params["high2"],
+                         p0=params["low1"], p1=params["low2"],
+                         p2=params["high1"], p3=params["high2"],
                          init_cash=init_cash, init_position=init_position,
                          trade_qty=trade_qty, scale=scale,
                          record_trades=True, trade_cap=n)

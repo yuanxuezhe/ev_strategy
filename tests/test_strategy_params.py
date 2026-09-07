@@ -118,10 +118,10 @@ def test_parse_grid_extra_keys():
 
 
 def test_parse_grid_rejects_unknown_without_extra_keys():
-    """parse_grid 默认仍拒绝未知 key"""
+    """parse_grid 默认仍拒绝未知 key (用真正未注册的 key)"""
     from evtrade.core.sweep import parse_grid
     with pytest.raises(ValueError, match="不支持的网格参数"):
-        parse_grid(["lookback=10"])
+        parse_grid(["bogus_xyz=10"])
 
 
 def test_sweep_breakout_with_grid():

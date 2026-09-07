@@ -130,15 +130,18 @@ def test_07_one_run():
 
 
 def test_08_replay_engine():
-    """8. (可选) 参考引擎回放对账"""
+    """8. (可选) 参考引擎回放对账 (用 channel_deviation 当稳定参照, 因为旧版
+    replay_kernel 本来就是硬编码 channel_deviation; 此处保留相同语义,
+    真正对账要写自己的策略级对账)"""
     from evtrade.data import synthetic_bars
     from evtrade.replay import reconcile
 
     bars = synthetic_bars(days=15, start_ymd="20241101", seed=42)
     warm = int("20241110") * 1_000_000
-    rep = reconcile(bars, "5m", warm, 21, 1.5, 1.0, 1.5, 0.5,
+    rep = reconcile(bars, "5m", warm, 21,
+                    strategy_name="channel_deviation",
+                    strategy_params={"low1": 1.5, "low2": 1.0,
+                                     "high1": 1.5, "high2": 0.5},
                     init_cash=200000.0, init_position=200000.0,
                     trade_qty=10000.0, scale=1.0, verbose=False)
-    # template_demo 不是 channel_deviation, 对账会跑但信号会差异
-    # 这个测试只确认不崩; 真正的对账要写自己的策略级对账
-    assert "pass" in rep
+    assert rep["pass"] is True

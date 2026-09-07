@@ -10,7 +10,7 @@ from evtrade.core.kernel_dsl import dsl_kernel
 from evtrade.data import synthetic_bars
 from evtrade.kernel import bars_to_arrays, summarize
 from evtrade.replay import reconcile
-from evtrade.sweep import run_one
+from evtrade.sweep import run_one_from_dict
 
 
 # 单源: 走 dsl_kernel("channel_deviation") 特化模块 (2026-09 重构后冻结本尊 _strategy_check 已清空)
@@ -24,8 +24,9 @@ def _bars():
 
 
 def _base_kwargs():
+    """构造状态用的通用 kwargs (按参数声明顺序 p0..p3 填策略参数)"""
     return dict(period="5m", warmup_until=int("20241120") * 1_000_000,
-                tf1=21, low1=1.5, low2=1.0, high1=1.5, high2=0.5,
+                tf1=21, p0=1.5, p1=1.0, p2=1.5, p3=0.5,
                 init_cash=200000.0, init_position=200000.0, trade_qty=10000.0)
 
 
@@ -157,7 +158,10 @@ def test_reconcile_with_buy_pct():
     from evtrade.replay import replay_kernel
     bars = synthetic_bars(days=30, start_ymd="20241101", seed=42)
     warm = int("20241110") * 1_000_000
-    rep = reconcile(bars, "5m", warm, 21, 1.5, 1.0, 1.5, 0.5,
+    rep = reconcile(bars, "5m", warm, 21,
+                    strategy_name="channel_deviation",
+                    strategy_params={"low1": 1.5, "low2": 1.0,
+                                     "high1": 1.5, "high2": 0.5},
                     init_cash=200000.0, init_position=200000.0,
                     trade_qty=10000.0, scale=1.0,
                     buy_pct=1.0, sell_pct=1.0, all_in=False,
@@ -170,7 +174,10 @@ def test_reconcile_with_sell_pct():
     from evtrade.replay import reconcile
     bars = synthetic_bars(days=30, start_ymd="20241101", seed=42)
     warm = int("20241110") * 1_000_000
-    rep = reconcile(bars, "5m", warm, 21, 1.5, 1.0, 1.5, 0.5,
+    rep = reconcile(bars, "5m", warm, 21,
+                    strategy_name="channel_deviation",
+                    strategy_params={"low1": 1.5, "low2": 1.0,
+                                     "high1": 1.5, "high2": 0.5},
                     init_cash=200000.0, init_position=200000.0,
                     trade_qty=10000.0, scale=1.0,
                     buy_pct=0.0, sell_pct=0.3, all_in=False,
@@ -182,7 +189,10 @@ def test_reconcile_default_unchanged():
     """默认 (0/0/False) 时对账仍 PASS, 证明向后兼容"""
     bars = synthetic_bars(days=30, start_ymd="20241101", seed=42)
     warm = int("20241110") * 1_000_000
-    rep = reconcile(bars, "5m", warm, 21, 1.5, 1.0, 1.5, 0.5,
+    rep = reconcile(bars, "5m", warm, 21,
+                    strategy_name="channel_deviation",
+                    strategy_params={"low1": 1.5, "low2": 1.0,
+                                     "high1": 1.5, "high2": 0.5},
                     init_cash=200000.0, init_position=200000.0,
                     trade_qty=10000.0, scale=1.0,
                     verbose=False)
@@ -192,15 +202,18 @@ def test_reconcile_default_unchanged():
 # ============ sweep 透传 ============
 
 def test_sweep_run_one_buy_pct():
-    """sweep.run_one 透传 buy_pct / sell_pct / all_in"""
+    """sweep.run_one_from_dict 透传 buy_pct / sell_pct / all_in"""
     bars = _bars()
-    m = run_one(bars, "5m", int("20241120") * 1_000_000, 21,
-                1.5, 1.0, 1.5, 0.5, 200000.0, 200000.0, 10000.0,
-                buy_pct=0.5, sell_pct=0.5, all_in=False)
+    warm = int("20241120") * 1_000_000
+    base = {"period": "5m", "tf1": 21,
+            "init_cash": 200000.0, "init_position": 200000.0,
+            "trade_qty": 10000.0, "scale": 1.0,
+            "buy_pct": 0.5, "sell_pct": 0.5, "all_in": False,
+            "params": {"low1": 1.5, "low2": 1.0,
+                       "high1": 1.5, "high2": 0.5}}
+    m = run_one_from_dict(bars, base, warm, strategy_name="channel_deviation")
     assert "n_trades" in m
-    # 与 all_in=False 对比, 至少有一项指标不同 (因为成交数量不同)
-    m_full = run_one(bars, "5m", int("20241120") * 1_000_000, 21,
-                     1.5, 1.0, 1.5, 0.5, 200000.0, 200000.0, 10000.0,
-                     buy_pct=1.0, sell_pct=1.0, all_in=False)
-    # 同一组策略参数 + 不同资金模式 → 至少 turnover 或 final_equity 应不同
+    # 与 buy_pct=0.5 对比, 至少有一项指标不同
+    base_full = dict(base, buy_pct=1.0, sell_pct=1.0)
+    m_full = run_one_from_dict(bars, base_full, warm, strategy_name="channel_deviation")
     assert m["turnover"] != m_full["turnover"] or m["final_equity"] != m_full["final_equity"]
