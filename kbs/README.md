@@ -1,9 +1,13 @@
 # kbs 知识库 · minute_bars 周期合并 + 通道偏离策略
 
 本知识库是对项目源码的系统性中文分析文档，覆盖架构、数据结构、核心算法、策略逻辑、组件细节与运行指南。
-**2026-09-05 起项目已重构为 `evtrade/` 包**（单文件拆分 + numba 流式内核 + 并发参数扫描，见 12 号文档），
+**2026-09-05 起项目已重构为 `evtrade/` 包**（单文件拆分 + numba 流式内核 + 并发参数扫描，见 12 号文档）。
 01~11 号文档的行号（如 `mysql_analyze_demo.py:70`）对应 git 历史中的原始单文件版本（commit 5585371），
-逻辑与现行代码一致。生成日期：2026-09-04，更新：2026-09-05。
+逻辑与现行代码一致。生成日期：2026-09-04，更新：2026-09-08。
+
+> **2026-09-08 同步**：`state_spec` 声明化、kernel/gpu 按 `state_spec` 工厂化、DSL→CUDA 投影迁至 `strategies/dsl.py`、
+> 框架去特殊化（`bucket_table` 去 EMA 轨 / per-bar dict 契约 / 策略展示 hook）已补入 02、06、11、12、14 号文档与下方源码地图。
+> `mysql_analyze_demo.py` 兼容入口已移除，统一用 `python -m evtrade`。
 
 ## 一句话简介
 
@@ -44,24 +48,27 @@
 
 | 模块 | 内容 | 相关文档 |
 |---|---|---|
-| `evtrade/config.py` | DB_URL / PERIODS / TF1 / 默认资金 | 01、10 |
-| `evtrade/models.py` | Bar、fmt | 03 |
-| `evtrade/timeutils.py` | compute_bucket、daterange | 04 |
-| `evtrade/aggregator.py` | BarAggregator | 04 |
-| `evtrade/indicators.py` | ema / IncrementalEMA / EMAChannel | 05 |
-| `evtrade/strategy.py` | ChannelDeviationStrategy | 06 |
-| `evtrade/account.py` / `evtrade/execution.py` | Account、Executor 两实现 | 07 |
-| `evtrade/feeds.py` | Feed 三实现 | 08 |
-| `evtrade/engine.py` | Engine | 09 |
-| `evtrade/kernel.py` | ★ numba 流式决策内核 | 12 |
-| `evtrade/kernel_dsl.py` | DSL 按策略特化内核 (ctx→st 渲染 + splice) | 14 |
-| `evtrade/data.py` | MySQL 拉取 + npz 缓存 + 合成数据 | 12 |
-| `evtrade/sweep.py` / `evtrade/cli.py` / `evtrade/gpu.py` | 扫描 / CLI / GPU 档 | 12、14 |
-| `evtrade/strategies/dsl.py` | 策略 DSL 转译器 (三端) | 14 |
+| `evtrade/primitives.py` | `Bar`、`fmt` | 03 |
+| `evtrade/core/config.py` | DB_URL / PERIODS / TF1 / 默认资金 | 01、10 |
+| `evtrade/core/timeutils.py` | `compute_bucket`、`daterange` | 04 |
+| `evtrade/core/aggregator.py` | `BarAggregator` | 04 |
+| `evtrade/core/incremental_indicators.py` | `IncrementalEMA` / `EMAChannel`（热路径增量版） | 05 |
+| `evtrade/indicators/ema.py` | EMA 纯函数（批量/复盘用）；含 `atr`/`boll`/`rsi` 同级模块 | 05 |
+| `evtrade/strategies/base.py` | `StrategyBase` + 注册表 + `state_spec`/`params_spec`/展示 hook | 06、11、14 |
+| `evtrade/strategies/channel_deviation.py` | `ChannelDeviationStrategy`（DSL 策略） | 06 |
+| `evtrade/strategies/dsl.py` | 策略 DSL 转译器（三端）+ **CUDA 投影函数（从 `core/gpu.py` 迁入）** | 14 |
+| `evtrade/execution/account.py`、`evtrade/execution/base.py` | `Account`、`Executor` 两实现 | 07 |
+| `evtrade/feeds/` | `Feed` 抽象 + `mysql_history` / `chained` / `_registry` | 08 |
+| `evtrade/core/engine.py` | `Engine`（参考引擎，verbose） | 09 |
+| `evtrade/core/kernel.py` | ★ numba 流式决策内核（按 `state_spec` 工厂化） | 12 |
+| `evtrade/core/kernel_dsl.py` | DSL 按策略特化内核（ctx→st 渲染 + splice） | 14 |
+| `evtrade/core/data.py` | MySQL 拉取 + npz 缓存 + 合成数据 | 12 |
+| `evtrade/core/sweep.py` / `evtrade/cli.py` / `evtrade/core/gpu.py` | 扫描 / CLI / GPU 档 | 12、14 |
+| `evtrade/core/replay.py` | 行情回放 + 对账（per-bar dict 契约） | 10、13 |
 | `tests/`、`scripts/benchmark.py` | 差分测试套件、基准脚本 | 12 |
 
-`mysql_analyze_demo.py` 现为兼容入口（委托 `evtrade.cli`）；
-原始 685 行单文件实现见 git 历史（commit 5585371），下表行号以该版本为准：
+> 现行代码已无 `mysql_analyze_demo.py` 兼容入口，统一用 `python -m evtrade`（子命令 `backtest`/`sweep`/`replay`/`params`）。
+> 原始 685 行单文件实现见 git 历史（commit 5585371），下表行号以该版本为准（仅供追溯 01~11 号文档的历史行号引用）：
 
 | 代码单元 | 行号 | 说明 |
 |---|---|---|
@@ -96,13 +103,15 @@
 | mark | 桶的标志位：0=预热（只累积指标），1=策略期（驱动策略） |
 | warmup | 策略起始日之前的预热数据，用于让 EMA 有足够历史 |
 | 不操作基线 | 期初资金 + 期初持仓 × 期末价；与策略期末总资产对比得盈亏 |
+| `state_spec` | DSL 策略在类上声明的持久状态字段 schema（`{"name": {"type": bool/int/float, "default": 标量}}`）；框架自动投影到 numba jitclass / CUDA device 函数 / Python ctx。空 dict = 无持久状态。DSL 策略必声明，缺则编译期抛 `CompileError`。详见 12、14 号文档 |
+| `bundle_per_bar` | 内核/replay 把 per-bar 数组打包成 dict 契约（`{"up","dw","h","l","ts",...}`），framework 不命名指标字段；策略 hook 按需取值 |
 
 ## 快速运行
 
 ```bash
 pip install pymysql sqlalchemy numpy numba
 # 单次回测 (默认 numba 内核, 与原实现逐笔等价; 周期任意 m/h/d, 支持倍投 --scale)
-python mysql_analyze_demo.py --period 5m --start 20250101 --end 20260903 --no-sleep
+python -m evtrade backtest --period 5m --start 20250101 --end 20260903 --no-sleep
 # 参数扫描: 滚动 WFO 多窗 + 费率 + 邻域衰减评分 + 蒙特卡洛 (选参标准流程, 见 13)
 python -m evtrade sweep --data-cache cache --grid "low1=1.0,1.5,2.0" ^
     --splits 20260101,20260401,20260701 --fee-bp 5 --mc 300
