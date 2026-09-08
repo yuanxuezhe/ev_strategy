@@ -25,7 +25,6 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 # 仓库内默认目录: evtrade/strategies/_defaults/
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -152,7 +151,6 @@ def pick_best_row(df, strategy_name: str):
         filter_pass / 次优差距 (与 rank 2 的 score 差, 若有) /
         chosen_params / candidate_total
     """
-    import pandas as _pd
     if df is None or len(df) == 0:
         return None, {"error": "empty DataFrame"}
     work = df.reset_index(drop=True)

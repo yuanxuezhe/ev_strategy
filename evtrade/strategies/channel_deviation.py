@@ -167,7 +167,7 @@ class ChannelDeviationStrategy(StrategyBase):
         l = per_bar.get("l")
         if up is None or dw is None or h is None or l is None:
             return {}
-        per_bar_dev = compute_deviation_columns(up, dw, h, l)
+        per_bar_dev = _compute_deviation_columns(up, dw, h, l)
         last_idx = np.cumsum(tab["count"]) - 1
         return {k: v[last_idx] for k, v in per_bar_dev.items()}
 
@@ -188,7 +188,7 @@ class ChannelDeviationStrategy(StrategyBase):
 ChannelDeviationStrategy.compute_signal.__doc__ = _CHANNEL_DEVIATION_DSL
 
 
-def compute_deviation_columns(up: np.ndarray, dw: np.ndarray,
+def _compute_deviation_columns(up: np.ndarray, dw: np.ndarray,
                               h: np.ndarray, l: np.ndarray) -> dict[str, np.ndarray]:
     """四个偏离值 (策略层公式, 与 DSL body 同式)
 

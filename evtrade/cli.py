@@ -636,7 +636,7 @@ def params_main(argv=None):
         return
 
     if args.params_cmd == "save":
-        from .strategies._defaults_loader import save, params_from_csv_row, path_for
+        from .strategies._defaults_loader import save, params_from_csv_row
         if args.from_csv:
             import csv as _csv
             with open(args.from_csv, "r", encoding="utf-8-sig", newline="") as f:

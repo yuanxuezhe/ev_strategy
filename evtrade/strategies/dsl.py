@@ -457,7 +457,6 @@ def compile_all(strategy_class, method_name: str = "compute_signal") -> dict:
 #
 # DSL 策略必须声明 state_spec; 缺则编译期抛错。声明可以为空 dict (无持久状态,
 # DSL body 里只能写局部变量, 不能写 ctx.<持久字段>)。
-from .base import get_strategy_state_spec
 
 # 框架通用 ctx 字段 (每根 bar 由 dsl_check / kernel step 注入, 不在 state_spec)
 _FRAMEWORK_CTX_FIELDS = (
