@@ -348,6 +348,8 @@ def sweep(bars: dict, base: dict, combos: list[dict],
         row["x_mdd_max"] = max(m.get("x_mdd", 0.0) for m in test_metrics)
         row["filter_pass"] = bool(
             all(m["n_trades"] >= min_trades for m in test_metrics)
+            # max_drawdown 是"占初始权益的小数"(unify-metrics-units);
+            # --max-mdd 默认 1.0 = 100% = 不限; 实盘建议 0.15 (拒回撤 > 15% 的参数)。
             and all(m.get("max_drawdown", 0.0) <= max_mdd for m in test_metrics))
         rows.append(row)
 

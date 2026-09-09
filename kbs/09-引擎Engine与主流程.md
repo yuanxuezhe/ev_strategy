@@ -94,6 +94,13 @@ def run(self):
 > Engine 路径仅给 6 项基础汇总 (`final_cash / final_position / final_equity / n_trades / baseline / diff / pct`),
 > 因为其逐 bar 路径不累积 `equity_curve`（仅 `account` 记账）。对账路径 (`reconcile`) 只比信号 + 成交, 不比 summary。
 
+> **字段单位约定**（详见 kbs/13 §1，2026-09-09 钉死）：
+> - 百分数（`cagr` / `max_drawdown` / `excess_pct` / `ann_excess_pct`）CLI 用 `:.2%`；
+> - 金额元（`final_equity` / `baseline` / `excess` / `final_cash` / `turnover`）CLI 用 `:.2f`；
+> - 无量纲比率（`calmar` / `sharpe_excess` / `sortino_excess`）CLI 用 `:.3f`；
+> - 自然日（`max_dd_days`）CLI 用 `:.1f 天`。
+> 任何"金额元"被 `:.2%` 打印（如 `15734173.45%`）即视为 broken，由 `tests/test_metrics_units.py` 锁定。
+
 ## 5. `main` 的五步装配（CLI `backtest` 子命令）
 
 ```

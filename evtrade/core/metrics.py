@@ -79,8 +79,8 @@ def summarize(final_state: dict, init_cash: float, init_position: float,
     calmar = 0.0
     max_dd_days = 0.0
     max_dd_recovered = 0
-    x_mdd = final_state.get("max_drawdown", 0.0)
-    max_drawdown = x_mdd
+    x_mdd = 0.0
+    max_drawdown = 0.0
 
     if equity_curve is not None and len(equity_curve) >= 2 and years > 0:
         eq = np.asarray(equity_curve, dtype=np.float64)
@@ -88,8 +88,14 @@ def summarize(final_state: dict, init_cash: float, init_position: float,
               if baseline_curve is not None else None)
 
         # === 1. max_drawdown / max_dd_days / max_dd_recovered ===
+        # 单位: 占当时 peak 的小数; 见 spec.md "metrics field units"。
+        # 业界惯例 (Tradestation / PT / 量化回测通用): max_drawdown = max((peak - trough) / peak)
+        # = -min((eq - running_peak) / running_peak) where running_peak = np.maximum.accumulate(eq)
         running_peak = np.maximum.accumulate(eq)
-        drawdown = eq - running_peak                     # ≤ 0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            drawdown = np.where(running_peak > 0,
+                                (eq - running_peak) / running_peak,
+                                0.0)                          # ≤ 0; 占当时 peak 的小数
         is_dd = drawdown < 0.0
         max_drawdown = float(-drawdown.min()) if is_dd.any() else 0.0
 
@@ -126,9 +132,18 @@ def summarize(final_state: dict, init_cash: float, init_position: float,
                         sortino_excess = (mean_ex / down_std
                                           * (bars_per_year ** 0.5) * 100.0)
 
-            # === 4. Calmar = CAGR / max_dd (取 %) ===
+            # === 3b. x_mdd: 累计超额曲线的最大回撤, 占初始 baseline 的小数 ===
+            if bl is not None and len(bl) == len(eq) and bl[0] > 0:
+                cum_ex = np.cumsum(excess_rets)              # 累计超额(无单位, 累计 ratio)
+                ex_peak = np.maximum.accumulate(cum_ex)
+                x_mdd_arr = ex_peak - cum_ex                  # ≥ 0 的回撤幅度
+                if len(x_mdd_arr):
+                    x_mdd = float(x_mdd_arr.max())
+
+            # === 4. Calmar = CAGR(%) / max_dd(小数) -> 无量纲 ===
+            # cagr 是 %, max_drawdown 是小数; 必须同单位相除
             if max_drawdown > 0:
-                calmar = cagr / max_drawdown
+                calmar = (cagr / 100.0) / max_drawdown
 
         # === 5. max_dd_days (估算; 真实时间戳下用 peak_idx→trough_idx→恢复 周期数) ===
         if is_dd.any():

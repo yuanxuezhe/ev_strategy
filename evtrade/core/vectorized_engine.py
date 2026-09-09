@@ -132,8 +132,6 @@ def _execute_trades(sig_np: np.ndarray, close_np: np.ndarray, ts_np: np.ndarray,
     n = len(sig_np)
     equity_curve = np.empty(n, dtype=np.float64)
     baseline_curve = np.empty(n, dtype=np.float64)
-    running_max = -np.inf
-    max_dd = 0.0
 
     for i in range(n):
         price = float(close_np[i])
@@ -141,12 +139,8 @@ def _execute_trades(sig_np: np.ndarray, close_np: np.ndarray, ts_np: np.ndarray,
         baseline_curve[i] = init_cash + init_position * price
         equity_curve[i] = cash + position * price
 
-        # 逐 bar 跟踪 max_drawdown (在 equity 收盘时点)
-        if equity_curve[i] > running_max:
-            running_max = equity_curve[i]
-        dd = equity_curve[i] - running_max
-        if dd < max_dd:
-            max_dd = dd
+        # max_drawdown 字段已由 metrics.summarize 统一计算 (unify-metrics-units);
+        # 这里不再重复计算,避免双源不一致。
 
         s = int(sig_np[i])
         if s == 0:
@@ -195,7 +189,6 @@ def _execute_trades(sig_np: np.ndarray, close_np: np.ndarray, ts_np: np.ndarray,
     return {"cash": cash, "position": position, "last_price": last_price,
             "n_trades": n_trades, "n_buy": n_buy, "n_sell": n_sell,
             "turnover": turnover, "trades": trades,
-            "max_drawdown": -max_dd if max_dd < 0.0 else 0.0,
             "equity_curve": equity_curve,
             "baseline_curve": baseline_curve}
 

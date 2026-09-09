@@ -237,7 +237,7 @@ def _run_backtest(args):
     print(f"超额 Sharpe           : {s['sharpe_excess']:+.3f}")
     print(f"超额 Sortino          : {s['sortino_excess']:+.3f}")
     print(f"Calmar (年化/回撤)    : {s['calmar']:+.3f}")
-    print(f"最大回撤 (逐bar盯市)   : {s['max_drawdown']:.2%}")
+    print(f"最大回撤 (逐bar盯市)   : {s['max_drawdown']:+.2%}")  # 小数 -> % (unify-metrics-units)
     print(f"最大回撤持续天数       : {s['max_dd_days']:.1f} 天")
     print(f"成交额合计            : {s['turnover']:.0f}")
     print(f"引擎耗时              : {dt * 1000:.1f} ms ({n} 根 1m bar, {args.device})")
