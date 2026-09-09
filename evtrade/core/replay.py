@@ -145,15 +145,35 @@ def replay_engine(bars, period: str, warmup_until: int, tf1: int,
     class _RecStrategy:
         def __init__(self, inner):
             self.inner = inner
+            # 转发 _ctx: Engine._sync_strategy_state 用 self.strategy._ctx 把闭合
+            # 桶 push 进策略 EMA state (framework 完全解耦后, 由策略自维护);
+            # 透传以保证 replay_engine 与 replay_kernel 的 EMA 推入路径逐位一致。
+            self._ctx = getattr(inner, "_ctx", None)
             self.sig = []
+            # up/dw 历史: framework 不再传入 (策略自维护指标), 但保留容器以便
+            # 旧 replay 对账测试仍能拉取; 填充来源 = 策略 info dict 暴露
+            # (channel_deviation 在 info 里返 up/dw); fallback NaN。
             self.up = []
             self.dw = []
 
-        def check(self, cur, up, dw):
-            s, info = self.inner.check(cur, up, dw)
+        def check(self, cur, indicators=None):
+            # 历史兼容: indicators 旧传 (up, dw) 两个 float; 新签名只接
+            # indicators=None (或 dict)。这里统一判一下, 让旧 replay 对账
+            # 测试不需要改 .check 调用形态即可继续工作。
+            if indicators is not None and not isinstance(indicators, dict):
+                # 旧位置参数形态: indicators=up (float)
+                # (不再支持, 但保留显式报错以提示调用方)
+                raise TypeError(
+                    "replay._RecStrategy.check 不再支持 positional (cur, up, dw); "
+                    "请用新签名 (cur, indicators=None)"
+                )
+            s, info = self.inner.check(cur, indicators)
             self.sig.append(0 if s is None else (1 if s == "BUY" else -1))
-            self.up.append(np.nan if up is None else up)
-            self.dw.append(np.nan if dw is None else dw)
+            # info 里取 up/dw (策略选择暴露的指标), 无则 NaN
+            up_v = (info or {}).get("up") if info else None
+            dw_v = (info or {}).get("dw") if info else None
+            self.up.append(np.nan if up_v is None else up_v)
+            self.dw.append(np.nan if dw_v is None else dw_v)
             return s, info
 
     class _RecExec(SimulatedExecutor):

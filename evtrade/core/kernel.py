@@ -285,12 +285,14 @@ class KernelState:
         self.cur_volume = 0.0
         self.cur_count = 0
         self.cur_mark = 1
+        # EMA 通道 base state (kernel.step 桶切换时推入; 策略不使用 EMA 时此
+        # push 是空操作; channel_deviation 等使用 EMA 的策略直接读这些字段)。
         self.up_sum = 0.0
         self.up_count = 0
-        self.up_ema = np.nan
+        self.up_ema = 0.0
         self.dw_sum = 0.0
         self.dw_count = 0
-        self.dw_ema = np.nan
+        self.dw_ema = 0.0
         # state_spec 字段 (按 {strategy_name!r} 的 state_spec)
 {state_init_block}
         self.cash = init_cash
@@ -417,12 +419,13 @@ class KernelState:
         self.cur_volume = 0.0
         self.cur_count = 0
         self.cur_mark = 1
+        # EMA 通道 base state (任何策略都自带; 不使用时 push 是空操作)
         self.up_sum = 0.0
         self.up_count = 0
-        self.up_ema = np.nan
+        self.up_ema = 0.0
         self.dw_sum = 0.0
         self.dw_count = 0
-        self.dw_ema = np.nan
+        self.dw_ema = 0.0
         self.cash = init_cash
         self.position = init_position
         self.last_price = 0.0
@@ -555,7 +558,9 @@ def step(st, stime: int64, o: float64, h: float64, l: float64,
     else:
         mark = 1
 
-    # 2) 桶切换: 闭合旧桶 -> push 进 EMA (等价 _sync_ema), 新桶初始化
+    # 2) 桶切换: 闭合旧桶 -> push 进 EMA 通道 state (base KernelState 字段, 任何
+    # 策略都自带; 策略不使用 EMA 时此 push 是空操作, 不影响语义; channel_deviation
+    # 等使用 EMA 的策略直接读这些字段, 与原 _sync_ema 行为逐位一致)。
     if st.has_cur and ts != st.cur_ts:
         s, n, e = _ema_push(st.cur_high, st.up_sum, st.up_count, st.up_ema, st.tf1)
         st.up_sum, st.up_count, st.up_ema = s, n, e
@@ -582,7 +587,7 @@ def step(st, stime: int64, o: float64, h: float64, l: float64,
         st.cur_count += 1
         st.cur_mark = mark
 
-    # 3) 通道值 (预热期也计算, 供逐 bar 轨迹输出; O(1))
+    # 3) 通道值: 从 base state 字段读 (与 kernel 原 EMA 通道逐位等价)
     up = _ema_current(st.up_sum, st.up_count, st.up_ema, st.tf1, st.cur_high)
     dw = _ema_current(st.dw_sum, st.dw_count, st.dw_ema, st.tf1, st.cur_low)
 

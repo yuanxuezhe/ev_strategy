@@ -16,7 +16,6 @@ from __future__ import annotations
                 - kernel_dsl.py   按策略特化的内核渲染 (build_dsl_kernel)
                 - aggregator.py   BarAggregator 增量桶合并 (差分锁定参考实现)
                 - timeutils.py    compute_bucket_general (任意周期, 差分锁定)
-                - incremental_indicators.py  IncrementalEMA (差分锁定)
                 - engine.py       参考引擎 (供 replay 对账)
                 - gpu.py          CUDA 内核 (DSL 渲染产物注入)
                 - sweep.py        并发参数扫描 + 鲁棒评分
@@ -36,8 +35,9 @@ from __future__ import annotations
 
   strategies/   ✅ 策略目录
                 - base.py         StrategyBase + register_strategy
-                - channel_deviation.py  DSL 版 (实验)
+                - channel_deviation.py  DSL 版
                 - example_breakout.py   示例
+                - example_dev_trigger.py   示例 (DSL)
 
   indicators/   ✅ 指标目录 (纯函数库, jupyter 友好)
                 - ema / atr / rsi / boll
@@ -46,7 +46,7 @@ from __future__ import annotations
 🟢🟡🔴 修改频次分类 (每个文件 docstring 顶部也标了)
 ================================================================
 🟢 冻结 (kernel 锁定, 改了触发全红):
-    core/aggregator / timeutils / incremental_indicators / kernel / engine / gpu / replay
+    core/aggregator / timeutils / kernel / engine / gpu / replay
 
 🟡 可改 (用户面 / 参数面):
     cli.py  core/config / data / sweep  execution/base
@@ -78,7 +78,9 @@ from .core.timeutils import compute_bucket, compute_bucket_general, daterange, r
 from .core.aggregator import BarAggregator
 from .execution.account import Account
 from .strategies.channel_deviation import ChannelDeviationStrategy
-from .core.incremental_indicators import EMAChannel, IncrementalEMA, ema, ema_channel
+# 注意: 旧的 `from evtrade import EMAChannel / IncrementalEMA / ema / ema_channel`
+# 已下线 (framework 不再持有指标, 详见 change 2026-09-09-decouple-indicators-from-framework);
+# 若需纯函数版 EMA, 请 `from evtrade.indicators import ema, ema_channel`
 
 # ---- 向后兼容 shim: 让 `from evtrade.data import ...` / `from evtrade.config import ...` 继续可用 ----
 # 测试文件 (tests/test_*.py) 用顶层路径, 顶层 `__init__.py` 把它们映射到真实位置
@@ -91,8 +93,7 @@ from .core import replay as _replay_mod
 from .core import permutation as _permutation_mod
 from .core import gpu as _gpu_mod
 from . import primitives as _primitives_mod
-from .core import (timeutils as _timeutils_mod, aggregator as _aggregator_mod,
-                   incremental_indicators as _incr_indicators_mod)
+from .core import (timeutils as _timeutils_mod, aggregator as _aggregator_mod)
 from .execution import account as _account_mod, base as _execution_mod
 from .strategies import channel_deviation as _strategy_mod  # 旧 evtrade.strategy shim (向后兼容)
 _sys.modules.setdefault("evtrade.data", _data_mod)
@@ -110,8 +111,20 @@ _sys.modules.setdefault("evtrade.models", _primitives_mod)  # 向后兼容旧路
 _sys.modules.setdefault("evtrade.account", _account_mod)
 _sys.modules.setdefault("evtrade.strategy", _strategy_mod)
 _sys.modules.setdefault("evtrade.execution", _execution_mod)
-_sys.modules.setdefault("evtrade._incremental_indicators", _incr_indicators_mod)  # 旧名向后兼容
-_sys.modules.setdefault("evtrade.incremental_indicators", _incr_indicators_mod)
+# incremental_indicators 模块已下线 (framework 解耦, EMA 改放 evtrade.indicators/ema.py);
+# 留一行 stub 兜底旧 import, 提示迁移路径 (任何调用都会立刻报错, 不 silent 失败)。
+import types as _types
+def _missing_incremental_indicators(*a, **kw):
+    raise ImportError(
+        "evtrade.incremental_indicators 已下线 (2026-09 framework 解耦); "
+        "EMA 增量 API 见 evtrade.indicators.ema (ema_push / ema_current / "
+        "ema_channel_push / ema_channel_current)。"
+    )
+_stub_mod = _types.ModuleType("evtrade.incremental_indicators")
+_stub_mod.IncrementalEMA = _missing_incremental_indicators
+_stub_mod.EMAChannel = _missing_incremental_indicators
+_sys.modules.setdefault("evtrade.incremental_indicators", _stub_mod)
+_sys.modules.setdefault("evtrade._incremental_indicators", _stub_mod)
 
 # ---- core 主调度 ----
 from .core.kernel import (
@@ -145,6 +158,9 @@ from .strategies import (
 )
 from .indicators import (
     ema as ema_fn, atr, rsi, bollinger, sma, true_range,
+    ema_push, ema_current, ema_channel_push, ema_channel_current,
+    atr_push, atr_current, rsi_push, rsi_current,
+    sma_push, sma_current, boll_push, boll_current,
 )
 
 
@@ -157,10 +173,11 @@ __all__ = [
     "BarAggregator", "Account",
     # 策略
     "ChannelDeviationStrategy",
-    # 指标 (增量 / 冻结层)
-    "ema", "IncrementalEMA", "EMAChannel", "ema_channel",
-    # 指标 (纯函数 / 子包)
+    # 指标 (纯函数 / 子包) —— framework 不再持有增量版 (详见 change 2026-09-09)
     "ema_fn", "atr", "rsi", "bollinger", "sma", "true_range",
+    "ema_push", "ema_current", "ema_channel_push", "ema_channel_current",
+    "atr_push", "atr_current", "rsi_push", "rsi_current",
+    "sma_push", "sma_current", "boll_push", "boll_current",
     # 执行器
     "Executor", "SimulatedExecutor", "BrokerExecutor",
     # 行情

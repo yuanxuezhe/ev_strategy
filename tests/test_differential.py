@@ -29,19 +29,30 @@ class ListFeed(Feed):
 
 
 class RecordingStrategy:
-    """代理策略: 记录每根 bar 的 (signal, up, dw), 逻辑完全委托真实策略"""
+    """代理策略: 记录每根 bar 的 (signal, up, dw), 逻辑完全委托真实策略
+
+    framework 不再传入 positional (up, dw); 改用新签名 (cur, indicators=None),
+    从 info dict 提取 up/dw (channel_deviation 在 info 里返 up/dw)。历史兼容:
+    仍按 (sig, up, dw) 三元组收集, 但 up/dw 现在来自策略 info 暴露。
+
+    暴露 _ctx = inner._ctx 让 Engine._sync_strategy_state 能把桶切换的
+    high/low push 进 channel_deviation 自维护的 EMA state (与 kernel 一致)。
+    """
 
     def __init__(self, inner):
         self.inner = inner
+        self._ctx = inner._ctx  # 转发: Engine 用此来 push 闭合桶进 EMA state
         self.sig = []
         self.up = []
         self.dw = []
 
-    def check(self, cur, up, dw):
-        s, info = self.inner.check(cur, up, dw)
+    def check(self, cur, indicators=None):
+        s, info = self.inner.check(cur, indicators)
         self.sig.append(SIG_NUM[s])
-        self.up.append(np.nan if up is None else up)
-        self.dw.append(np.nan if dw is None else dw)
+        up_v = (info or {}).get("up") if info else None
+        dw_v = (info or {}).get("dw") if info else None
+        self.up.append(np.nan if up_v is None else up_v)
+        self.dw.append(np.nan if dw_v is None else dw_v)
         return s, info
 
 
@@ -67,7 +78,10 @@ def run_reference(bars, period, warmup_until, tf1, params, init_cash, init_posit
     feed = ListFeed(bars)
     account = Account(cash=init_cash, position=init_position)
     executor = RecordingExecutor(account, qty=trade_qty, scale=scale)
-    strategy = RecordingStrategy(ChannelDeviationStrategy(params=params))
+    # tf1 已下沉为策略 params (channel_deviation 的 params_spec 自声明 tf1);
+    # 若调用方未在 params 中显式给出, 补上以便 Python 与 kernel 走同一份
+    params2 = {**params, "tf1": tf1}
+    strategy = RecordingStrategy(ChannelDeviationStrategy(params=params2))
     aggregator = BarAggregator(resolve_period_seconds(period), on_bars=None,
                                warmup_until=warmup_until)
     engine = Engine(feed, aggregator, strategy, executor, tf1=tf1, verbose=False)
@@ -81,13 +95,14 @@ def run_kernel(bars, period, warmup_until_int, tf1, params, init_cash, init_posi
     已被清空 (2026-09 重构, 单源), 真实执行必须经 dsl_kernel(name)。"""
     arr = bars_to_arrays(bars)
     n = len(bars)
+    from evtrade.core.kernel_dsl import dsl_kernel, make_state_general
     kmod = dsl_kernel("channel_deviation")
-    st = kmod.make_state(period=period, warmup_until=warmup_until_int, tf1=tf1,
-                         p0=params["low1"], p1=params["low2"],
-                         p2=params["high1"], p3=params["high2"],
-                         init_cash=init_cash, init_position=init_position,
-                         trade_qty=trade_qty, scale=scale,
-                         record_trades=True, trade_cap=n)
+    st = make_state_general("channel_deviation", period=period,
+                            warmup_until=warmup_until_int, tf1=tf1,
+                            init_cash=init_cash, init_position=init_position,
+                            trade_qty=trade_qty, scale=scale,
+                            strategy_params=params,
+                            record_trades=True, trade_cap=n)
     sig = np.zeros(n, np.int8)
     up = np.full(n, np.nan)
     dw = np.full(n, np.nan)

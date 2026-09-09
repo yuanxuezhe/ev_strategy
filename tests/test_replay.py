@@ -49,7 +49,11 @@ def test_replay_kernel_vs_engine_signals_equal():
     stime = np.array([int(b.stime) for b in bars])
     warm = 20250106000000
     offset = int(np.searchsorted(stime, warm))
-    params = {"low1": 0.4, "low2": 0.25, "high1": 0.4, "high2": 0.2}
+    # tf1 已下沉为策略参数 (channel_deviation 的 params_spec 自声明);
+    # 若 strategy_params 不含 tf1, 引擎和内核各自的 tf1 入参会落到不同字段
+    # (内核 make_state_general 兜底, 引擎 _sync_strategy_state 不动 ctx.params),
+    # 导致三端 EMA 周期不一致, 信号漂移。这里显式填入以锁定两边行为。
+    params = {"low1": 0.4, "low2": 0.25, "high1": 0.4, "high2": 0.2, "tf1": 5}
     k = replay_kernel(bars, "5m", warm, 5,
                       strategy_name="channel_deviation", strategy_params=params)
     r = replay_engine(bars, "5m", warm, 5,

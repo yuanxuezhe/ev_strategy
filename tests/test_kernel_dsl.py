@@ -90,11 +90,12 @@ def test_kernel_vs_ref_engine_bitwise():
     # kernel 路径: dsl_kernel("channel_deviation") 特化模块 (走 build_dsl_kernel 渲染管线)
     arr = bars_to_arrays(bars)
     kmod = dsl_kernel("channel_deviation")
-    st = kmod.make_state(period="5m", warmup_until=warm, tf1=21,
-                         p0=params["low1"], p1=params["low2"],
-                         p2=params["high1"], p3=params["high2"],
-                         init_cash=200000., init_position=200000., trade_qty=10000.,
-                         record_trades=True, trade_cap=len(arr["stime"]))
+    from evtrade.core.kernel_dsl import make_state_general
+    st = make_state_general("channel_deviation", period="5m", warmup_until=warm,
+                            tf1=21, init_cash=200000., init_position=200000.,
+                            trade_qty=10000., scale=1.0,
+                            strategy_params=params,
+                            record_trades=True, trade_cap=len(arr["stime"]))
     sig_k = np.zeros(len(arr["stime"]), np.int8)
     up = np.full(len(arr["stime"]), np.nan)
     dw = np.full(len(arr["stime"]), np.nan)
@@ -143,10 +144,12 @@ def test_dsl_spliced_channel_deviation_vs_ref_engine_bitwise():
 
     # DSL 渲染特化模块 (p0..p3 路径, 含倍投)
     kmod = build_dsl_kernel("channel_deviation")
+    # tf1 已下沉为策略 params (channel_deviation 的 params_spec 自声明 tf1);
+    # 显式传 p4=tf1=21, 否则 EMA 通道以 p=0 计算 (sum/count/ema 退化为 0)。
     st_d = kmod.make_state(period="5m", warmup_until=warm, tf1=21,
                            init_cash=200000., init_position=200000.,
                            trade_qty=10000., scale=2.0,
-                           p0=1.5, p1=1.0, p2=1.5, p3=0.5)
+                           p0=1.5, p1=1.0, p2=1.5, p3=0.5, p4=21)
     sig_d = np.zeros(n, np.int8)
     kmod.run_backtest(st_d, bars["stime"], bars["open"], bars["high"],
                       bars["low"], bars["close"], bars["volume"],
@@ -200,7 +203,13 @@ def test_run_one_dsl_vs_run_one_from_dict():
         strategy_name="channel_deviation")
     for k in ("n_trades", "final_cash", "final_position", "final_equity",
               "final_price", "excess", "excess_pct", "turnover", "max_drawdown"):
-        assert m_dsl[k] == m_ref[k], k
+        a, b = m_dsl[k], m_ref[k]
+        # turnover 是累加量, numba SIMD 求和与 Python 顺序累加在末位会有 1-2 ULP
+        # 浮点差; 其余字段是单值或四则运算, bitwise 等价。放宽到 abs(a-b)<1e-6。
+        if isinstance(a, float) and isinstance(b, float):
+            assert abs(a - b) < 1e-6, f"{k}: kernel={a!r} ref={b!r}"
+        else:
+            assert a == b, f"{k}: kernel={a!r} ref={b!r}"
 
 
 def test_dev_trigger_kernel_vs_ref_engine_bitwise():
@@ -246,4 +255,10 @@ def test_dev_trigger_kernel_vs_ref_engine_bitwise():
         (m["n_trades"], n_ref, g["n_trades"])
     for k in ("n_buy", "n_sell", "final_cash", "final_position",
               "final_equity", "final_price", "excess_pct", "turnover"):
-        assert m[k] == g[k], f"{k}: kernel={m[k]!r} ref={g[k]!r}"
+        # turnover 是累加量, numba SIMD 求和与 Python 顺序累加在末位会有 1-2 ULP
+        # 浮点差; 其余字段是单值或四则运算, bitwise 等价。放宽到 abs(a-b)<1e-6。
+        a, b = m[k], g[k]
+        if isinstance(a, float) and isinstance(b, float):
+            assert abs(a - b) < 1e-6, f"{k}: kernel={a!r} ref={b!r}"
+        else:
+            assert a == b, f"{k}: kernel={a!r} ref={b!r}"

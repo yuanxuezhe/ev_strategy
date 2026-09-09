@@ -134,6 +134,30 @@ def _build_dsl_kernel_impl(strategy_name: str, source_hash: str):
     i1 = src.index(_SPLICE_END)
     i0 = src.rindex("\n", 0, i0) + 1                    # BEGIN 注释行行首
     i1 = src.index("\n", i1) + 1                        # END 注释行行尾之后
+    # 注入白名单 indicator 函数 import (DSL body 调 ema_channel_push 等;
+    # 详见 strategies/dsl._INDICATOR_INJECT_NUMBA); 必须放在模块顶层 (import
+    # 不得嵌进函数体, 否则 col 0 行落在 def docstring 后会触发 IndentationError)。
+    # 做法: 找到模块第一个 `@njit` 装饰行, 把 imports 插到它之前 (模块级, 在
+    # docstring + 其它 imports 之后, 在 numba 装饰函数之前)。
+    from ..strategies.dsl import _INDICATOR_INJECT_NUMBA
+    inject = _INDICATOR_INJECT_NUMBA + "\n"
+    # 找第一个以 @njit 开头的行
+    lines = src.split("\n")
+    first_njit = None
+    for idx, line in enumerate(lines):
+        if line.lstrip().startswith("@njit"):
+            first_njit = idx
+            break
+    if first_njit is None:
+        raise RuntimeError("kernel.py 中找不到 @njit 装饰行; 无法注入 indicator imports")
+    inject_pos = sum(len(l) + 1 for l in lines[:first_njit])
+    src = src[:inject_pos] + inject + src[inject_pos:]
+    # 然后替换 BEGIN/END 之间为带缩进的 DSL body
+    # BEGIN/END 位置在注入 imports 后整体下移, 需要重新计算
+    i0 = src.index(_SPLICE_BEGIN)
+    i1 = src.index(_SPLICE_END)
+    i0 = src.rindex("\n", 0, i0) + 1
+    i1 = src.index("\n", i1) + 1
     src = src[:i0] + textwrap.indent(body, "    ") + "\n" + src[i1:]
 
     # 2) 注入 KernelState jitclass (按 state_spec 添加字段)
@@ -230,7 +254,9 @@ def make_state_general(strategy_name: str, period: str, warmup_until: int,
                        record_trades: bool = False, trade_cap: int = 0):
     """按 params_spec 声明顺序把策略参数填进内核 p0..pN 并构造状态
 
-    tf1 (通道 EMA 周期) 是引擎级参数, 不属于 params_spec。
+    tf1 (通道 EMA 周期) 已下沉为策略 params (channel_deviation 等的 params_spec 自声明
+    tf1); 若调用方同时传 `tf1` 关键字和 `strategy_params`, 且 strategy_params 含 tf1,
+    则 strategy_params 优先 (显式覆盖); 否则用本函数的 tf1 兜底填进 p4。
     参数 > 16 个 -> ValueError (内核 p0..p15 上限)。
     """
     from ..strategies import get_strategy_param_spec
@@ -239,6 +265,11 @@ def make_state_general(strategy_name: str, period: str, warmup_until: int,
         raise ValueError(
             f"策略 {strategy_name} 有 {len(spec)} 个参数, 超过内核上限 16 (p0..p15)")
     sp = dict(strategy_params or {})
+    # tf1 兜底: 若 strategy_params 没声明 tf1, 用本函数 tf1 入参数兜底 (历史 tf1 是
+    # 引擎级关键字, 仍允许直接传 — 不显式声明就回落到函数入参, 避免 silently 落到
+    # params_spec 的 default 21, 造成指标周期与调用方预期不符)。
+    if "tf1" in spec and "tf1" not in sp:
+        sp["tf1"] = tf1
     pvals = [float(sp.get(k, schema.get("default", 0.0)))
              for k, schema in spec.items()]
     return dsl_kernel(strategy_name).make_state(

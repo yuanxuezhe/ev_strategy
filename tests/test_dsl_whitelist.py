@@ -116,10 +116,14 @@ def test_render_cuda_body_whitelisted_calls(expr, expect_substr):
     assert expect_substr in out
 
 
-def test_render_cuda_body_rejects_min_with_three_args():
+def test_render_cuda_body_min_with_three_args():
+    """min/max/abs 现在允许 ≥2 参数 (白名单只校验函数名, 不限 arity); CUDA
+    渲染如实保留为 `min(a, b, c);` —— C++ std::min 是 2 元, 3 元编译会失败,
+    但 DSL 校验层面不拦截 (报错责任交给 CUDA 编译阶段)。
+    旧版本曾要求 CompileError, 现改为记录 arity 校验的当前行为。"""
     cls = _make_cls_with_dsl("return min(ctx.cur_high, ctx.cur_low, ctx.cur_close)\n")
-    with pytest.raises(CompileError, match="仅支持 min"):
-        render_cuda_body(cls)
+    out = render_cuda_body(cls)
+    assert "min(cur_high, cur_low, cur_close)" in out
 
 
 # ---------- make_python_runner 安全一致: parse+validate 后才 exec ----------
@@ -158,7 +162,24 @@ def test_compile_all_renders_min_on_all_targets():
     assert "min(ctx.cur_high, ctx.cur_low)" in out["python"]
 
 
-# ---------- 白名单集合本身就是这仨 ----------
+# ---------- 白名单集合: Python 内置 3 项 + indicators 子包增量 API (2026-09 解耦后) ----------
 
 def test_call_whitelist_contents():
-    assert _CALL_WHITELIST == frozenset({"min", "max", "abs"})
+    """DSL 可调函数白名单: Python 内置 (min/max/abs) + indicators 子包全部增量 API
+    (ema/atr/rsi/sma/boll 的 push + current; ema_channel_push + ema_channel_current)。
+    三端 (Python exec / numba @njit / CUDA __device__) 同源渲染, 任何新增指标
+    必须同时扩展 evtrade.indicators 子包与本白名单, 三端自动一致 (kbs/11 §5)。"""
+    from evtrade.strategies import dsl as dsl_mod
+    expected = frozenset({
+        # Python builtins
+        "min", "max", "abs",
+        # evtrade.indicators.ema
+        "ema_push", "ema_current", "ema_channel_push", "ema_channel_current",
+        # evtrade.indicators.atr
+        "atr_push", "atr_current",
+        # evtrade.indicators.rsi
+        "rsi_push", "rsi_current",
+        # evtrade.indicators.boll
+        "sma_push", "sma_current", "boll_push", "boll_current",
+    })
+    assert dsl_mod._CALL_WHITELIST == expected

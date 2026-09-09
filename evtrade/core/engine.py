@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""回测/实盘统一引擎 (自 mysql_analyze_demo.py 原样迁移; 参考实现, 差分测试基准)
+"""回测/实盘统一引擎 (参考实现, 差分测试基准)
 
 ================================================================
 ✅  可改层模块  ✅  (但与 kernel 等价, 改时小心)
@@ -13,73 +13,100 @@ from __future__ import annotations
       若不满足风控则置 signal=None。
 
 **不要改**的部分:
-  - _sync_ema 增量推送逻辑 (与 kernel step 第 2 步等价)
-  - mark=0 时只累积指标不驱动策略 (kernel 第 4 步等价)
+  - mark=0 时只跑框架预热 (不驱动策略) — kernel 第 4 步等价
   - 成交时点 = 信号当根 close, 价格 = cur["close"]
-================================================================
+
+框架不假定任何指标字段 (CLAUDE.md §5): Engine 不再持有 EMAChannel;
+策略自维护指标 (DSL body 内调 evtrade.indicators.*); strategy.check
+签名 = (cur, indicators=None), framework 永远传 indicators=None
+(详见 kbs/09 §2 与本文件 on_bars)。
 """
 
 from ..core.aggregator import BarAggregator
-from ..core.incremental_indicators import EMAChannel
 from ..primitives import fmt
 from ..execution.base import Executor
 from ..feeds.base import Feed
 from ..strategies.base import StrategyBase
-from .config import INIT_CASH, INIT_POSITION, TF1, TRADE_QTY
+from .config import INIT_CASH, INIT_POSITION, TRADE_QTY
 
 
 # ============ 引擎 (连接 Feed → Aggregator → 策略 → 执行) ============
 
 class Engine:
-    """回测/实盘统一引擎
+    """回测/实盘统一引擎 (framework 不假定指标)
 
     run(): 从 feed 取 bar 喂 aggregator; aggregator 回调 on_bars;
-           on_bars 内: 预热(mark=0)跳过, 否则算指标+策略, 信号触发 executor。
+           on_bars 内: 预热(mark=0)跳过, 否则 strategy.check(cur) +
+           信号触发 executor。
+
+    框架仍保留"桶切换推入 helper" (供策略自维护 EMA 通道 state 用);
+    具体策略 ctx 是否需要, 由策略 state_spec 决定 — framework 通过 duck-typing
+    检测 ctx 上是否有 up_st_sum / dw_st_sum 等字段, 有则在每个闭合桶切换时
+    把该桶 high/low push 进 ctx.state (与 numba kernel.step 的对应处理逐位
+    一致, 保证三端 bitwise 一致)。
     """
 
     def __init__(self, feed: Feed, aggregator: BarAggregator,
                  strategy: StrategyBase, executor: Executor,
-                 tf1: int = TF1, verbose=True):
+                 tf1: int = 21, verbose=True, **legacy):
+        # tf1 仍保留为参数 (策略如需 EMA 周期, 从 params 取; framework 仅
+        # 在 _sync_strategy_state 里使用 duck-typing 检测, 不假定指标命名)
         self.feed = feed
         self.aggregator = aggregator
         self.strategy = strategy
         self.executor = executor
         self.tf1 = tf1
         self.verbose = verbose
-        # 增量 EMA 通道轨 (替代每根 O(n) 重算的 ema_channel)
-        self.ema_ch = EMAChannel(tf1)
-        self._pushed = 0        # 已 push 的闭合桶数 (对应 aggregator.bars 长度)
+        # 已 push 的闭合桶计数 (与策略 ctx 配合做桶切换检测)
+        self._pushed = 0
         # 让 aggregator 的回调指向自己
         self.aggregator.on_bars = self.on_bars
 
-    def _sync_ema(self, closed_bars: list[dict]):
-        """把新增的闭合桶 push 进 EMA 状态 (O(1)/桶)"""
+    def _sync_strategy_state(self, closed_bars: list[dict]):
+        """把新增的闭合桶 high/low push 进策略 ctx 的 EMA 通道 state
+        (ctx 上有 up_sum/up_count/up_ema + dw_sum/dw_count/dw_ema 时)。
+
+        框架仅做"桶切换时机 + push 时机"的协调, 与 numba kernel.step 行为逐位
+        一致 (这是三端 bitwise 一致的关键)。
+        """
+        ctx = getattr(self.strategy, "_ctx", None)
+        if ctx is None or not hasattr(ctx, "up_sum"):
+            return  # 策略没有 EMA state 字段, 不推入
+        from ..indicators.ema import ema_channel_push
         n = len(closed_bars)
         while self._pushed < n:
             b = closed_bars[self._pushed]
-            self.ema_ch.push(b["high"], b["low"])
+            us, uc, ue, ds, dc, de = ema_channel_push(
+                ctx.up_sum, ctx.up_count, ctx.up_ema,
+                ctx.dw_sum, ctx.dw_count, ctx.dw_ema,
+                b["high"], b["low"], self.tf1,
+            )
+            ctx.up_sum, ctx.up_count, ctx.up_ema = us, uc, ue
+            ctx.dw_sum, ctx.dw_count, ctx.dw_ema = ds, dc, de
             self._pushed += 1
 
     def on_bars(self, bars: list[dict]):
-        """聚合器回调: 计算指标 + 策略信号 + 执行 + 打印
+        """聚合器回调: 策略信号 + 执行 + 打印
 
-        mark=0 (预热): 只 push 闭合桶进 EMA 状态 (指标预热), 不驱动策略。
-        mark=1 (策略期): 增量算指标 + 驱动策略 + 打印。
+        mark=0 (预热): 不驱动策略, 直接返回 — 但仍 _sync_strategy_state
+        (预热期也要累积 EMA 历史, 保证 mark=1 时指标就绪)。
+
+        mark=1 (策略期): strategy.check(cur) — indicators=None, 由策略内
+        部从 cur 维护指标状态 (DSL body 内 ema_current)。
         """
         closed = bars[:-1]           # 已闭合桶
         cur = bars[-1]               # 当前未闭合桶
-        # 同步新增闭合桶到 EMA 状态 (预热期也需累积, 保证 mark=1 时指标就绪)
-        self._sync_ema(closed)
+        # 同步新增闭合桶到策略 EMA 通道 state (duck-typed: 仅当 ctx 有 up_st_*)
+        self._sync_strategy_state(closed)
 
         if cur.get("mark", 1) == 0:
-            return   # 预热: 只累积指标历史, 不进入策略
+            return   # 预热: 指标已累积, 不驱动策略
 
         price = float(cur["close"])
         self.executor.update_price(price)
 
-        # 增量 EMA: 基于已闭合序列 + 当前桶最新 H/L, O(1)
-        up, dw = self.ema_ch.channel(cur["high"], cur["low"])
-        signal, info = self.strategy.check(cur, up, dw)
+        # 策略自维护指标: framework 不传任何 positional 指标 (up/dw 等均不假设)
+        signal, info = self.strategy.check(cur, None)
 
         # 信号触发 -> 统一下单处理
         if signal:
@@ -139,7 +166,8 @@ def build_engine(feed, *, period, warmup_until=None,
                  init_cash=INIT_CASH, init_position=INIT_POSITION,
                  trade_qty=TRADE_QTY, scale=1.0,
                  buy_pct=0.0, sell_pct=0.0, all_in=False,
-                 tf1=TF1, verbose=False, executor=None) -> Engine:
+                 tf1: int = 21, verbose=False, executor=None,
+                 **legacy) -> Engine:
     """装配 Feed → Aggregator → Strategy → Executor → Engine
 
     参考引擎的四处装配 (_run_ref / run_one_general / replay_engine / 测试)
@@ -150,6 +178,7 @@ def build_engine(feed, *, period, warmup_until=None,
       - executor 未给时新建 Account + SimulatedExecutor (verbose 跟随 verbose)
       - period 接受 "5m" 字符串或周期秒数 int
       - warmup_until 为 stime 字符串阈值 (BarAggregator 约定), None 表示不预热
+      - tf1 已删除: 框架不再持有 EMA 周期 (策略如需 tf1, 在 params_spec 自声明)
     """
     from ..execution.account import Account
     from ..core.timeutils import resolve_period_seconds

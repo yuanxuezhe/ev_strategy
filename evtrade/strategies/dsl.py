@@ -58,9 +58,10 @@ class CompileError(Exception):
 
 
 # numba/CUDA 不支持的关键字 / 类型
-# 注: ast.Call 不在此处 —— _validate 单独处理 (仅允许白名单 min/max/abs)
+# 注: ast.Call 不在此处 —— _validate 单独处理 (仅允许白名单 min/max/abs + indicators.*)
+# 注: ast.Tuple 仅在 Assign.targets[0] 多元赋值场景放行 (expr 位置 _validate 兜底拒)
 _FORBIDDEN_NODES = (
-    ast.List, ast.Dict, ast.Set, ast.Tuple,
+    ast.List, ast.Dict, ast.Set,
     ast.Lambda,
     ast.Yield, ast.YieldFrom,
     ast.Try, ast.With, ast.AsyncFor, ast.AsyncWith,
@@ -70,8 +71,66 @@ _FORBIDDEN_NODES = (
 )
 
 
-# DSL 允许的函数调用白名单 (仅此三者, 三端一致)
-_CALL_WHITELIST = frozenset({"min", "max", "abs"})
+# DSL 允许的函数调用白名单 (三端一致)
+# 基础内建: min / max / abs
+# 指标增量 API (DSL 三端可调; 详见 evtrade/indicators/* + kbs/11 §5)
+_CALL_WHITELIST = frozenset({
+    # 基础
+    "min", "max", "abs",
+    # evtrade.indicators.ema
+    "ema_push", "ema_current", "ema_channel_push", "ema_channel_current",
+    # evtrade.indicators.atr
+    "atr_push", "atr_current",
+    # evtrade.indicators.rsi
+    "rsi_push", "rsi_current",
+    # evtrade.indicators.boll
+    "sma_push", "sma_current", "boll_push", "boll_current",
+})
+
+# Python exec namespace 注入 (DSL body 直接调, 不需要写 import)
+_INDICATOR_INJECT_PYTHON = [
+    "from evtrade.indicators.ema import (ema_push, ema_current, ema_channel_push, ema_channel_current)",
+    "from evtrade.indicators.atr import (atr_push, atr_current)",
+    "from evtrade.indicators.rsi import (rsi_push, rsi_current)",
+    "from evtrade.indicators.boll import (sma_push, sma_current, boll_push, boll_current)",
+]
+
+# numba 内核模块注入 (由 kernel_dsl 在 splice kernel.py 时拼接到 _strategy_check 函数前)
+_INDICATOR_INJECT_NUMBA = "\n".join(_INDICATOR_INJECT_PYTHON)
+
+# CUDA 端: __device__ 函数定义源码 (由 render_cuda_device_function 注入到
+# strategy_check 函数前)。从 evtrade.indicators 取, 不在此处重复字面源码。
+def _indicator_cuda_defs() -> str:
+    from evtrade.indicators import (
+        CUDA_DEVICE_EMA_PUSH, CUDA_DEVICE_EMA_CHANNEL_PUSH, CUDA_DEVICE_EMA_CURRENT,
+        CUDA_DEVICE_ATR_PUSH, CUDA_DEVICE_ATR_CURRENT,
+        CUDA_DEVICE_RSI_PUSH, CUDA_DEVICE_RSI_CURRENT,
+        CUDA_DEVICE_SMA_PUSH, CUDA_DEVICE_SMA_CURRENT,
+        CUDA_DEVICE_BOLL_PUSH, CUDA_DEVICE_BOLL_CURRENT,
+    )
+    return "\n".join([
+        CUDA_DEVICE_EMA_PUSH, CUDA_DEVICE_EMA_CHANNEL_PUSH, CUDA_DEVICE_EMA_CURRENT,
+        CUDA_DEVICE_ATR_PUSH, CUDA_DEVICE_ATR_CURRENT,
+        CUDA_DEVICE_RSI_PUSH, CUDA_DEVICE_RSI_CURRENT,
+        CUDA_DEVICE_SMA_PUSH, CUDA_DEVICE_SMA_CURRENT,
+        CUDA_DEVICE_BOLL_PUSH, CUDA_DEVICE_BOLL_CURRENT,
+    ])
+
+
+# 多元赋值字段映射 (CUDA 端展开用): indicator 函数 -> struct 字段名列表
+# 当 DSL body 写 `a, b, c = ema_push(...)` 时, CUDA 端展开为:
+#   auto _t = ema_push(args);
+#   a = _t.sum; b = _t.count; c = _t.ema;
+# 字段顺序必须与 @njit 函数返回 tuple 顺序一致。
+_CUDA_INDICATOR_FIELDS = {
+    "ema_push":            ["sum", "count", "ema"],
+    "ema_channel_push":    ["up.sum", "up.count", "up.ema",
+                            "dw.sum", "dw.count", "dw.ema"],
+    "atr_push":            ["sum", "count", "prev_close", "atr"],
+    "rsi_push":            ["sum_g", "sum_l", "avg_g", "avg_l", "count", "prev_close"],
+    "sma_push":            ["sum", "count"],
+    "boll_push":           ["sum", "sumsq", "count"],
+}
 
 
 def _validate(tree: ast.Module) -> None:
@@ -86,7 +145,8 @@ def _validate(tree: ast.Module) -> None:
             raise CompileError(f"DSL 不支持节点: {type(node).__name__} "
                                f"(行 {getattr(node, 'lineno', '?')})")
         if isinstance(node, ast.Call):
-            # 仅允许白名单内建; 不接受关键字参数 (min/max/abs 都是单参数或双位置参数)
+            # 仅允许白名单内函数 (min/max/abs + indicators.* 增量 API);
+            # 不接受关键字参数, 不接受嵌套属性访问 (如 a.b() 也拒绝)
             if (isinstance(node.func, ast.Name)
                     and node.func.id in _CALL_WHITELIST
                     and not node.keywords):
@@ -94,7 +154,7 @@ def _validate(tree: ast.Module) -> None:
             raise CompileError(
                 f"DSL 不支持调用: "
                 f"{ast.unparse(node.func) if hasattr(ast, 'unparse') else type(node.func).__name__} "
-                f"(仅允许 min/max/abs, 且必须位置参数)"
+                f"(仅允许白名单 {sorted(_CALL_WHITELIST)} 内函数, 且必须位置参数)"
             )
         if isinstance(node, ast.Name) and node.id in ("True", "False", "None"):
             continue
@@ -103,10 +163,27 @@ def _validate(tree: ast.Module) -> None:
         if isinstance(node, (ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare)):
             continue
         if isinstance(node, ast.Assign):
-            # 仅允许 ctx.x = v 形式 (单目标, Attribute 或 Name)
+            # 支持两种形式:
+            #   1) 单目标: ctx.x = v / x = v
+            #   2) 多元目标: a, b, c = indicator_func(...)  (指标多返回;
+            #      targets[0] 是 ast.Tuple 含 2-6 个 Name/Attribute, value 是白名单 Call)
             if len(node.targets) != 1:
-                raise CompileError("DSL 不允许多元赋值")
-            continue
+                raise CompileError(
+                    "DSL 多元赋值仅支持 `a, b, c = indicator_func(...)` 形式"
+                )
+            t = node.targets[0]
+            if isinstance(t, ast.Name) or isinstance(t, ast.Attribute):
+                continue    # 单目标
+            if (isinstance(t, ast.Tuple) and 2 <= len(t.elts) <= 6
+                    and all(isinstance(e, (ast.Name, ast.Attribute)) for e in t.elts)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in _CALL_WHITELIST):
+                continue    # 多元 (指标函数调用)
+            raise CompileError(
+                "DSL 不支持的赋值目标; 仅允许 `ctx.x = v` / `x = v` / "
+                "`a, b, c = indicator_func(...)`"
+            )
         if isinstance(node, ast.Attribute):
             continue
         if isinstance(node, ast.Name):
@@ -124,6 +201,11 @@ def _validate(tree: ast.Module) -> None:
             continue
         # BinOp/Compare/BoolOp 的 op 字段是 operator 子类 (ast.Add/Sub/...), 不是独立节点
         if isinstance(node, (ast.operator, ast.unaryop, ast.cmpop, ast.boolop)):
+            continue
+        # ast.Tuple 仅在 Assign.targets[0] (多元赋值 LHS) 放行; expr 位置 (RHS)
+        # 的 Tuple 节点会被 ast.walk 遇到, 这里跳过让它继续 —— _unparse_stmt
+        # 在 Render 阶段按 targets 是否是 Tuple 分别处理 (LHS 多元 / RHS 单值)
+        if isinstance(node, ast.Tuple):
             continue
         # 兜底: 未识别的 ast 节点 (IfExp / Subscript / Slice / Starred / Match* /
         # keyword / AugAssign 等) 一律拒绝, 避免 Python exec 静默执行它们
@@ -198,6 +280,9 @@ def make_python_runner(strategy_class, method_name: str = "compute_signal"):
         raise CompileError(f"DSL 语法错误: {e}") from e
     _validate(tree)
     namespace: dict = {}
+    # 注入指标函数 (DSL body 内可裸调 ema_channel_push 等, 不必 import)
+    for stmt in _INDICATOR_INJECT_PYTHON:
+        exec(stmt, namespace)
     # 用 exec 直接定义 _f 函数 (保留原 body 不经渲染, 避免漂移)
     exec("def _f(ctx):\n" + textwrap.indent(body, "    "), namespace)
     runner = namespace["_f"]
@@ -239,8 +324,16 @@ def _unparse_stmt(node) -> str:
         return "\n".join(lines)
     if isinstance(node, ast.Assign):
         if len(node.targets) != 1:
-            raise CompileError("DSL 不允许多元赋值")
-        return f"{_unparse_expr(node.targets[0])} = {_unparse_expr(node.value)}"
+            raise CompileError(
+                "DSL 多元赋值仅支持 `a, b, c = indicator_func(...)` 形式"
+            )
+        target = node.targets[0]
+        val = _unparse_expr(node.value)
+        if isinstance(target, ast.Tuple):
+            # a, b, c = func()  ->  a, b, c = func()
+            names = ", ".join(_unparse_expr(e) for e in target.elts)
+            return f"{names} = {val}"
+        return f"{_unparse_expr(target)} = {val}"
     if isinstance(node, ast.Return):
         return f"return {_unparse_expr(node.value)}"
     if isinstance(node, ast.Expr):
@@ -258,7 +351,7 @@ def _unparse_expr(node) -> str:
         # ctx.xxx -> ctx.xxx (numba 用 . 访问 jitclass)
         return f"{_unparse_expr(node.value)}.{node.attr}"
     if isinstance(node, ast.Call):
-        # 白名单 (min/max/abs) 已由 _validate 校验; 这里只负责文本生成
+        # 白名单 (min/max/abs + indicators.* 增量 API) 已由 _validate 校验
         if not (isinstance(node.func, ast.Name)
                 and node.func.id in _CALL_WHITELIST):
             raise CompileError(f"无法 unparse expr Call {ast.dump(node)}")
@@ -296,6 +389,10 @@ def _unparse_expr(node) -> str:
     if isinstance(node, ast.BoolOp):
         kw = " and " if isinstance(node.op, ast.And) else " or "
         return "(" + kw.join(_unparse_expr(v) for v in node.values) + ")"
+    if isinstance(node, ast.Tuple):
+        # Tuple 节点仅在 Assign LHS 出现 (DST 多元赋值 targets[0]); 这里
+        # 出现表示 RHS 是直接 Tuple 表达式 (DSL 不开放, _validate 应已拒)
+        raise CompileError(f"无法 unparse expr Tuple (DSL 仅在 LHS 多元赋值场景支持)")
     raise CompileError(f"无法 unparse expr {type(node).__name__}: {ast.dump(node)}")
 
 
@@ -390,7 +487,7 @@ def _c99_expr(node, ctx_map: dict) -> str:
     if isinstance(node, ast.Attribute):
         return _c99_attr(node, ctx_map)
     if isinstance(node, ast.Call):
-        # 白名单 (min/max/abs); _validate 已拒绝关键字参数
+        # 白名单 (min/max/abs + indicators.* 增量 API); _validate 已拒绝关键字参数
         if not (isinstance(node.func, ast.Name)
                 and node.func.id in _CALL_WHITELIST):
             raise CompileError(f"CUDA DSL 不支持调用 {type(node.func).__name__}")
@@ -402,7 +499,10 @@ def _c99_expr(node, ctx_map: dict) -> str:
             b = _c99_expr(node.args[1], ctx_map)
             op = "<" if node.func.id == "min" else ">"
             return f"(({a}) {op} ({b}) ? ({a}) : ({b}))"
-        raise CompileError(f"CUDA DSL 仅支持 min(a,b) / max(a,b) / abs(a)")
+        # 其余白名单 (indicators.*) 走普通 C 函数调用; __device__ 函数定义
+        # 由 render_cuda_device_function 注入到 strategy_check 函数前
+        args = ", ".join(_c99_expr(a, ctx_map) for a in node.args)
+        return f"{node.func.id}({args})"
     if isinstance(node, ast.BinOp):
         op = node.op
         op_map = {
@@ -462,6 +562,9 @@ def compile_all(strategy_class, method_name: str = "compute_signal") -> dict:
 _FRAMEWORK_CTX_FIELDS = (
     "cur_ts", "cur_open", "cur_high", "cur_low", "cur_close", "cur_volume",
     "up", "dw",
+    # EMA 通道 base state (kernel.step 桶切换时推入; 任何策略都自带, 不使用时静默忽略)
+    "up_sum", "up_count", "up_ema",
+    "dw_sum", "dw_count", "dw_ema",
 )
 
 # Python 原生类型 -> numba 类型名 / CUDA 类型声明
@@ -627,8 +730,37 @@ def _c99_stmt_state(node, declared: set, decl_kinds: dict, ctx_map: dict) -> str
         return "\n".join(lines)
     if isinstance(node, ast.Assign):
         if len(node.targets) != 1:
-            raise CompileError("CUDA DSL 不允许多元赋值")
+            raise CompileError(
+                "CUDA DSL 多元赋值仅支持 `a, b, c = indicator_func(...)` 形式"
+            )
         target = node.targets[0]
+        if isinstance(target, ast.Tuple):
+            # 多元赋值: a, b, c = ema_push(a, b, c, v, p)
+            # 展开: auto _t = ema_push(a, b, c, v, p);
+            #       a = _t.sum; b = _t.count; c = _t.ema;
+            if not (isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id in _CUDA_INDICATOR_FIELDS):
+                raise CompileError(
+                    "CUDA DSL 多元赋值仅支持白名单 indicator 函数 (struct return)"
+                )
+            fn = node.value.func.id
+            fields = _CUDA_INDICATOR_FIELDS[fn]
+            if len(target.elts) != len(fields):
+                raise CompileError(
+                    f"CUDA DSL 多元赋值: 函数 {fn} 返回 {len(fields)} 个字段, "
+                    f"但 LHS 有 {len(target.elts)} 个目标"
+                )
+            args_str = ", ".join(_c99_expr(a, ctx_map) for a in node.value.args)
+            lines = [f"auto _t = {fn}({args_str});"]
+            for tgt, field in zip(target.elts, fields):
+                if isinstance(tgt, ast.Name):
+                    lines.append(f"{tgt.id} = _t.{field};")
+                elif isinstance(tgt, ast.Attribute):
+                    lines.append(f"{_c99_attr(tgt, ctx_map)} = _t.{field};")
+                else:
+                    raise CompileError("CUDA DSL 多元赋值 LHS 必须是 Name 或 ctx.x")
+            return "\n".join(lines)
         val = _c99_expr(node.value, ctx_map)
         if isinstance(target, ast.Attribute):
             field = _c99_attr(target, ctx_map)
@@ -693,7 +825,10 @@ def render_cuda_device_function(strategy_class, method_name: str = "compute_sign
             f"{', '.join(sig_list)})")
 
     header = build_cuda_device_header(strategy_class)
-    return header + "\n" + _render_cuda_state_body(tree, strategy_class) + "\n}"
+    # 注入白名单 indicator 的 __device__ 函数定义 (位于 strategy_check 函数前);
+    # 这些函数在 evtrade.indicators.* 的 CUDA_DEVICE_* 常量里, 与 Python @njit 版逐位一致。
+    indicator_defs = _indicator_cuda_defs()
+    return indicator_defs + "\n" + header + "\n" + _render_cuda_state_body(tree, strategy_class) + "\n}"
 
 
 # ====================================================================
@@ -729,9 +864,22 @@ def make_dsl_ctx(strategy_class) -> DSLCtx:
 
     状态字段按 strategy.state_spec 投影 (空 dict 也合法 = 无持久状态)。
     DSL 策略必须声明 state_spec, 缺则编译期抛 CompileError。
+
+    框架提供的 EMA 通道 base state (up_sum/up_count/up_ema + dw_sum/dw_count/dw_ema)
+    始终初始化; 与 numba jitclass KernelState 的对应字段对齐 (kernel step 桶切换
+    时推入, 策略不需要时静默忽略)。策略也可以选择"不使用" — Python 端 runner
+    跳过该字段访问即可。
     """
     spec = _require_state_spec(strategy_class)
     ctx = DSLCtx()
+    # 框架 EMA base state (任何策略都自带, 不使用时静默忽略)
+    ctx.up_sum = 0.0
+    ctx.up_count = 0
+    ctx.up_ema = 0.0
+    ctx.dw_sum = 0.0
+    ctx.dw_count = 0
+    ctx.dw_ema = 0.0
+    # 策略 state_spec 字段
     for name, schema in spec.items():
         setattr(ctx, name, schema["default"])
     return ctx

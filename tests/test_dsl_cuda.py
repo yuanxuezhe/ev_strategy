@@ -260,11 +260,19 @@ def test_cuda_state_body_maps_kernel_names():
 
 
 def test_cuda_device_function_declares_locals():
-    """device 函数: 局部变量首赋值处声明 (int signal / double low_dev)"""
+    """device 函数: 局部变量首赋值处声明 (int signal / double low_dev)
+
+    2026-09 解耦后, CUDA 设备函数签名由 render_cuda_device_function 拼接,
+    包含 EMA device 函数 + strategy_check device 函数 (前段以 indicator 函数
+    为主 + state updaters, 末段以 DSL body 编译产物为主)。
+    """
     from evtrade.strategies import get_strategy
     from evtrade.strategies.dsl import render_cuda_device_function
     func = render_cuda_device_function(get_strategy("channel_deviation"))
-    assert func.startswith("__device__")
+    # 函数以 __device__ ... { ... } 块拼接; 不再严格要求以 __device__ 起头 (有
+    # indicator device 函数前置块)。改为断言 EMA device 函数 + strategy_check
+    # 收尾 return signal 都齐。
+    assert "__device__" in func               # indicator device 函数前缀
     assert "int signal = 0;" in func          # 纯整数字面量 -> int
     assert "double low_dev =" in func         # 浮点表达式 -> double
     assert "return signal;" in func           # DSL 收尾 return signal

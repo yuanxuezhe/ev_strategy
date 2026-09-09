@@ -24,9 +24,9 @@ def _bars():
 
 
 def _base_kwargs():
-    """构造状态用的通用 kwargs (按参数声明顺序 p0..p3 填策略参数)"""
+    """构造状态用的通用 kwargs (按参数声明顺序 p0..p4 填策略参数; p4=tf1=21)"""
     return dict(period="5m", warmup_until=int("20241120") * 1_000_000,
-                tf1=21, p0=1.5, p1=1.0, p2=1.5, p3=0.5,
+                tf1=21, p0=1.5, p1=1.0, p2=1.5, p3=0.5, p4=21,
                 init_cash=200000.0, init_position=200000.0, trade_qty=10000.0)
 
 

@@ -1,7 +1,13 @@
-# 14 · 策略 DSL 与三端转译 (2026-09-06; 2026-09-08 同步 state_spec 声明化)
+# 14 · 策略 DSL 与三端转译 (2026-09-06; 2026-09-08 同步 state_spec 声明化; 2026-09-09 同步指标 DSL 化)
 
 > 一份策略主逻辑 (DSL), 三端自动可用: **Python 参考引擎 / numba 流式内核 / CUDA GPU 内核**。
 > 本文说明 DSL 写法、字段契约、三端转译机制与测试锁定。写新策略前必读 11 号文档第 3 节。
+>
+> **2026-09-09 同步 (change `2026-09-09-decouple-indicators-from-framework`)**:
+> 框架层 ctx **不暴露** `up`/`dw` 等指标字段; DSL body 通过白名单内的 `evtrade/indicators/`
+> 增量 API (`ema_push` / `ema_current` / `ema_channel_push` / `ema_channel_current` 等)
+> 自维护指标状态, 三端 (Python exec / numba @njit / CUDA __device__) 渲染路径同时扩展。
+> 详见 §2 白名单扩展 + §3 字段契约修订。
 
 ## 1. 为什么做这件事
 
@@ -29,12 +35,37 @@
 - ✅ 常量: 数字 / `True` / `False`; 整数字面量在三端都按 float 语义参与算术
 - ✅ 标量赋值: `ctx.x = v` 与裸名 `x = v` (局部变量, 首赋值前不可读)
 - ✅ `return <int>`: `1` = BUY, `-1` = SELL, `0` = 无信号; **允许提前 return**
-- ❌ 字符串 / 列表 / 字典 / 元组 / 调用 (连 `min/max/abs` 也只在 Python 端可用,
-  numba/CUDA 端不支持 → 不要用) / 循环 / 异常 / lambda / f-string
+- ✅ **2026-09-09 扩展** 标量函数调用 (DSL 白名单, 三端统一可用):
+  - 基础: `min(a, b)` / `max(a, b)` / `abs(x)`
+  - 指标增量 API (`evtrade/indicators/` 下, @njit 实现, 三端 stub 注入):
+    `ema_push` / `ema_current` / `ema_channel_push` / `ema_channel_current` /
+    `atr_push` / `atr_current` / `rsi_push` / `rsi_current` /
+    `boll_push` / `boll_current` / `sma_push` / `sma_current`
+  - 调用形态: `<fn>(<args>)` 返回值用赋值 `a, b = ema_channel_push(...)`
+    (多返回值仅限指标函数) 或 `v = ema_current(...)`。
+- ❌ 字符串 / 列表 / 字典 / 元组 / 一般函数调用 (除白名单外) / 循环 / 异常 / lambda / f-string
 
 注意: 提前 `return` 在三端语义一致 (CUDA 端靠 `__device__` 函数的函数返回实现),
 但 channel_deviation 保持 **signal 变量形式** (不提前 return), 让本桶的锁存段
 在信号赋值后仍生效 —— 公式与历史实现逐位一致 (test_differential 72 项 bitwise)。
+
+### 2.1 指标函数的三端 stub (2026-09-09)
+
+DSL body 调 `ema_channel_push(...)` 时, 三端渲染器各注入对应实现:
+
+- **Python 端** (`make_python_runner`): 在 `exec` namespace 注入
+  `from evtrade.indicators.ema import ema_channel_push, ema_channel_current`
+- **numba 端** (`render_numba_state_body`): 在函数体顶部插入
+  `from evtrade.indicators.ema import ema_channel_push, ema_channel_current`
+  (`@njit(cache=True)` 已装饰, 第一次调用触发编译; 之后走缓存)
+- **CUDA 端** (`render_cuda_device_function`): 改写为内联 `__device__` 函数
+  (`indicators/ema.py` 内每个 push/current 都有同形 `__device__` 副本, 由
+  `dsl._DSL_CUDA_INDICATOR_FUNCS` 字典映射)
+
+三端实现必须**逐位一致** (同浮点表达式 + 同一初值 seed 公式); 差分测试
+`tests/test_dsl_cuda.py::test_generic_cuda_matches_cpu_channel_deviation` 锁定。
+新增指标需在 `indicators/<name>.py` 同时提供 Python @njit 版 + CUDA `__device__` 版
++ 写进 `dsl._DSL_NUMBA_RENDERERS` / `dsl._DSL_CUDA_RENDERERS` (两步加, 详见 11 号文档第 5 节)。
 
 ## 3. ctx 字段契约 (`dsl.build_ctx_to_kernel_map`, 动态构建)
 
@@ -44,21 +75,29 @@
 > **单名空间 identity 映射**: `ctx.<name>` = 内核侧 `<name>` = `state_spec[<name>]`,
 > 旧的 `_bucket_ts → lock_ts` 等改名随 channel_deviation 迁移一并取消 (dsl.py:448-460)。
 > 状态字段来源是策略类 `state_spec`, **框架层无任何 baked-in 字段名**。
+>
+> **2026-09-09 修订**: 框架字段仅保留行情 (`cur_*`); **不再暴露** `up` / `dw` 等
+> 任何指标字段。指标值由 DSL body 在策略段首部调 `evtrade/indicators/` 增量 API 算得,
+> 通过裸名局部变量 (如 `up`, `dw`) 持有; 跨桶持久化时由策略 `state_spec` 声明
+> 增量状态字段 (如 `up_st` / `dw_st`), DSL body 内调 push 维护。
 
 | DSL 写法 | numba 内核 | CUDA device 函数 | 含义 |
 |---|---|---|---|
 | `ctx.p0` .. `ctx.p15` | `st.p0`..`st.p15` | `p0`..`p7` (寄存器) | 策略参数, **按 params_spec 声明顺序** |
 | `ctx.cur_ts` | `st.cur_ts` | `cur_ts` | 当前桶时间戳 (框架字段, 非 state_spec) |
 | `ctx.cur_open/high/low/close/volume` | `st.cur_*` | 同名 | 当前桶运行中 OHLCV (框架字段) |
-| `ctx.up` / `ctx.dw` | 裸名 `up` / `dw` (函数参数) | 同名 | 通道上/下轨 (NaN=未就绪; 框架字段) |
 | `ctx.low_hit` / `ctx.high_hit` | `st.low_hit` / `st.high_hit` | 同名 | 极端偏离锁存 (**state_spec 声明**) |
 | `ctx.low_acted` / `ctx.high_acted` | `st.low_acted` / `st.high_acted` | 同名 | 本桶已操作锁 (**state_spec 声明**) |
 | `ctx.lock_ts` | `st.lock_ts` | `lock_ts` | 桶切换检测 (≠cur_ts 时重置 *_acted; **state_spec 声明**) |
+| `ctx.up_st` / `ctx.dw_st` | `st.up_st` / `st.dw_st` | 同名 | EMA 通道增量状态 (state_spec 声明; **指标私有**) |
+| `ctx.prev_ts` | `st.prev_ts` | `prev_ts` | 桶切换跟踪 (state_spec 声明; channel_deviation 用) |
+| 裸名 `up` / `dw` 等 | 函数内局部变量 | 函数内局部变量 | **指标当前值**, 由 DSL body 调 `ema_channel_current(...)` 算得 |
 | 其余 `ctx.x` / 裸名 `x` | 局部变量 | 局部变量 (自动声明) | 桶内临时值, 跨桶不保留 |
 
-> 上表中 `low_hit/high_hit/low_acted/high_acted/lock_ts` 是 channel_deviation 的
+> 上表中 `low_hit/high_hit/low_acted/high_acted/lock_ts/up_st/dw_st/prev_ts` 是 channel_deviation 的
 > `state_spec` 字段 (channel_deviation.py:77-83), 非框架内置; 换策略后这些字段随之改变。
-> 框架字段 (`cur_*/up/dw`) 由 dsl_check / kernel step 每根 bar 注入, 不在 state_spec。
+> 框架字段 (`cur_*`) 由 dsl_check / kernel step 每根 bar 注入, 不在 state_spec。
+> 框架**不暴露**任何指标字段 (历史曾暴露 `up`/`dw`, 已于 2026-09-09 删除)。
 
 CUDA 端参数上限 8 个 (`p0..p7`), numba 端 16 个 (`p0..p15`); 超限在编译/调用期报错。
 **非法引用** (如 CUDA 端用 `ctx.p8`) 在渲染期即被拒绝。
@@ -77,25 +116,34 @@ CUDA 端参数上限 8 个 (`p0..p7`), numba 端 16 个 (`p0..p15`); 超限在�
 
 上层 API:
 
-- `make_state_general(name, period, warmup_until, tf1, ..., strategy_params)`:
-  按 params_spec 顺序把参数填进 `p0..pN` 构造状态;
+- `make_state_general(name, period, warmup_until, ..., strategy_params)`:
+  按 params_spec 顺序把参数填进 `p0..pN` 构造状态; **无 framework 端 tf1 形参**——
+  `tf1` 等指标周期是策略私有, 由 `strategy_params` 透传 (走 params_spec 声明顺序)。
 - `run_one_dsl(bars, ..., strategy_name, strategy_params)`: 单窗回测,
   指标口径 = `kernel.summarize`;
 - `strategy_has_dsl(name)`: 是否有可渲染的 DSL (决定 sweep 走哪条路)。
 
 ## 5. CUDA 端: 通用 kernel + device 函数
 
-`core/gpu.py::_CUDA_SOURCE_GENERIC_TEMPLATE` = 与旧 `sweep_kernel` 逐行等价的
-桶合并/EMA/成交/绩效段 + 三个编译期占位符 (gpu.py:320-323 替换):
+`core/gpu.py::_CUDA_SOURCE_GENERIC_TEMPLATE` = **只含**桶合并/成交/绩效段
+(行情 + 信号 + 账户) + 三个编译期占位符 (gpu.py:320-323 替换);
+**不内嵌**任何指标公式 (旧版曾内嵌 EMA 推入/读出, 2026-09-09 已删除):
 
-- `{STRATEGY_BODY}` — 注入 `render_cuda_device_function` 生成的 `__device__ __forceinline__ int strategy_check(...)`;
-- `{STATE_DECLS}` — 按 `state_spec` 注入的状态字段寄存器声明 (dsl.py:542-568 `build_cuda_state_decls`);
-- `{STRATEGY_STATE_ARGS}` — `strategy_check(...)` 调用处的 state arg 列表 (dsl.py:571-581 `build_cuda_strategy_check_call`)。
+- `{STRATEGY_BODY}` — 注入 `render_cuda_device_function` 生成的 `__device__ __forceinline__ int strategy_check(...)`
+  (函数体已包含指标自维护 + 信号判定 + 锁存段; 详见 §2.1 指标函数的三端 stub);
+- `{STATE_DECLS}` — 按 `state_spec` 注入的状态字段寄存器声明 (dsl.py `build_cuda_state_decls`);
+  **框架不预设** `up_st` / `dw_st` 等任何指标字段, 一切来自策略 `state_spec`。
+- `{STRATEGY_STATE_ARGS}` — `strategy_check(...)` 调用处的 state arg 列表 (dsl.py `build_cuda_strategy_check_call`),
+  与 `state_spec` 一一对应。
 
 > **2026-09-08 迁移** (commit `dfd4785`): 上述三个投影函数 (`render_cuda_device_function` /
 > `build_cuda_state_decls` / `build_cuda_strategy_check_call` / `build_cuda_device_header`)
 > 已从 `core/gpu.py` 迁至 **`strategies/dsl.py`**; `gpu.py` 只保留 kernel 源码模板 + 编译 + 调度。
 > 状态字段来源是策略 `state_spec`, 框架无硬编码状态字段 (见第 3 节)。
+>
+> **2026-09-09 迁移**: CUDA 模板内的 EMA 推入/读出段已删除; kernel step 与 CUDA
+> `strategy_check` 不再内嵌任何指标公式; 指标状态完全由策略 `state_spec` 声明
+> + DSL body 调 `__device__` 增量 API 维护 (见 §2.1)。
 
 device 函数形态的关键: 状态字段 (low_hit/lock_ts/...) 按**引用**传入可写,
 行情/参数为 const 引用; DSL 的 `return X` 直接成为函数返回 ——
