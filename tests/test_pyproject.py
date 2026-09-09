@@ -5,7 +5,7 @@
   - entry point evtrade -> evtrade.cli:main 已注册
   - dev-dependencies 走 [dependency-groups] dev (PEP 735, 替代已废弃的
     tool.uv.dev-dependencies)
-  - 核心依赖: numpy/numba/pandas/sqlalchemy/pymysql
+  - 核心依赖: numpy/pandas/sqlalchemy/pymysql (2026-09-09 已删 numba)
   - GPU extra: cupy (Linux/Windows 区分)
   - 排除目录 (tests/docs/...) 不被打包
   - 若环境有 uv: uv lock --check 通过
@@ -56,8 +56,15 @@ def test_entry_point_evtrade_registered():
 
 def test_core_dependencies_listed():
     text = _read_pyproject()
-    for pkg in ("numpy", "numba", "pandas", "sqlalchemy", "pymysql"):
+    for pkg in ("numpy", "pandas", "sqlalchemy", "pymysql"):
         assert f'"{pkg}>=' in text, f"缺少核心依赖: {pkg}"
+
+
+def test_numba_dependency_removed():
+    """2026-09-09 统一 CPU/GPU 重构后, numba 依赖已下线 (DSL/numba 内核已删)"""
+    text = _read_pyproject()
+    # 不再要求 numba (CPU/GPU 走 numpy/cupy 算子)
+    assert '"numba>=' not in text, "numba 已下线, 不应再列为核心依赖"
 
 
 def test_gpu_extra_listed():

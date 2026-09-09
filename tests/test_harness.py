@@ -42,13 +42,13 @@ def test_list_bar_feed_passthrough():
 
 
 def test_sweep_module_imports_NumpyDictFeed():
-    """sweep.py 在 run_one_general 中已 import 并使用 NumpyDictFeed"""
+    """_harness.NumpyDictFeed 作为公共 fixture 存在; sweep 已改为直接吃 numpy dict"""
     import evtrade.core.sweep as sweep_mod
     from evtrade.core._harness import NumpyDictFeed
-    # NumpyDictFeed 必须存在于 _harness 且可被 sweep 引用
+    # NumpyDictFeed 必须存在于 _harness 且可被 sweep 引用 (历史 sweep 入口)
     assert callable(NumpyDictFeed)
-    # sweep 模块本身必须可 import (没语法错)
-    assert hasattr(sweep_mod, "run_one_general")
+    # sweep 模块本身必须可 import (没语法错); DSL 删除后只剩 run_one_vectorized
+    assert hasattr(sweep_mod, "run_one_vectorized")
 
 
 def test_replay_module_imports_ListBarFeed():

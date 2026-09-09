@@ -1,9 +1,6 @@
 from __future__ import annotations
 """array 后端选择器 (CuPy 统一 CPU/GPU 路径)
 
-================================================================
-✅  可改层 (基础设施)  ✅
-================================================================
 vectorized 引擎通过 `get_xp(device)` 拿到 array 后端:
   - device="cpu"  -> numpy (np)
   - device="gpu"  -> cupy  (cp)
@@ -12,7 +9,8 @@ vectorized 引擎通过 `get_xp(device)` 拿到 array 后端:
 cp.where 等调用映射到预编译的 CUDA kernel, 无需手写 C++ / DSL 渲染。
 
 适用: 可向量化的策略 (MA 交叉 / 突破 / 协方差等标准数组运算)。
-不适用: 逐 bar 状态机 (channel_deviation 的 if/elif 锁存) —— 走 DSL/numba 路径。
+不适用: 逐 bar 状态机 (channel_deviation 的 if/elif 锁存) —— 策略在
+compute_signals 内通过 .get() 拉回 host 维护 Python FSM, 见 channel_deviation.py。
 """
 
 

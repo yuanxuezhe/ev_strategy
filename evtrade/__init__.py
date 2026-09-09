@@ -1,167 +1,116 @@
 from __future__ import annotations
-"""evtrade — minute_bars 周期合并 + 通道偏离策略 (回测/实盘统一架构)
+"""evtrade — 策略回测 / 参数扫描 / 行情回放 (CPU+GPU 统一向量化路径)
 
-================================================================
-📦 包结构 (2026-09-06 子包化, 顶层仅 2 个文件)
-================================================================
+包结构 (2026-09 DSL 统一后):
+  顶层   __init__.py / __main__.py / cli.py / backends.py
+  core/      aggregator / timeutils / engine / gpu / sweep / replay
+             / permutation / vectorized_engine / metrics / data / config / capability
+  execution/ account / base (Executor / SimulatedExecutor / BrokerExecutor)
+  feeds/     base / mysql_history / chained / _registry
+  strategies/ vectorized_base + 已注册策略 (channel_deviation / ma_crossover)
+  indicators/ ema / atr / rsi / boll (xp 算子 + 纯 Python 增量版)
 
-顶层只放:
-  __init__.py   本文件: 顶层 API 统一导出 (向后兼容)
-  __main__.py   python -m evtrade 入口
-  cli.py        CLI 入口 (回测 / 扫描 / 回放 三个子命令)
-
-子包:
-  core/         ✅ 主调度层
-                - kernel.py       numba 流式决策内核 (DSL splice 模板 + 数据流)
-                - kernel_dsl.py   按策略特化的内核渲染 (build_dsl_kernel)
-                - aggregator.py   BarAggregator 增量桶合并 (差分锁定参考实现)
-                - timeutils.py    compute_bucket_general (任意周期, 差分锁定)
-                - engine.py       参考引擎 (供 replay 对账)
-                - gpu.py          CUDA 内核 (DSL 渲染产物注入)
-                - sweep.py        并发参数扫描 + 鲁棒评分
-                - replay.py       录制回放对账
-                - permutation.py  MC 置换检验
-                - config.py       全局常量
-                - data.py         MySQL 拉数 + npz 缓存 + 合成数据
-
-  execution/    ✅ 下单撮合
-                - base.py         Executor / SimulatedExecutor / BrokerExecutor
-
-  feeds/        ✅ 行情入口
-                - base.py         Feed 基类
-                - mysql_history.py   MySQLBacktestFeed
-                - chained.py      ChainedFeed
-                - _registry.py    get_feed / register_feed
-
-  strategies/   ✅ 策略目录
-                - base.py         StrategyBase + register_strategy
-                - channel_deviation.py  DSL 版
-                - example_breakout.py   示例
-                - example_dev_trigger.py   示例 (DSL)
-
-  indicators/   ✅ 指标目录 (纯函数库, jupyter 友好)
-                - ema / atr / rsi / boll
-
-================================================================
-🟢🟡🔴 修改频次分类 (每个文件 docstring 顶部也标了)
-================================================================
-🟢 冻结 (kernel 锁定, 改了触发全红):
-    core/aggregator / timeutils / kernel / engine / gpu / replay
-
-🟡 可改 (用户面 / 参数面):
-    cli.py  core/config / data / sweep  execution/base
-    feeds/*  strategies/*  indicators/*
-
-🟠 慎改 (公式锁定, kbs/13 文档约束):
-    core/sweep (score 公式)  core/permutation (日块置换)
-
-================================================================
-📜 用法
-================================================================
-  python -m evtrade backtest --engine kernel --period 5m ...
-  python -m evtrade sweep --grid key1=v1,v2,v3 --grid key2=v4,v5 ...
+用法:
+  python -m evtrade backtest --device auto --strategy channel_deviation ...
+  python -m evtrade sweep --grid low1=1.0,1.5 --strategy channel_deviation ...
   python -m evtrade replay --log live_demo.log --against-ref
   python -m pytest tests -q
 
 切换实盘/回测: 换 Feed + 换 Executor, 其余不变。
-依赖: pip install pymysql sqlalchemy numpy numba
+依赖: pip install pymysql sqlalchemy numpy (cupy 可选 GPU)
 """
 
 # ============================================================
-# 顶层 API 统一导出 (向后兼容, 用户代码不变)
+# 顶层 API 统一导出 + 向后兼容 shim
 # ============================================================
 import sys as _sys
 
-# ---- frozen 冻结层 ----
+# ---- 核心数据模型 / 时间桶 / 桶合并 / 记账 ----
 from .primitives import Bar, fmt
-from .core.timeutils import compute_bucket, compute_bucket_general, daterange, resolve_period_seconds
+from .core.timeutils import (
+    compute_bucket, compute_bucket_general, daterange,
+    resolve_period_seconds, encoded_to_epoch, epoch_to_encoded,
+    bucket_ts_encoded, _days_from_civil,
+)
 from .core.aggregator import BarAggregator
 from .execution.account import Account
-from .strategies.channel_deviation import ChannelDeviationStrategy
-# 注意: 旧的 `from evtrade import EMAChannel / IncrementalEMA / ema / ema_channel`
-# 已下线 (framework 不再持有指标, 详见 change 2026-09-09-decouple-indicators-from-framework);
-# 若需纯函数版 EMA, 请 `from evtrade.indicators import ema, ema_channel`
 
-# ---- 向后兼容 shim: 让 `from evtrade.data import ...` / `from evtrade.config import ...` 继续可用 ----
-# 测试文件 (tests/test_*.py) 用顶层路径, 顶层 `__init__.py` 把它们映射到真实位置
-from .core import data as _data_mod
-from .core import config as _config_mod
-from .core import kernel as _kernel_mod
-from .core import engine as _engine_mod
-from .core import sweep as _sweep_mod
-from .core import replay as _replay_mod
-from .core import permutation as _permutation_mod
-from .core import gpu as _gpu_mod
+# ---- 向后兼容 shim: 让 `from evtrade.X import ...` 继续可用 ----
+# 历史 import 路径 (KB 12 + 旧脚本) 仍指向 core.* 子模块, 这里一次性挂上别名。
+from .core import (
+    data as _data_mod, config as _config_mod, timeutils as _timeutils_mod,
+    aggregator as _aggregator_mod, engine as _engine_mod, sweep as _sweep_mod,
+    replay as _replay_mod, permutation as _permutation_mod, gpu as _gpu_mod,
+    vectorized_engine as _vec_mod, metrics as _metrics_mod,
+)
 from . import primitives as _primitives_mod
-from .core import (timeutils as _timeutils_mod, aggregator as _aggregator_mod)
 from .execution import account as _account_mod, base as _execution_mod
-from .strategies import channel_deviation as _strategy_mod  # 旧 evtrade.strategy shim (向后兼容)
-_sys.modules.setdefault("evtrade.data", _data_mod)
-_sys.modules.setdefault("evtrade.config", _config_mod)
-_sys.modules.setdefault("evtrade.kernel", _kernel_mod)
-_sys.modules.setdefault("evtrade.engine", _engine_mod)
-_sys.modules.setdefault("evtrade.sweep", _sweep_mod)
-_sys.modules.setdefault("evtrade.replay", _replay_mod)
-_sys.modules.setdefault("evtrade.permutation", _permutation_mod)
-_sys.modules.setdefault("evtrade.gpu", _gpu_mod)
-_sys.modules.setdefault("evtrade.aggregator", _aggregator_mod)
-_sys.modules.setdefault("evtrade.timeutils", _timeutils_mod)
-_sys.modules.setdefault("evtrade.primitives", _primitives_mod)
-_sys.modules.setdefault("evtrade.models", _primitives_mod)  # 向后兼容旧路径
-_sys.modules.setdefault("evtrade.account", _account_mod)
-_sys.modules.setdefault("evtrade.strategy", _strategy_mod)
-_sys.modules.setdefault("evtrade.execution", _execution_mod)
-# incremental_indicators 模块已下线 (framework 解耦, EMA 改放 evtrade.indicators/ema.py);
-# 留一行 stub 兜底旧 import, 提示迁移路径 (任何调用都会立刻报错, 不 silent 失败)。
-import types as _types
-def _missing_incremental_indicators(*a, **kw):
-    raise ImportError(
-        "evtrade.incremental_indicators 已下线 (2026-09 framework 解耦); "
-        "EMA 增量 API 见 evtrade.indicators.ema (ema_push / ema_current / "
-        "ema_channel_push / ema_channel_current)。"
-    )
-_stub_mod = _types.ModuleType("evtrade.incremental_indicators")
-_stub_mod.IncrementalEMA = _missing_incremental_indicators
-_stub_mod.EMAChannel = _missing_incremental_indicators
-_sys.modules.setdefault("evtrade.incremental_indicators", _stub_mod)
-_sys.modules.setdefault("evtrade._incremental_indicators", _stub_mod)
 
-# ---- core 主调度 ----
-from .core.kernel import (
-    KernelState, run_backtest, run_backtest_trace, step,
-    bucket_table, summarize, trades_to_list, bars_to_arrays,
-    bucket_ts_encoded, encoded_to_epoch, epoch_to_encoded, _days_from_civil,
+for _name, _mod in [
+    ("evtrade.data", _data_mod), ("evtrade.config", _config_mod),
+    ("evtrade.engine", _engine_mod), ("evtrade.sweep", _sweep_mod),
+    ("evtrade.replay", _replay_mod), ("evtrade.permutation", _permutation_mod),
+    ("evtrade.gpu", _gpu_mod), ("evtrade.aggregator", _aggregator_mod),
+    ("evtrade.timeutils", _timeutils_mod),
+    ("evtrade.primitives", _primitives_mod),
+    ("evtrade.account", _account_mod), ("evtrade.execution", _execution_mod),
+    ("evtrade.vectorized_engine", _vec_mod), ("evtrade.metrics", _metrics_mod),
+]:
+    _sys.modules.setdefault(_name, _mod)
+
+# ---- 兼容旧 evtrade.kernel (kernel.py 已下线, 转发到 core.timeutils / core.metrics) ----
+import types as _types
+_kernel_stub = _types.ModuleType("evtrade.kernel")
+_kernel_stub.bucket_ts_encoded = _timeutils_mod.bucket_ts_encoded
+_kernel_stub.encoded_to_epoch = _timeutils_mod.encoded_to_epoch
+_kernel_stub.epoch_to_encoded = _timeutils_mod.epoch_to_encoded
+_kernel_stub._days_from_civil = _timeutils_mod._days_from_civil
+_kernel_stub.resolve_period_seconds = _timeutils_mod.resolve_period_seconds
+_kernel_stub.summarize = _metrics_mod.summarize
+_kernel_stub.trades_to_list = _metrics_mod.trades_to_list
+_kernel_stub.bars_to_arrays = _metrics_mod.bars_to_arrays
+_sys.modules["evtrade.kernel"] = _kernel_stub
+
+# ---- 引擎 / 调度 ----
+from .core.engine import Engine, build_engine
+from .core.gpu import gpu_info
+from .core.sweep import sweep, parse_grid, GRID_KEYS, run_one_vectorized
+from .core.replay import (
+    replay_vectorized, replay_engine, reconcile,
+    append_bar, read_bars_log, write_bars_log,
 )
-from .core.kernel_dsl import (
-    build_dsl_kernel, dsl_kernel, make_state_general, run_one_dsl,
-    strategy_has_dsl,
-)
-from .core.engine import Engine
-from .core.gpu import gpu_info, cuda_sweep_window_generic
-from .core.sweep import sweep, parse_grid, GRID_KEYS
-from .core.replay import replay_kernel, replay_engine, reconcile, append_bar, read_bars_log, write_bars_log
 from .core.permutation import permutation_test
-from .core.config import DB_URL, TABLE, INTERVAL, TF1, INIT_CASH, INIT_POSITION, TRADE_QTY
+from .core.metrics import (
+    bars_to_arrays, summarize, trades_to_list,
+)
+from .core.config import DB_URL, TABLE, TF1, INIT_CASH, INIT_POSITION, TRADE_QTY
 
 # ---- execution ----
-from .execution.base import BrokerExecutor, Executor, SimulatedExecutor
+from .execution.base import Executor, SimulatedExecutor
 
-# ---- feeds / strategies / indicators 子包 ----
+# ---- feeds ----
 from .feeds import (
     ChainedFeed, Feed, MySQLBacktestFeed,
     get_feed, available_feeds, register_feed,
 )
+
+# ---- strategies (统一 VectorizedStrategy 契约) ----
 from .strategies import (
-    StrategyBase,
+    VectorizedStrategy,
     get_strategy, available_strategies, register_strategy,
-    render_numba_state_body, render_cuda_device_function, DSLCtx, dsl_check,
+    get_strategy_class, get_strategy_param_spec,
 )
-from .strategies.vectorized_base import VectorizedStrategy, get_vectorized_strategy
+from .strategies.channel_deviation import ChannelDeviationStrategy
 from .strategies.ma_crossover import MACrossoverStrategy
+
+# ---- backends / vectorized ----
 from .backends import get_xp, gpu_available
 from .core.vectorized_engine import run_vectorized
+
+# ---- indicators ----
 from .indicators import (
-    ema as ema_fn, atr, rsi, bollinger, sma, true_range,
+    ema, ema_channel, atr, rsi, bollinger, sma, true_range,
+    xp_ema, xp_ema_channel,
     ema_push, ema_current, ema_channel_push, ema_channel_current,
     atr_push, atr_current, rsi_push, rsi_current,
     sma_push, sma_current, boll_push, boll_current,
@@ -172,40 +121,41 @@ __all__ = [
     # 数据模型
     "Bar", "fmt",
     # 时间桶
-    "compute_bucket", "compute_bucket_general", "daterange", "resolve_period_seconds",
+    "compute_bucket", "compute_bucket_general", "daterange",
+    "resolve_period_seconds", "encoded_to_epoch", "epoch_to_encoded",
+    "bucket_ts_encoded", "_days_from_civil",
     # 桶合并 + 记账
     "BarAggregator", "Account",
-    # 策略
-    "ChannelDeviationStrategy",
-    # 指标 (纯函数 / 子包) —— framework 不再持有增量版 (详见 change 2026-09-09)
-    "ema_fn", "atr", "rsi", "bollinger", "sma", "true_range",
+    # 策略 (统一基类 + 已注册)
+    "VectorizedStrategy",
+    "ChannelDeviationStrategy", "MACrossoverStrategy",
+    "get_strategy", "available_strategies", "register_strategy",
+    "get_strategy_class", "get_strategy_param_spec",
+    # 指标 (纯函数 + 增量版)
+    "ema", "ema_channel", "atr", "rsi", "bollinger", "sma", "true_range",
+    "xp_ema", "xp_ema_channel",
     "ema_push", "ema_current", "ema_channel_push", "ema_channel_current",
     "atr_push", "atr_current", "rsi_push", "rsi_current",
     "sma_push", "sma_current", "boll_push", "boll_current",
     # 执行器
-    "Executor", "SimulatedExecutor", "BrokerExecutor",
+    "Executor", "SimulatedExecutor",
     # 行情
     "Feed", "MySQLBacktestFeed", "ChainedFeed",
     "get_feed", "available_feeds", "register_feed",
-    # 策略目录
-    "StrategyBase", "get_strategy", "available_strategies", "register_strategy",
-    "render_numba_state_body", "render_cuda_device_function", "DSLCtx", "dsl_check",
-    # 引擎 / 内核
-    "Engine",
-    "KernelState", "run_backtest", "run_backtest_trace", "step",
-    "bucket_table", "summarize", "trades_to_list", "bars_to_arrays",
-    "bucket_ts_encoded", "encoded_to_epoch", "epoch_to_encoded", "_days_from_civil",
-    # DSL 特化内核 (任意 DSL 策略的 numba/CUDA 路径)
-    "build_dsl_kernel", "dsl_kernel", "make_state_general", "run_one_dsl",
-    "strategy_has_dsl",
+    # 引擎 / 引擎工厂
+    "Engine", "build_engine",
+    # 向量化引擎
+    "run_vectorized", "run_one_vectorized", "get_xp", "gpu_available",
+    # 度量
+    "bars_to_arrays", "summarize", "trades_to_list",
     # GPU
-    "gpu_info", "cuda_sweep_window_generic",
+    "gpu_info",
     # 扫描 / 评分
     "sweep", "parse_grid", "GRID_KEYS",
     # 回放 / 置换
-    "replay_kernel", "replay_engine", "reconcile",
+    "replay_vectorized", "replay_engine", "reconcile",
     "append_bar", "read_bars_log", "write_bars_log",
     "permutation_test",
     # 配置
-    "DB_URL", "TABLE", "INTERVAL", "TF1", "INIT_CASH", "INIT_POSITION", "TRADE_QTY",
+    "DB_URL", "TABLE", "TF1", "INIT_CASH", "INIT_POSITION", "TRADE_QTY",
 ]
