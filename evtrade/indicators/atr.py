@@ -1,19 +1,31 @@
 from __future__ import annotations
-"""ATR (Average True Range) 指标 (纯 xp / ndarray 版 + 纯 Python 增量版)
+"""ATR (Average True Range) 指标
 
 ================================================================
 ✅  可改层 (indicators 子包)  ✅
 ================================================================
 True Range = max(H-L, |H-prev_close|, |L-prev_close|)
-ATR(p) = TR 的 p 期 SMA (简单平均) 或 EMA (指数平均)。
+ATR(p) = TR 的 p 期 SMA (默认) 或 EMA。
 本实现默认 SMA (与 MetaTrader/TradingView 一致)。
 
-@Python 增量版 (Engine 路径调用):
-  - atr_push(state, h, l, c, p) -> state  (Wilder 平滑: k=1/p)
-  - atr_current(state, h, l, c, p) -> float
-state = (sum: float, count: int, prev_close: float, atr: float)
+@step API (策略 step 调):
+  - atr_step(state: ATRState, h, l, c, p) -> (ATRState, atr)
+state: ATRState dataclass (sum / count / prev_close / atr)
 """
+from dataclasses import dataclass
+
 import numpy as np
+
+
+# ============ step state (dataclass) ============
+
+@dataclass
+class ATRState:
+    """ATR 增量 state; atr_step in/out (Wilder 平滑: k=1/p)"""
+    sum: float = 0.0
+    count: int = 0
+    prev_close: float = 0.0
+    atr: float = 0.0
 
 
 # ============ 纯函数版 (jupyter / 复盘, 返 ndarray) ============
@@ -68,70 +80,63 @@ def atr(highs, lows, closes, p: int = 14, ema: bool = False):
         return _ema(tr_filled, p)
 
 
-# ============ 纯 Python 增量版 (Engine.on_bars 路径) ============
+# ============ step 增量版 (策略 step 调用, strategy-step-only) ============
+
+def _tr(h: float, l: float, prev_close: float, has_prev: bool) -> float:
+    """单根 true range; has_prev=False 时 (首根) TR = h - l"""
+    if not has_prev:
+        return h - l
+    d1 = h - l
+    d2 = abs(h - prev_close)
+    d3 = abs(l - prev_close)
+    tr = d1
+    if d2 > tr:
+        tr = d2
+    if d3 > tr:
+        tr = d3
+    return tr
+
+
+def atr_step(state: ATRState, h: float, l: float, c: float,
+             p: int) -> tuple[ATRState, float]:
+    """ATR 单步: state + (h, l, c) -> (new_state, atr)
+
+    规则 (Wilder 平滑, k=1/p):
+      - TR = _tr(h, l, state.prev_close, state.count > 0)
+      - count < p:   sum += TR; count += 1; if count==p: atr = sum/p
+      - count >= p:  atr = atr * (p-1)/p + TR/p; count += 1
+      - new_state.prev_close = c
+    """
+    has_prev = state.count > 0
+    tr = _tr(h, l, state.prev_close, has_prev)
+    if state.count < p:
+        new_sum = state.sum + tr
+        new_count = state.count + 1
+        if new_count < p:
+            return ATRState(sum=new_sum, count=new_count,
+                            prev_close=c, atr=0.0), 0.0
+        new_atr = new_sum / p
+        return ATRState(sum=new_sum, count=new_count,
+                        prev_close=c, atr=new_atr), new_atr
+    # count >= p: Wilder 平滑
+    new_atr = state.atr * ((p - 1.0) / p) + tr / p
+    return ATRState(sum=state.sum, count=state.count + 1,
+                    prev_close=c, atr=new_atr), new_atr
+
+
+# ============ Deprecated shim (2026-09-10: 合并到 atr_step, 后续删除) ============
 
 def atr_push(state, h, l, c, p):
-    """ATR 增量推入 (Wilder 平滑): state=(sum, count, prev_close, atr)
-
-    表达式:
-      TR = max(h-l, |h-prev_close|, |l-prev_close|)
-      count < p:  sum += TR; count++; if count==p: atr = sum/p
-      count >= p: atr = atr*(p-1)/p + TR/p; count++
-    返回新 state (含 prev_close <- c)。
-    """
-    s_sum = state[0]
-    s_count = state[1]
-    prev_close = state[2]
-    s_atr = state[3]
-    if s_count == 0:
-        tr = h - l
-    else:
-        d1 = h - l
-        d2 = h - prev_close
-        if d2 < 0.0:
-            d2 = -d2
-        d3 = l - prev_close
-        if d3 < 0.0:
-            d3 = -d3
-        tr = d1
-        if d2 > tr:
-            tr = d2
-        if d3 > tr:
-            tr = d3
-    if s_count < p:
-        s_sum += tr
-        s_count += 1
-        if s_count == p:
-            s_atr = s_sum / p
-    else:
-        s_atr = s_atr * ((p - 1.0) / p) + tr / p
-        s_count += 1
-    return s_sum, s_count, c, s_atr
+    """DEPRECATED: 用 atr_step(state, h, l, c, p) -> (state, atr)."""
+    s = ATRState(sum=state[0], count=state[1],
+                 prev_close=state[2], atr=state[3])
+    new_s, _ = atr_step(s, h, l, c, p)
+    return new_s.sum, new_s.count, new_s.prev_close, new_s.atr
 
 
 def atr_current(state, h, l, c, p):
-    """ATR 当前值 (假设当前未闭合桶为 (h, l, c), 不改 state); 数据不足返回 0.0"""
-    s_sum = state[0]
-    s_count = state[1]
-    prev_close = state[2]
-    s_atr = state[3]
-    if s_count == 0:
-        tr = h - l
-    else:
-        d1 = h - l
-        d2 = h - prev_close
-        if d2 < 0.0:
-            d2 = -d2
-        d3 = l - prev_close
-        if d3 < 0.0:
-            d3 = -d3
-        tr = d1
-        if d2 > tr:
-            tr = d2
-        if d3 > tr:
-            tr = d3
-    if s_count < p - 1:
-        return 0.0
-    if s_count == p - 1:
-        return (s_sum + tr) / p
-    return s_atr * ((p - 1.0) / p) + tr / p
+    """DEPRECATED: 用 atr_step(state, h, l, c, p) -> (state, atr)."""
+    s = ATRState(sum=state[0], count=state[1],
+                 prev_close=state[2], atr=state[3])
+    _, atr_v = atr_step(s, h, l, c, p)
+    return atr_v

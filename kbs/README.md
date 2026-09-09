@@ -91,7 +91,7 @@
 | warmup | 策略起始日之前的预热数据，用于让 EMA 有足够历史 |
 | 不操作基线 | 期初资金 + 期初持仓 × 期末价；与策略期末总资产对比得盈亏 |
 | `compute_signals(xp, bars, params)` | 策略唯一抽象入口；`xp` = numpy 或 cupy；返回 `ndarray[int8]`，长度 = `len(bars["ts"])` |
-| `compute_signals_for_one_bar(xp, bar, params)` | framework 单 bar 包装（默认包成单元素数组 → `compute_signals[0]`）；子类可覆写维护 instance 状态 |
+| `step(state, bar)(xp, bar, params)` | framework 单 bar 包装（默认包成单元素数组 → `compute_signals[0]`）；子类可覆写维护 instance 状态 |
 | `xp` | 抽象后端（`numpy` 或 `cupy`）；策略代码禁止直接 `import numpy / cupy`，必须通过 `xp` 参数 |
 | `VectorizedStrategy` | 唯一策略基类，定义 `compute_signals` 抽象方法 + `params_spec` schema 校验 + `format_signal_line` 默认 hook |
 | `format_signal_line` | 策略展示 hook（Engine.on_bars 在 verbose 时打印）；默认仅打 OHLCV + 信号；channel_deviation 自定义展示 up/dw/dev |

@@ -1,8 +1,9 @@
 # 05 指标计算：EMA 与通道轨
 
 > 相关源码：`indicators/ema.py`（`evtrade/indicators/ema.py`）。
-> 历史包袱：`evtrade/core/incremental_indicators.py` 已在 change `2026-09-09-decouple-indicators-from-framework` 中删除——framework 不再持有 EMA 状态，所有指标计算由策略通过 `evtrade/indicators/` 在 `compute_signals` 内部自维护。
-> 本文档为 2026-09-09 统一 CPU/GPU 重构版（删 `numba`、删 `CUDA_DEVICE_*`）。
+> 本文档为 2026-09-10 重构版（strategy-step-only）—— 删 `ema_push / ema_current` 双轨标量 API,
+> 改用 `ema_step(state, value, p) -> (state, ema)` 单函数 + `@dataclass EMAState`。
+> xp 批量版 `xp_ema / xp_ema_channel` 保留供 engine fast-path 调用。
 
 ## 1. 指标定义：通达信蓝色通道轨
 
@@ -20,26 +21,44 @@ TF1 = 21（默认，由策略 params_spec 自定义）
 - **种子（seed）**：前 p 个值做简单平均 `SMA = sum(前p个)/p`，作为第一个 EMA
 - 之后递推：`EMA_t = price_t * k + EMA_{t-1} * (1-k)`
 
-`evtrade/indicators/ema.py` 提供**双形态**，口径一致：
+`evtrade/indicators/ema.py` 提供**三类形态**，口径一致：
 
 | 形态 | 函数 | 用途 | 复杂度 |
 |---|---|---|---|
-| 批量 (xp) | `xp_ema(xp, values, p)` | `compute_signals` 主体 (向量化引擎 / sweep) | O(n)，xp 算子 |
+| 批量 (xp) | `xp_ema(xp, values, p)` | engine fast-path 算全序列 | O(n)，xp 算子 |
 | 批量 (xp) | `xp_ema_channel(xp, h, l, p)` | 通道策略批量版 | O(n) |
-| 增量 (Python 标量) | `ema_push / ema_current` | `compute_signals_for_one_bar` 逐 bar O(1) | O(1) |
-| 增量 (Python 标量) | `ema_channel_push / ema_channel_current` | 通道逐 bar | O(1) |
+| step 增量 | `ema_step(EMAState, value, p) -> (EMAState, ema)` | 策略 `step(state, bar)` 调 | O(1) |
+| step 增量 | `ema_channel_step(EMAChannelState, h, l, p) -> (EMAChannelState, up, dw)` | 通道策略 step 调 | O(1) |
 
-> **2026-09-09 变化**：
-> - 旧版 `ema / ema_channel` 批量函数（return `np.ndarray`）保留，新版 `xp_ema / xp_ema_channel` 接受 `xp` 第一参数（numpy/cupy 兼容）。
-> - 旧版 `@njit` 增量函数重写为**纯 Python**（保留 3-6 标量 in/out API）。无 `numba` import、无 `CUDA_DEVICE_*` 字符串常量。
-> - 表达式与浮点路径与原 numba 版逐位一致 (同一份 k=2/(p+1) SMA seed + 递推)。
+> **2026-09-10 变化 (strategy-step-only)**：
+> - 删旧 `ema_push(s_sum, s_count, s_ema, value, p)` / `ema_current(...)` 6/3 标量 API
+> - 新 `ema_step(state, value, p) -> (state, ema)`: state 是 `@dataclass EMAState(sum, count, ema)`, in/out 单 dataclass
+> - 公式与浮点路径与旧版逐位一致（同 k=2/(p+1) SMA seed + 递推）
+> - 旧 push/current 改作 deprecated shim, 后续 change 删除
 
-## 3. 增量版：`ema_push` / `ema_current`
+## 3. step 版：`ema_step`
 
-增量 state 形状为 `(sum, count, ema)` 三元组，初始 `(0.0, 0, 0.0)`。
-`compute_signals_for_one_bar` 在策略 instance 维护 (`self._up_st = (0.0, 0, 0.0)`)。
+state 是 `@dataclass EMAState(sum, count, ema)`, 初值 `EMAState()` 全 0。
 
-### `ema_push(s_sum, s_count, s_ema, value, p) -> (sum, count, ema)`
+```python
+@dataclass
+class EMAState:
+    sum: float = 0.0
+    count: int = 0
+    ema: float = 0.0
+
+def ema_step(state: EMAState, value: float, p: int) -> tuple[EMAState, float]:
+    if state.count < p:
+        new_sum = state.sum + value
+        new_count = state.count + 1
+        if new_count < p:
+            return EMAState(new_sum, new_count, 0.0), 0.0
+        new_ema = new_sum / p                                # SMA seed
+        return EMAState(new_sum, new_count, new_ema), new_ema
+    k = 2.0 / (p + 1.0)
+    new_ema = value * k + state.ema * (1.0 - k)             # 递推
+    return EMAState(state.sum, state.count + 1, new_ema), new_ema
+```
 
 桶闭合 / 每根 bar 推入时调用，O(1)：
 
@@ -48,116 +67,101 @@ count <  p :  sum += value; count++; 若 count == p: ema = sum/p      ← SMA se
 count >= p :  ema = value*k + ema*(1-k); count++
 ```
 
-返回新 state（按值，Python tuple）。
-
-### `ema_current(s_sum, s_count, s_ema, pending, p) -> float`
-
-带当前未闭合 bar 的"试探性 EMA"，O(1)，不改 state：
-
-```
-count <  p-1 :  返回 0.0（数据不足；策略代码用 up==0 守卫即可）
-count == p-1 :  返回 (sum + pending) / p        ← pending 凑满 p 个，得 SMA seed
-count >= p   :  返回 pending*k + ema*(1-k)
-```
-
-> 与旧 numba 版 (`inf` 表示未就绪) 不同的选择: 用 `0.0` 表示未就绪；
+> 与旧版 (`inf` 表示未就绪) 不同的选择: 用 `0.0` 表示未就绪 (state.ema = 0.0);
 > 策略代码用 `if up == 0.0 or dw == 0.0: return 0` 守卫即可。
 > 数值口径 (count==p-1 → SMA seed) 与旧版完全一致。
 
-## 4. 双 rail：`ema_channel_push` / `ema_channel_current`
+## 4. 双 rail：`ema_channel_step`
 
 ```python
-# 增量推入 (6 标量 in → 6 标量 out)
-new_up_st, new_dw_st = ema_channel_push(
-    up_st_sum, up_st_count, up_st_ema,
-    dw_st_sum, dw_st_count, dw_st_ema,
-    cur_high, cur_low, p
-)
-# 当前通道值 (6 标量 in → 2 标量 out)
-up, dw = ema_channel_current(
-    up_st_sum, up_st_count, up_st_ema,
-    dw_st_sum, dw_st_count, dw_st_ema,
-    cur_high, cur_low, p
-)
+@dataclass
+class EMAChannelState:
+    up: EMAState = field(default_factory=EMAState)
+    dw: EMAState = field(default_factory=EMAState)
+
+def ema_channel_step(state: EMAChannelState, h: float, l: float, p: int
+                    ) -> tuple[EMAChannelState, float, float]:
+    new_up, up = ema_step(state.up, h, p)
+    new_dw, dw = ema_step(state.dw, l, p)
+    return EMAChannelState(up=new_up, dw=new_dw), up, dw
 ```
 
-策略层典型用法（参考 `evtrade/strategies/channel_deviation.py::compute_signals_for_one_bar`）：
+策略层典型用法（参考 `evtrade/strategies/channel_deviation.py::step`）：
 
 ```python
-def compute_signals_for_one_bar(self, xp, bar, params):
+def step(self, state, bar, params):
+    if bar["mark"] == 0:
+        return state, 0                          # 预热段
+
     tf1 = int(params["tf1"])
     cur_ts = int(bar["ts"])
     cur_high = float(bar["h"])
     cur_low = float(bar["l"])
 
     # 桶切换: 旧桶 high/low 闭锁入 EMA
-    if self._has_prev and self._prev_ts != cur_ts:
-        us, uc, ue = self._up_st
-        us, uc, ue = ema_push(us, uc, ue, self._cur_high, tf1)
-        self._up_st = (us, uc, ue)
-        ds, dc, de = self._dw_st
-        ds, dc, de = ema_push(ds, dc, de, self._cur_low, tf1)
-        self._dw_st = (ds, dc, de)
+    if state.has_prev and state.prev_ts != cur_ts:
+        state.ema, _, _ = ema_channel_step(state.ema, state.cur_high, state.cur_low, tf1)
 
-    self._prev_ts = cur_ts; self._cur_high = cur_high; self._cur_low = cur_low
-    self._has_prev = True
+    state.prev_ts = cur_ts
+    state.cur_high = cur_high; state.cur_low = cur_low
+    state.has_prev = True
 
     # 当前通道值 (含 pending)
-    us, uc, ue = self._up_st; ds, dc, de = self._dw_st
-    up = ema_current(us, uc, ue, cur_high, tf1)
-    dw = ema_current(ds, dc, de, cur_low, tf1)
+    state.ema, up, dw = ema_channel_step(state.ema, cur_high, cur_low, tf1)
     if up == 0.0 or dw == 0.0:
-        return 0
-    ...
+        return state, 0                          # 通道未就绪
+    # ... 算偏离 + FSM
+    return state, sig
 ```
 
 ## 5. 数据就绪时间线（tf1=21 为例）
 
-| 已闭合 bar 数 | push 后状态 | current(pending) 返回 |
+| 已 step 调用次数 | EMAState.count | ema_step 返回的 ema |
 |---|---|---|
-| 0 ~ 19 | 累加中，无 EMA | 0.0（count<20） |
-| 20（count=20=p-1） | 累加中 | `(sum+pending)/21`，首个试探 EMA |
-| 21（count=21=p） | `ema = sum/21`（SMA seed） | `pending*k + ema*(1-k)` |
-| 之后每 bar | 正常递推 | 同上 |
+| 0 ~ 20 | 累加中 (count < p) | 0.0 |
+| 21 (count=21=p) | `ema = sum/21`（SMA seed） | `sum/21` |
+| 之后每 step | 正常递推 | `value*k + ema*(1-k)` |
 
-因此：**策略最早能在"第 21 个周期 bar"看到通道值**。回测默认预热 365 天，即使 1d 周期也有充足历史。
+因此：**策略最早能在"第 21 次 step"看到通道值**。回测默认预热 365 天, 即使 1d 周期也有充足历史。
 
-## 6. 策略层使用：compute_signals 内混合写法
+## 6. 策略层使用：step 内混合写法
 
-批量路径（vectorized 引擎 / sweep）:
+策略 `step(state, bar, params)` body 内:
 
 ```python
-def compute_signals(self, xp, bars, params):
-    tf1 = int(params["tf1"])
-    up, dw = xp_ema_channel(xp, bars["h"], bars["l"], tf1)
-    # NaN -> 0 (未就绪时偏离不触发)
-    up_v = xp.where(xp.isnan(up), 0.0, up)
-    dw_v = xp.where(xp.isnan(dw), 0.0, dw)
-    low_dev = (dw_v - bars["l"]) / dw_v * 100.0
-    high_dev = (bars["h"] - up_v) / up_v * 100.0
-    ...
+# 1) EMA 通道 (step 增量; state 由 engine 持有)
+state.ema, up, dw = ema_channel_step(state.ema, bar["h"], bar["l"], tf1)
+
+# 2) NaN -> 0 (引擎 batched 路径下, _compute_devs_xp 内部安全 mask; step 路径无需)
+low_dev   = (dw - bar["l"]) / dw * 100.0      # 通道未就绪时 dw==0 -> dev==0, FSM 不触发
+high_dev  = (bar["h"] - up) / up * 100.0
 ```
 
-逐 bar 路径（Engine.on_bars / 实盘）见 §4。
+batched 路径（`VectorizedEngine._compute_signals_xp`）也调同一份 step, 引擎循环维护 state。
 
-## 7. 复杂度对比（为什么做增量）
+## 7. 复杂度对比
 
-朴素做法：每次回调对全部闭合桶重算 EMA → O(n)/根，n 为桶数，全程 O(n²)。
-增量做法：`push` O(1)/桶 + `current` O(1)/根 → 全程 O(总根数)。
+朴素做法：每次回调对全部闭合桶重算 EMA → O(n)/根, n 为桶数, 全程 O(n²)。
+step 增量：`ema_step` O(1)/次 + state 跨调用持续 → 全程 O(总调用数)。
 单文件回测（百万级 1m bar）与实盘逐根推送都因此可行。
-**批量路径**用 `xp_ema_channel` 一次性算全序列（O(n) 总），GPU 路径下走 cuBLAS 预编译 kernel。
+**批量路径**用 `xp_ema_channel` 一次性算全序列（O(n) 总）, GPU 路径下走 cuBLAS 预编译 kernel。
 
 ## 8. 顶层 API
 
 ```python
 from evtrade.indicators import (
-    xp_ema,             # 批量 xp 版
-    xp_ema_channel,     # 批量 xp 版
-    ema_push, ema_current,                          # 增量 Python
-    ema_channel_push, ema_channel_current,          # 增量 Python
-    # 同形态还有 xp_atr / xp_rsi / xp_bollinger / atp_push / rsi_push / boll_push
+    # 批量 xp 版 (engine fast-path)
+    xp_ema, xp_ema_channel,
+
+    # step 增量版 (strategy-step-only, 2026-09-10)
+    EMAState, EMAChannelState,
+    ema_step, ema_channel_step,
+
+    # Deprecated shim (过渡期; 后续删除)
+    ema_push, ema_current, ema_channel_push, ema_channel_current,
+
+    # 同形态还有 xp_atr / xp_rsi / xp_bollinger / atr_step / rsi_step / sma_step / boll_step
 )
 ```
 
-旧 `evtrade.core.incremental_indicators.IncrementalEMA` / `EMAChannel` 已删除；
-旧 `ema(values)` / `ema_channel(values)` 批量函数被 `xp_ema(xp, ...)` / `xp_ema_channel(xp, ...)` 取代（多一个 `xp` 第一参数）。
+旧 `evtrade.core.incremental_indicators.IncrementalEMA` / `EMAChannel` 已删除（旧 `unify-strategy-contract`）。

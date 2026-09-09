@@ -1,14 +1,18 @@
 from __future__ import annotations
-"""向量化引擎 (CuPy 统一 CPU/GPU 路径)
+"""向量化引擎 (CuPy 统一 CPU/GPU 路径, strategy-step-only)
 
 唯一执行路径 (DSL/ref 引擎已下线):
   - 桶聚合: 向量化 (xp 算子), GPU 加速显著
-  - 信号:   策略 compute_signals(xp, ...) 纯数组算子
+  - 信号:   策略 step(state, bar, params) 循环调用 (engine 持有 state)
   - 成交:   顺序 Python 循环 (cash/position 累积依赖; 先保证正确)
   - 汇总:   metrics.summarize (16 字段, 含 equity_curve)
 
 device="cpu" -> xp=numpy; device="gpu" -> xp=cupy。
 策略代码一份, framework 0 渲染逻辑。
+
+(strategy-step-only, 2026-09-10) 算法/执行分层:
+  - 策略仅写 step(state, bar, params) -> (state, sig); 无 instance state
+  - engine 在 batched 路径循环调 step; state 跨调用由 list 累积
 """
 
 import numpy as np
@@ -139,9 +143,6 @@ def _execute_trades(sig_np: np.ndarray, close_np: np.ndarray, ts_np: np.ndarray,
         baseline_curve[i] = init_cash + init_position * price
         equity_curve[i] = cash + position * price
 
-        # max_drawdown 字段已由 metrics.summarize 统一计算 (unify-metrics-units);
-        # 这里不再重复计算,避免双源不一致。
-
         s = int(sig_np[i])
         if s == 0:
             continue
@@ -193,6 +194,49 @@ def _execute_trades(sig_np: np.ndarray, close_np: np.ndarray, ts_np: np.ndarray,
             "baseline_curve": baseline_curve}
 
 
+# ============ 信号循环 (strategy-step-only) ============
+
+def _compute_signals_xp(strategy, params: dict, buckets: dict) -> np.ndarray:
+    """vectorized 路径: 循环调 strategy.step, state 由 engine 持有 (list)
+
+    桶级 OHLCV 已由 _aggregate_buckets_xp 算好 (xp 数组, cupy 时在 device 上);
+    本函数循环调 step, 每桶一次. state 在 host 维护 (因为 step 内大多数算法
+    是 Python 标量); 仅桶 OHLCV 数据本身在 device 上.
+
+    返回: sig 序列 (numpy int8, 长度 = len(buckets["ts"])), 已 mark=0 清零
+    """
+    state = strategy.init_state(params)
+    n = len(buckets["ts"])
+    sig = np.zeros(n, dtype=np.int8)
+
+    # 桶数据预先拉回 host (标量 in/out; cupy 单元素 .get() N 次太慢, 整组拉)
+    ts_np = _to_host(buckets["ts"])
+    o_np = _to_host(buckets["o"])
+    h_np = _to_host(buckets["h"])
+    l_np = _to_host(buckets["l"])
+    c_np = _to_host(buckets["c"])
+    v_np = _to_host(buckets["v"])
+    mark_np = _to_host(buckets["mark"])
+
+    for i in range(n):
+        bar = {
+            "ts": int(ts_np[i]),
+            "o": float(o_np[i]),
+            "h": float(h_np[i]),
+            "l": float(l_np[i]),
+            "c": float(c_np[i]),
+            "v": float(v_np[i]),
+            "mark": int(mark_np[i]),
+        }
+        # step 内 mark=0 返 0; 但 mark=0 也走 step (engine 一致行为)
+        state, s = strategy.step(state, bar, params)
+        sig[i] = s
+
+    # 预热段信号清零 (mark=0 的桶不应成交; 与 Engine.on_bars 一致)
+    sig = sig * mark_np.astype(np.int8)
+    return sig
+
+
 # ============ 汇总 (metrics.summarize 16 字段) ============
 
 def _summarize(exec_state: dict, init_cash: float, init_position: float,
@@ -234,35 +278,28 @@ def run_vectorized(bars_1m: dict, period: str, warmup_until: int,
                    trade_qty: float = 10000.0, scale: float = 1.0,
                    buy_pct: float = 0.0, sell_pct: float = 0.0,
                    device: str = "cpu") -> dict:
-    """向量化回测 (CPU/GPU 统一入口)
+    """向量化回测 (CPU/GPU 统一入口, strategy-step-only)
 
     bars_1m: kernel.bars_to_arrays 输出 (numpy dict)
-    strategy: VectorizedStrategy 实例 (compute_signals 方法)
+    strategy: VectorizedStrategy 实例 (step 方法)
     device: "cpu" -> numpy; "gpu" -> cupy
 
     返回: {"sig", "trades", "summary", "buckets"}
     """
     xp = get_xp(device)
 
-    # 1) 桶聚合 (向量化, GPU 加速)
+    # 1) 桶聚合 (向量化, GPU 加速; 复用 xp 算子)
     buckets = _aggregate_buckets_xp(xp, bars_1m, period, warmup_until)
 
-    # 2) 信号 (策略算, 纯数组)
-    sig = strategy.compute_signals(xp, buckets, params)
-    sig = xp.asarray(sig, dtype=xp.int8)
+    # 2) 信号: 循环调 strategy.step(state, bar, params), state 由 engine 持有
+    sig_np = _compute_signals_xp(strategy, params, buckets)
 
-    # 3) 成交 (拉回 host 顺序执行; 正确性优先)
-    sig_np = _to_host(sig)
+    # 3) 成交 (host 顺序执行; 正确性优先)
     close_np = _to_host(buckets["c"])
     ts_np = _to_host(buckets["ts"])
-    # 只在策略期 (mark=1) 成交; mark 也拉回
-    mark_np = _to_host(buckets["mark"])
-
-    # 预热段信号清零 (mark=0 的桶不应成交)
-    sig_np = sig_np * mark_np
 
     # 首末策略期 ts (年化用)
-    strat_mask = mark_np == 1
+    strat_mask = _to_host(buckets["mark"]) == 1
     first_ts = int(ts_np[strat_mask][0]) if strat_mask.any() else 0
     last_ts = int(ts_np[strat_mask][-1]) if strat_mask.any() else 0
 
@@ -273,6 +310,7 @@ def run_vectorized(bars_1m: dict, period: str, warmup_until: int,
     summary = _summarize(exec_state, init_cash, init_position, first_ts, last_ts)
 
     # sig 只保留 mark=1 的桶 (与 Engine.bucket_signals 同形: 预热段不进 sig)
+    mark_np = _to_host(buckets["mark"])
     sig_live = sig_np[mark_np == 1]
 
     return {"sig": sig_live, "trades": exec_state["trades"],

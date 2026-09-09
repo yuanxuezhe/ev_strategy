@@ -1,16 +1,15 @@
 from __future__ import annotations
-"""ChannelDeviationStrategy: 通道偏离回撤策略 (统一 CPU/GPU; 唯一基类)
+"""ChannelDeviationStrategy: 通道偏离回撤策略
 
 ================================================================
 ✅  可改层 (strategies 子包)  ✅
 ================================================================
-混合策略: EMA 通道 + 偏离用 xp 数组算子向量化 (GPU 加速), 锁存 FSM
-用 Python 循环 (顺序依赖; cupy 时循环前 .get() 拉回 host)。
+混合策略: EMA 通道 (stateful, step) + 偏离 (stateless, 算) + 锁存 FSM (stateful, step)。
 
-compute_signals: 批量向量化 (vectorized 引擎 + sweep)
-compute_signals_for_one_bar: 覆写维护 instance FSM (Engine.on_bars / 实盘)
-
-FSM 核心逻辑 (_fsm_step) 只写一次, 两个接口共享 —— 保证语义一致。
+唯一方法 step(state, bar, params) -> (state, sig):
+  - state 由 engine 持有传入, 策略无 instance attr
+  - bar 是单桶 OHLCV + mark; mark=0 (预热) 直接返 (state, 0)
+  - 算法: ema_channel_step 算 up/dw + 4 偏离 + _fsm_step 锁存
 
 参数:
   low1:  下轨极端偏离阈值 (%)  (p0)
@@ -19,19 +18,36 @@ FSM 核心逻辑 (_fsm_step) 只写一次, 两个接口共享 —— 保证语�
   high2: 上轨回撤确认阈值 (%)  (p3)
   tf1:   EMA 通道周期           (p4)
 """
-import numpy as np
+from dataclasses import dataclass, field
 
-from ..indicators import ema_current, ema_push, xp_ema_channel
+from ..indicators import EMAChannelState, ema_channel_step
 from .vectorized_base import VectorizedStrategy, register_strategy
 
 
-# ============ FSM 核心 (只写一次; 批量 + 逐 bar 共享) ============
+# ============ 状态 dataclass ============
 
-def _fsm_step(state, cur_ts, low_dev_h, low_dev, high_dev_l, high_dev,
-              low1, low2, high1, high2):
-    """单 bar FSM 步进; 返回 signal (0/1/-1), 原地改 state。
+@dataclass
+class ChannelDeviationState:
+    """策略持久状态: EMA 通道 + FSM 锁存
 
-    state: dict {"low_hit", "high_hit", "lock_ts", "low_acted", "high_acted"}
+    engine 在 strategy 实例化时调 init_state() 拿初值, 之后每次 step 调用传入传出。
+    """
+    ema: EMAChannelState = field(default_factory=EMAChannelState)
+    fsm: dict = field(default_factory=lambda: {
+        "low_hit": False, "high_hit": False, "lock_ts": 0,
+        "low_acted": False, "high_acted": False})
+    prev_ts: int = 0
+    cur_high: float = 0.0
+    cur_low: float = 0.0
+    has_prev: bool = False
+
+
+# ============ 算法 ============
+
+def _fsm_step(state_fsm: dict, cur_ts: int, low_dev_h, low_dev,
+              high_dev_l, high_dev, low1, low2, high1, high2) -> int:
+    """FSM 单步: 原地改 state_fsm, 返回 signal (0/1/-1)
+
     语义 (与原 DSL body 逐行一致):
       - 桶切换 (cur_ts != lock_ts) -> 清 low_acted/high_acted
       - low_dev_h < low2 且 low_hit 且未 acted -> BUY, 清 low_hit, 置 low_acted
@@ -40,50 +56,33 @@ def _fsm_step(state, cur_ts, low_dev_h, low_dev, high_dev_l, high_dev,
       - high_dev > high1 且未 high_acted -> 置 high_hit, 置 high_acted
     """
     # 桶切换清锁
-    if cur_ts != state["lock_ts"]:
-        state["lock_ts"] = cur_ts
-        state["low_acted"] = False
-        state["high_acted"] = False
+    if cur_ts != state_fsm["lock_ts"]:
+        state_fsm["lock_ts"] = cur_ts
+        state_fsm["low_acted"] = False
+        state_fsm["high_acted"] = False
 
     signal = 0
-    if state["low_hit"] and low_dev_h < low2 and not state["low_acted"]:
+    if state_fsm["low_hit"] and low_dev_h < low2 and not state_fsm["low_acted"]:
         signal = 1
-        state["low_hit"] = False
-        state["low_acted"] = True
-    elif state["high_hit"] and high_dev_l < high2 and not state["high_acted"]:
+        state_fsm["low_hit"] = False
+        state_fsm["low_acted"] = True
+    elif state_fsm["high_hit"] and high_dev_l < high2 and not state_fsm["high_acted"]:
         signal = -1
-        state["high_hit"] = False
-        state["high_acted"] = True
+        state_fsm["high_hit"] = False
+        state_fsm["high_acted"] = True
 
-    if low_dev > low1 and not state["low_acted"]:
-        state["low_hit"] = True
-        state["low_acted"] = True
-    if high_dev > high1 and not state["high_acted"]:
-        state["high_hit"] = True
-        state["high_acted"] = True
+    if low_dev > low1 and not state_fsm["low_acted"]:
+        state_fsm["low_hit"] = True
+        state_fsm["low_acted"] = True
+    if high_dev > high1 and not state_fsm["high_acted"]:
+        state_fsm["high_hit"] = True
+        state_fsm["high_acted"] = True
 
     return signal
 
 
-def _init_fsm_state():
-    return {"low_hit": False, "high_hit": False, "lock_ts": 0,
-            "low_acted": False, "high_acted": False}
-
-
-# ============ 共享 helpers (去重 compute_signals / _for_one_bar, dedupe-fsm-helpers) ============
-
-def _parse_thresholds(params: dict) -> tuple[float, float, float, float]:
-    """(low1, low2, high1, high2) 一次性解析, 避免两处重复写 4 个 float(params[k])"""
-    return (float(params["low1"]), float(params["low2"]),
-            float(params["high1"]), float(params["high2"]))
-
-
-def _compute_devs_scalar(up: float, dw: float, h: float, l: float):
-    """4 个偏离 (low_dev, high_dev, low_dev_h, high_dev_l) 标量版
-
-    逐 bar 路径用 (compute_signals_for_one_bar); 通道未就绪 (up==0 或 dw==0)
-    时返 4 个 0.0, 避免 RuntimeWarning: divide by zero。
-    """
+def _compute_devs(up: float, dw: float, h: float, l: float):
+    """4 个偏离 (low_dev, high_dev, low_dev_h, high_dev_l); 通道未就绪返 0"""
     if up == 0.0 or dw == 0.0:
         return 0.0, 0.0, 0.0, 0.0
     return ((dw - l) / dw * 100.0,
@@ -92,44 +91,13 @@ def _compute_devs_scalar(up: float, dw: float, h: float, l: float):
             (l - up) / up * 100.0)
 
 
-def _compute_devs_xp(xp, up, dw, h, l):
-    """4 个偏离 xp 数组算子版 (批量 compute_signals 用; GPU 加速)
-
-    与原版差异 (顺手修): 原版 (dw_v - l) / dw_v 在 dw_v==0 时产生 inf,
-    FSM 把 inf 视为大数会误触发。新版用 safe_dw/safe_up (0->1) 计算,
-    最后用 ready mask 强制未就绪处返 0。NaN 由 up_v/dw_v 替换前置掉。
-    """
-    up_v = xp.where(xp.isnan(up), 0.0, up)
-    dw_v = xp.where(xp.isnan(dw), 0.0, dw)
-    safe_up = xp.where(up_v == 0, 1.0, up_v)
-    safe_dw = xp.where(dw_v == 0, 1.0, dw_v)
-    low_dev    = (safe_dw - l)   / safe_dw * 100.0
-    high_dev   = (h - safe_up)   / safe_up * 100.0
-    low_dev_h  = (safe_dw - h)   / safe_dw * 100.0
-    high_dev_l = (l - safe_up)   / safe_up * 100.0
-    ready = (up_v != 0) & (dw_v != 0)
-    return (xp.where(ready, low_dev,    0.0),
-            xp.where(ready, high_dev,   0.0),
-            xp.where(ready, low_dev_h,  0.0),
-            xp.where(ready, high_dev_l, 0.0))
-
-
-def _run_fsm(state, ts, low_dev_h, low_dev, high_dev_l, high_dev,
-             low1, low2, high1, high2) -> int:
-    """薄包装 _fsm_step; 把传参顺序定死避免两处调用错位"""
-    return _fsm_step(state, ts,
-                     low_dev_h, low_dev, high_dev_l, high_dev,
-                     low1, low2, high1, high2)
-
-
 # ============ 策略类 (单继承 VectorizedStrategy) ============
 
 @register_strategy("channel_deviation")
 class ChannelDeviationStrategy(VectorizedStrategy):
-    """通道偏离回撤策略 (统一 CPU/GPU)
+    """通道偏离回撤策略 (strategy-step-only, 2026-09-10)
 
-    compute_signals: EMA+偏离向量化 (xp), FSM Python 循环 (_fsm_step)
-    compute_signals_for_one_bar: 覆写维护 instance EMA + FSM (逐 bar O(1))
+    唯一抽象 step(state, bar, params) -> (state, sig); 无 instance state。
     """
 
     params_spec = {
@@ -140,87 +108,45 @@ class ChannelDeviationStrategy(VectorizedStrategy):
         "tf1":   {"default": 21,  "type": int,   "min": 2,   "max": 1000},
     }
 
-    def __init__(self, params: dict | None = None, **kwargs):
-        super().__init__(params=params, **kwargs)
-        # 逐 bar 路径用的 instance state (compute_signals_for_one_bar 用)
-        self._fsm = _init_fsm_state()
-        self._up_st = (0.0, 0, 0.0)
-        self._dw_st = (0.0, 0, 0.0)
-        self._has_prev = False
-        self._prev_ts = 0
-        self._cur_high = 0.0
-        self._cur_low = 0.0
+    def init_state(self, params: dict) -> ChannelDeviationState:
+        """engine 调一次, 返回 state 初值"""
+        return ChannelDeviationState()
 
-    # ---- 批量向量化路径 (vectorized 引擎 / sweep) ----
+    def step(self, state: ChannelDeviationState, bar: dict, params: dict
+             ) -> tuple[ChannelDeviationState, int]:
+        """单步: state + 单桶 bar -> (new_state, sig)
 
-    def compute_signals(self, xp, bars: dict, params: dict):
+        bar = {"ts","o","h","l","c","v","mark"}
+        预热段 (mark==0) 直接返 (state, 0)。
+        """
+        if bar["mark"] == 0:
+            return state, 0
+
         tf1 = int(params["tf1"])
-        low1, low2, high1, high2 = _parse_thresholds(params)
-
-        # 1) 向量化: EMA 通道 + 4 个偏离 (xp 数组算子; GPU 加速)
-        #    EMA 在桶级 finalized OHLCV 上算 (与 Engine.on_bars 桶 CLOSE 语义对齐:
-        #    桶切换时 push 上一桶 high, 然后 ema_current 用本桶 finalized high)
-        up, dw = xp_ema_channel(xp, bars["h"], bars["l"], tf1)
-        # NaN -> 0 + 通道未就绪 (up==0/dw==0) -> 0 由 _compute_devs_xp 处理
-        low_dev, high_dev, low_dev_h, high_dev_l = _compute_devs_xp(
-            xp, up, dw, bars["h"], bars["l"])
-
-        # 2) FSM (Python 循环; cupy 时先拉回 host)
-        ts = bars["ts"]; mark = bars["mark"]
-        if hasattr(ts, "get"):
-            ts = ts.get(); mark = mark.get()
-            low_dev_h = low_dev_h.get(); low_dev = low_dev.get()
-            high_dev_l = high_dev_l.get(); high_dev = high_dev.get()
-
-        n = len(ts)
-        sig = np.zeros(n, dtype=np.int8)
-        state = _init_fsm_state()
-        for i in range(n):
-            if mark[i] == 0:
-                continue
-            sig[i] = _run_fsm(state, int(ts[i]),
-                              float(low_dev_h[i]), float(low_dev[i]),
-                              float(high_dev_l[i]), float(high_dev[i]),
-                              low1, low2, high1, high2)
-        return sig
-
-    # ---- 逐 bar 路径 (Engine.on_bars / 实盘; 覆写避免每根 O(n) 重算) ----
-
-    def compute_signals_for_one_bar(self, xp, bar: dict, params: dict) -> int:
-        """单 bar: 增量 EMA + _fsm_step (instance FSM 跨桶持续)"""
-        tf1 = int(params["tf1"])
+        low1, low2, high1, high2 = (float(params[k]) for k in
+                                    ("low1", "low2", "high1", "high2"))
         cur_ts = int(bar["ts"])
         cur_high = float(bar["h"])
         cur_low = float(bar["l"])
 
         # 桶切换 push (旧桶 high/low 闭锁入 EMA)
-        if self._has_prev and self._prev_ts != cur_ts:
-            us, uc, ue = self._up_st
-            us, uc, ue = ema_push(us, uc, ue, self._cur_high, tf1)
-            self._up_st = (us, uc, ue)
-            ds, dc, de = self._dw_st
-            ds, dc, de = ema_push(ds, dc, de, self._cur_low, tf1)
-            self._dw_st = (ds, dc, de)
+        if state.has_prev and state.prev_ts != cur_ts:
+            state.ema, _, _ = ema_channel_step(
+                state.ema, state.cur_high, state.cur_low, tf1)
 
-        self._prev_ts = cur_ts
-        self._cur_high = cur_high
-        self._cur_low = cur_low
-        self._has_prev = True
+        state.prev_ts = cur_ts
+        state.cur_high = cur_high
+        state.cur_low = cur_low
+        state.has_prev = True
 
-        # 当前通道值 (含 pending); 通道未就绪由 _compute_devs_scalar 内部短路
-        us, uc, ue = self._up_st
-        ds, dc, de = self._dw_st
-        up = ema_current(us, uc, ue, cur_high, tf1)
-        dw = ema_current(ds, dc, de, cur_low, tf1)
-
-        low_dev, high_dev, low_dev_h, high_dev_l = _compute_devs_scalar(
+        # 当前通道值 (含 pending); 通道未就绪返 0 由 _compute_devs 内部短路
+        state.ema, up, dw = ema_channel_step(state.ema, cur_high, cur_low, tf1)
+        low_dev, high_dev, low_dev_h, high_dev_l = _compute_devs(
             up, dw, cur_high, cur_low)
-        if up == 0.0 or dw == 0.0:
-            return 0  # 通道未就绪: 偏离全 0, FSM 不触发
-
-        return _run_fsm(self._fsm, cur_ts,
+        sig = _fsm_step(state.fsm, cur_ts,
                         low_dev_h, low_dev, high_dev_l, high_dev,
-                        *_parse_thresholds(params))
+                        low1, low2, high1, high2)
+        return state, sig
 
     # ---- 展示 hook ----
 

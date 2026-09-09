@@ -17,7 +17,7 @@ engine = Engine(feed, aggregator, strategy, executor, verbose=True)
 2. **接线**：`self.aggregator.on_bars = self.on_bars` —— 聚合器每根 bar 的回调改道到引擎（`main` 里构造 aggregator 时传的 `on_bars=None` 就是为了在这里被覆盖）
 
 > framework **不再持有** `tf1` / `EMAChannel` / `_pushed` / `state_spec` 等任何策略相关字段。
-> `tf1` 由策略 `params_spec` 自声明；EMA 增量状态由策略 instance 字段 (`self._up_st / self._dw_st`) 自维护。
+> `tf1` 由策略 `params_spec` 自声明；EMA 增量状态由策略 `step(state, bar, params)` 内部维护 (state dataclass 字段, engine 持有)。
 
 ## 2. `on_bars` —— 桶 CLOSE 时驱动策略
 
@@ -32,7 +32,7 @@ on_bars(bars):
           price = float(prev["close"])
           executor.update_price(price)
           bar = {ts, o, h, l, c, v, mark=1} from prev
-          sig = strategy.compute_signals_for_one_bar(np, bar, params)
+          sig = strategy.step(state, bar, params)
           bucket_signals.append(sig)
           if sig != 0:
               signal = {1: "BUY", -1: "SELL"}.get(sig)
@@ -48,9 +48,10 @@ on_bars(bars):
 - **桶 CLOSE 语义**：信号触发时点 = 桶**切换**那一刻（看到当前根 `ts` ≠ 上一根 `ts`），价格 = 上一桶 finalized `close`。
   与 vectorized 路径在"桶级 finalized OHLCV"上算指标完全对齐（replay/reconcile 测试通过 `bucket_diff_cap=8` 容忍 EMA 累积漂移）。
 - **mark=0（预热）不驱动**：若上一桶在预热期（mark=0），不调策略、不成交。
-- **信息流**：`compute_signals_for_one_bar` 内部可维护 instance state（增量 EMA、FSM）;
-  `compute_signals` 的批量路径无 instance state（FSM 是函数内局部）。
-  两种入口通过共享 `_fsm_step(state, ...)` 保证信号 bitwise 一致。
+- **信息流**：`step(state, bar, params)` 内部维护 state（增量 EMA、FSM）;
+  state 字段累积在 dataclass 里, engine 持有 (`Engine._state`)。
+  vectorized 路径同样循环调 step, state 跨调用在循环内持续。
+  两种入口（`VectorizedEngine._compute_signals_xp` 与 `Engine.on_bars`）走同一份 `step` 算法, 信号 bitwise 一致。
 - `info` dict 字段集由策略自由控制，framework 不命名也不假设。
 
 ## 3. `run()` 与收尾
@@ -127,7 +128,7 @@ BUY  >>> [20250106101500] 159992.SZ | UP=.. DW=.. | low_dev(L/DW)=..% high_dev(H
 期末价 / 交易次数 / 期初期末资金持仓 / 策略总资产 / 不操作基线 / 盈亏差额 / 盈亏比例
 ```
 
-信号行字段对照见 03 文档第 5 节（info 快照）；`UP`/`DW` 是策略在 info 里塞的（来源是 `compute_signals_for_one_bar` 内调 `ema_channel_current`），framework 不感知。
+信号行字段对照见 03 文档第 5 节（info 快照）；`UP`/`DW` 是策略在 info 里塞的（来源是 `step(state, bar)` 内调 `ema_channel_current`），framework 不感知。
 
 ## 7. 与 vectorized_engine 的对账
 

@@ -1,54 +1,54 @@
 from __future__ import annotations
-"""统一策略基类 (CPU+GPU 单一份契约)
+"""VectorizedStrategy 唯一基类 (strategy-step-only, 2026-09-10)
 
-================================================================
-✅  可改层 (strategies 子包)  ✅
-================================================================
-DSL 删除后, evtrade 只剩这一个策略基类:
-  - 唯一抽象方法: compute_signals(xp, bars, params) -> xp.ndarray[int8]
-  - framework 包装 compute_signals_for_one_bar 给 Engine.on_bars / 直播用
-  - 子类可覆写 compute_signals_for_one_bar 维护 instance-level 增量 state
-    (e.g. channel_deviation 的桶切换 FSM)
-  - framework 不持有任何 DSL / numba / CUDA 渲染逻辑
+DSL 渲染层 + numba 流式内核 + NVRTC CUDA 编译已下线 (unify-strategy-contract);
+策略唯一抽象方法 = step(state, bar, params) -> (state, int);
+state 由 engine 持有 (dataclass), 策略无 instance attr。
 
 bars 契约 (由 vectorized_engine._aggregate_buckets_xp 聚合后传入):
   {"ts":   int64[N_bucket],   # 桶时间戳 (14 位整数)
    "o":    float64[N],        # 每桶 open (首根 1m bar)
-   "h":    float64[N],        # 每桶 high (桶内 1m bar 最高)
-   "l":    float64[N],        # 每桶 low  (桶内 1m bar 最低)
-   "c":    float64[N],        # 每桶 close (桶内最后一根 1m bar)
-   "v":    float64[N],        # 每桶 volume (桶内 1m bar 成交量累加)
+   "h":    float64[N],        # 每桶 high
+   "l":    float64[N],        # 每桶 low
+   "c":    float64[N],        # 每桶 close
+   "v":    float64[N],        # 每桶 volume
    "mark": int8[N],           # 1=策略期 (stime >= warmup), 0=预热期
-   "n_bars": int}             # 每桶含 1m bar 根数 (供调试)
+   "n_bars": int}             # 每桶含 1m bar 根数
 
-返回: sig (int8[N]), 每桶一个信号: 0=无 / 1=BUY / -1=SELL
+step 返回: (state, int); int ∈ {-1, 0, 1} (SELL/无/BUY)
+引擎循环调 step, state 由 engine 持有跨调用持续。
 
 策略注册: @register_strategy("name") (放在类声明前一行)。
 params 解析: 子类声明 params_spec (dict of {type, default, min, max}),
             __init__ 自动按 spec 校验/填默认。
 """
+
 from typing import Any
 
 
 # ============ 注册表 (唯一来源) ============
+
 _STRATEGIES: dict[str, type["VectorizedStrategy"]] = {}
 
 
 def register_strategy(name: str):
     """类装饰器: 注册策略到 _STRATEGIES 表
+
     用法:
         @register_strategy("ma_crossover")
         class MACrossoverStrategy(VectorizedStrategy):
             params_spec = {...}
-            def compute_signals(self, xp, bars, params):
+            def step(self, state, bar, params):
                 ...
     """
+
     def deco(cls):
         if name in _STRATEGIES and _STRATEGIES[name] is not cls:
             raise ValueError(f"策略名 {name!r} 已注册为 {_STRATEGIES[name].__name__}")
         cls.strategy_key = name
         _STRATEGIES[name] = cls
         return cls
+
     return deco
 
 
@@ -86,17 +86,19 @@ def available_strategies() -> list[str]:
 
 
 class VectorizedStrategy:
-    """统一策略基类 (DSL/ref kernel 已下线, 全框架只剩这一份契约)
+    """统一策略基类 (strategy-step-only, 2026-09-10)
 
     子类必须:
       - 声明 params_spec: dict[str, dict[str, Any]]  (可空 {})
-      - 实现 compute_signals(xp, bars, params) -> xp.ndarray[int8]
+      - 实现 step(self, state, bar, params) -> (state, int)
       - 类上加 @register_strategy("name")
-      - (可选) 覆写 compute_signals_for_one_bar 维护 instance 增量 state
+      - (可选) 覆写 init_state(self, params) -> state  返回 state 初值 (默认 None = 无状态)
 
-    默认 compute_signals_for_one_bar 包装 compute_signals:
-      单 bar -> 单元素数组 -> compute_signals -> [0]。
-    子类覆写该方法维护 instance state (避免每根 O(n) 重算)。
+    算法与执行模型分层:
+      - 策略仅做"算法": 拿到 state + 单桶 bar -> 算指标 -> FSM -> 返回 (new_state, sig)
+      - 引擎 (Vectorized Engine / Engine.on_bars) 持有 state, 循环调 step
+      - 策略 MUST NOT 在 step 内出现批量循环 / xp 模块引用 / mark 之外过滤
+      - 策略 MUST NOT 持有 instance-level 持久状态 (无 self._fsm 等)
     """
 
     params_spec: dict[str, dict[str, Any]] = {}
@@ -145,30 +147,36 @@ class VectorizedStrategy:
             out[k] = v
         return out
 
-    def compute_signals(self, xp, bars: dict, params: dict):
-        """子类必须实现: 数组算子 -> 信号数组 (int8)
+    def init_state(self, params: dict[str, Any]) -> Any:
+        """返回 state 初值; 无状态策略默认返 None
 
-        xp: numpy 或 cupy 模块 (vectorized_engine 传入)
-        bars: 聚合后桶数组 dict (见模块 docstring 契约)
+        引擎 (vectorized_engine / engine) 在 strategy 实例化时调一次,
+        把 state 存到 engine 层 (不是 self._state, 是 engine 持有, 策略无感)。
+
+        stateful 策略覆写此方法返回 @dataclass 实例;
+        策略 MUST NOT 把 state 存到 self.* (instance attr).
+        """
+        return None
+
+    def step(self, state: Any, bar: dict, params: dict) -> tuple[Any, int]:
+        """策略唯一入口: 拿到 state + 单桶 bar -> 返回 (new_state, signal)
+
+        bar:  {"ts", "o", "h", "l", "c", "v", "mark"} (mark=0 预热段)
         params: 已解析参数 dict (= self.params)
-        返回: xp.ndarray[int8], 长度 = len(bars["ts"])
+        返回: (new_state, signal), signal ∈ {-1, 0, 1} (SELL/无/BUY)
+
+        策略 MUST:
+          - 若 bar["mark"] == 0: return state, 0  (预热段)
+          - 仅做"算法": 算指标 + FSM, 不持有 instance state
+          - 不 import numba / cupy
+          - 不出现 for i in range(n) 批量循环
         """
         raise NotImplementedError
-
-    def compute_signals_for_one_bar(self, xp, bar: dict, params: dict) -> int:
-        """framework 包装: 单 bar -> compute_signals[0]
-
-        子类若需要维护 instance-level 增量 state (如桶切换 FSM),
-        可覆写本方法; 默认实现走批量 compute_signals。
-        """
-        single = {k: xp.asarray([v]) for k, v in bar.items()}
-        out = self.compute_signals(xp, single, params)
-        return int(out[0])
 
     def format_signal_line(self, ts: int, sig: int, info: dict | None = None) -> str:
         """策略展示 hook: 自定义信号行打印; 默认显示 ts/sig。
 
-        info 字典: 由 strategy.check() / compute_signals_for_one_bar 累积的可选元数据
+        info 字典: 由 strategy.step() 累积的可选元数据
                   (e.g. 当前通道上轨/下轨/通道宽度)。框架不假设 info 键集。
         """
         side = {1: "BUY", -1: "SELL"}.get(sig, "")

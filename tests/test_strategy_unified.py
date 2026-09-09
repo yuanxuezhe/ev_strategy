@@ -54,31 +54,44 @@ def test_strategy_registry_lists_both():
     assert "ma_crossover" in keys
 
 
-def test_compute_signals_returns_int8_xp_array():
-    """compute_signals(xp, bars, params) -> xp.ndarray[int8]"""
+def test_step_returns_int():
+    """step(state, bar, params) -> (state, int); signal ∈ {-1, 0, 1}"""
     s = evtrade.get_strategy("ma_crossover", fast=3, slow=10)
     bars = _aggregate_bars("5m", _make_bars())
-    sig = s.compute_signals(np, bars, s.params)
-    assert sig.dtype == np.int8
-    assert len(sig) == len(bars["ts"])
+    state = s.init_state(s.params)
+    sigs = []
+    for i in range(len(bars["ts"])):
+        bar = {"ts": int(bars["ts"][i]), "o": float(bars["o"][i]),
+               "h": float(bars["h"][i]), "l": float(bars["l"][i]),
+               "c": float(bars["c"][i]), "v": float(bars["v"][i]),
+               "mark": int(bars["mark"][i])}
+        state, sig = s.step(state, bar, s.params)
+        sigs.append(sig)
+    sigs = np.array(sigs, dtype=np.int8)
+    assert sigs.dtype == np.int8
+    assert len(sigs) == len(bars["ts"])
+    assert set(sigs.tolist()).issubset({-1, 0, 1})
 
 
 def test_ma_crossover_cpu_vs_gpu_bitwise_equal():
-    """CPU vs GPU 信号 bitwise 一致 (cupy 不可用时 skip)"""
+    """CPU vs GPU 信号 bitwise 一致 (cupy 不可用时 skip)
+
+    strategy-step-only: 跑两次 run_vectorized (cpu + gpu), 比较 sig_live 序列
+    """
     try:
         cp = get_xp("gpu")
         _ = cp.zeros(2)
     except Exception:
         pytest.skip("cupy/CUDA 不可用")
 
+    bars = _make_bars()
     s_cpu = evtrade.get_strategy("ma_crossover", fast=5, slow=20)
     s_gpu = evtrade.get_strategy("ma_crossover", fast=5, slow=20)
-    bars_cpu = _aggregate_bars("5m", _make_bars())
-    bars_gpu = _aggregate_bars_gpu("5m", _make_bars())
-
-    sig_cpu = s_cpu.compute_signals(np, bars_cpu, s_cpu.params)
-    sig_gpu = s_gpu.compute_signals(cp, bars_gpu, s_gpu.params).get()
-    np.testing.assert_array_equal(sig_cpu, sig_gpu)
+    out_cpu = run_vectorized(bars, "5m", warmup_until=0,
+                             strategy=s_cpu, params=s_cpu.params, device="cpu")
+    out_gpu = run_vectorized(bars, "5m", warmup_until=0,
+                             strategy=s_gpu, params=s_gpu.params, device="gpu")
+    np.testing.assert_array_equal(out_cpu["sig"], out_gpu["sig"])
 
 
 def test_vectorized_vs_engine_on_bars_reconcile():
@@ -153,19 +166,102 @@ def test_metrics_summary_has_16_fields():
     assert s["years"] > 0 or s["n_trades"] == 0  # 退化场景下 years 可为 0
 
 
+# ============ strategy-step-only 新增锁定 ============
+
+def test_init_state_returns_dataclass():
+    """stateful 策略 init_state 返回 dataclass 实例"""
+    from dataclasses import is_dataclass
+
+    cd = evtrade.get_strategy("channel_deviation", tf1=5)
+    mc = evtrade.get_strategy("ma_crossover", fast=3, slow=10)
+
+    cd_state = cd.init_state(cd.params)
+    mc_state = mc.init_state(mc.params)
+
+    assert is_dataclass(cd_state), \
+        f"ChannelDeviation init_state 应返 dataclass, 实际 {type(cd_state)}"
+    assert is_dataclass(mc_state), \
+        f"MACrossover init_state 应返 dataclass, 实际 {type(mc_state)}"
+
+    # cd_state 含 EMA 通道 + FSM
+    from evtrade.indicators import EMAChannelState
+    assert isinstance(cd_state.ema, EMAChannelState)
+    assert "low_hit" in cd_state.fsm and "lock_ts" in cd_state.fsm
+
+    # mc_state 含 fast/slow EMA
+    from evtrade.indicators import EMAState
+    assert isinstance(mc_state.fast, EMAState)
+    assert isinstance(mc_state.slow, EMAState)
+    assert mc_state.has_prev is False  # 初值
+
+
+def test_no_instance_state_in_strategies():
+    """静态扫描: 策略文件 MUST NOT 出现 self._xxx 状态字段 (strategy-step-only)"""
+    import re
+    from pathlib import Path
+    strategies_dir = Path(evtrade.__file__).parent / "strategies"
+    pattern = re.compile(r"\bself\._(fsm|up_st|dw_st|has_prev|prev_ts|cur_high|cur_low)\b")
+    violators = []
+    for py in strategies_dir.glob("*.py"):
+        if py.name == "vectorized_base.py":
+            continue  # 基类不算
+        text = py.read_text(encoding="utf-8")
+        for m in pattern.finditer(text):
+            line_no = text[:m.start()].count("\n") + 1
+            violators.append(f"{py.name}:{line_no} {m.group(0)!r}")
+    assert not violators, \
+        f"策略禁止 self._xxx 状态字段 (state 必须由 engine 持有): {violators}"
+
+
+def test_step_state_persists_across_calls():
+    """连续 step(state, bar) 调, EMA 状态在 state 字段里累积"""
+    cd = evtrade.get_strategy("channel_deviation", tf1=3)
+    state = cd.init_state(cd.params)
+
+    # 调 5 次 step, 每次 mark=1, close 递增
+    for i, c in enumerate([10.0, 11.0, 12.0, 13.0, 14.0]):
+        bar = {"ts": i, "o": c, "h": c, "l": c, "c": c, "v": 0.0, "mark": 1}
+        state, _ = cd.step(state, bar, cd.params)
+
+    # EMA 状态跨调用持续:
+    # channel_deviation.step 内部对每根 bar 推 2 次 (旧桶 push + 当前桶 step),
+    # 但 state 在同一根 bar 内只 push 一次 (ts 切换时不重复); 上面 5 根 ts 不同
+    # 但都触发 prev_ts != cur_ts, 所以 5 + 5 = 10. 实际取决于 prev_ts 切换逻辑
+    # 这里只断言 count > 0 + 跨调用持续
+    # 注: dataclass 是 mutable, state 与 new_state.ema 同对象; 用 id() 比对
+    assert state.ema.up.count > 0, \
+        f"调 5 次 step, state.ema.up.count 应 > 0, 实际 {state.ema.up.count}"
+    assert state.ema.dw.count == state.ema.up.count, "up/dw count 应一致"
+    assert state.has_prev is True, "state.has_prev 跨调用持续"
+
+    # 同一个 state 继续调, EMA count 继续增长
+    old_count = state.ema.up.count
+    bar = {"ts": 5, "o": 15.0, "h": 15.0, "l": 15.0, "c": 15.0, "v": 0.0, "mark": 1}
+    new_state, _ = cd.step(state, bar, cd.params)
+    assert new_state.ema.up.count > old_count, \
+        f"再调 1 次, EMA count 应递增, 实际 new={new_state.ema.up.count} old={old_count}"
+
+
 def test_compute_signals_for_one_bar_default_wrapper():
-    """默认包装: 单 bar -> 单元素数组 -> compute_signals[0]"""
+    """DEPRECATED 2026-09-10 (strategy-step-only): wrapper 已删;
+    此测试改验 init_state 返回 None 时 step 仍能工作"""
 
     class TestStrat(VectorizedStrategy):
         params_spec = {}
 
-        def compute_signals(self, xp, bars, params):
-            return xp.ones(len(bars["ts"]), dtype=xp.int8)
+        def init_state(self, params):
+            return None
+
+        def step(self, state, bar, params):
+            return state, 1  # 无状态, 永远 BUY
 
     bar = {"ts": 100, "o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0,
            "v": 0.0, "mark": 1}
     s = TestStrat()
-    assert s.compute_signals_for_one_bar(np, bar, {}) == 1
+    state = s.init_state({})
+    new_state, sig = s.step(state, bar, {})
+    assert sig == 1
+    assert new_state is None  # 无状态策略 state 始终 None
 
 
 # ============ helpers ============
