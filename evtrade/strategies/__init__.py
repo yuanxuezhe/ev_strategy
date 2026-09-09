@@ -24,6 +24,7 @@ from .base import (StrategyBase, register_strategy, get_strategy,
 from . import channel_deviation  # noqa: F401  注册 channel_deviation
 from . import example_breakout  # noqa: F401  注册 breakout (示例, 仅参考引擎)
 from . import example_dev_trigger  # noqa: F401  注册 dev_trigger (DSL 三端同源示例)
+from . import ma_crossover  # noqa: F401  注册 ma_crossover (向量化, CuPy 路径)
 
 # DSL 转译器 (Python / numba / CUDA 三端)
 from .dsl import (compile_all, render_numba_body, render_cuda_body,

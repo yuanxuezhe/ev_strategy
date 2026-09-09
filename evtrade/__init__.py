@@ -156,6 +156,10 @@ from .strategies import (
     get_strategy, available_strategies, register_strategy,
     render_numba_state_body, render_cuda_device_function, DSLCtx, dsl_check,
 )
+from .strategies.vectorized_base import VectorizedStrategy, get_vectorized_strategy
+from .strategies.ma_crossover import MACrossoverStrategy
+from .backends import get_xp, gpu_available
+from .core.vectorized_engine import run_vectorized
 from .indicators import (
     ema as ema_fn, atr, rsi, bollinger, sma, true_range,
     ema_push, ema_current, ema_channel_push, ema_channel_current,

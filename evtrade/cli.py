@@ -133,8 +133,12 @@ def build_backtest_parser() -> argparse.ArgumentParser:
                     help="[阶段 2] SELL 时按当前持仓的该比例卖 (0=关闭走 --trade-qty, "
                          "1.0=清仓)")
     ap.add_argument("--code", default="159992.SZ", help="证券代码 (如 159992.SZ / 513120.SH)")
-    ap.add_argument("--engine", default="kernel", choices=["kernel", "ref"],
-                    help="kernel=numba流式内核(默认,与ref逐笔等价) / ref=原Python实现")
+    ap.add_argument("--engine", default="kernel", choices=["kernel", "ref", "vectorized"],
+                    help="kernel=numba流式内核(默认,与ref逐笔等价) / ref=原Python实现 / "
+                         "vectorized=CuPy向量化引擎(数组算子, CPU/GPU 统一, 需 --device)")
+    ap.add_argument("--device", default="cpu", choices=["cpu", "gpu"],
+                    help="[vectorized] array 后端: cpu=numpy / gpu=cupy (需 cupy, "
+                         "仅 --engine vectorized 生效)")
     ap.add_argument("--warmup-days", type=int, default=365,
                     help="[kernel] 预热天数 (拉取 start 之前的行情供指标就绪)")
     ap.add_argument("--data-cache", default=None,
@@ -334,10 +338,70 @@ def _run_ref(args):
     engine.print_summary()
 
 
+def _run_vectorized(args):
+    """向量化引擎路径 (CuPy 统一 CPU/GPU; 数组算子策略)"""
+    from .core.data import load_bars
+    from .core.vectorized_engine import run_vectorized
+    from .strategies.vectorized_base import get_vectorized_strategy
+
+    strategy_params = _resolve_strategy_params(args.strategy, args.params)
+    strategy = get_vectorized_strategy(args.strategy, params=strategy_params)
+
+    bars = load_bars(args.code, args.start, args.end,
+                     warmup_days=args.warmup_days, cache_dir=args.data_cache)
+    n = len(bars["stime"])
+    print(f"证券: {args.code}  周期: {args.period}  策略日期: {args.start}~{args.end}  "
+          f"预热: {args.warmup_days}天  策略: {args.strategy}  "
+          f"scale={args.scale}  "
+          f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}  "
+          f"引擎: vectorized ({args.device})\n", flush=True)
+
+    import time as _time
+    t0 = _time.perf_counter()
+    buy_pct = args.buy_pct
+    sell_pct = args.sell_pct
+    if args.all_in:
+        buy_pct = max(buy_pct, 1.0)
+        sell_pct = max(sell_pct, 1.0)
+    result = run_vectorized(
+        bars, period=args.period, warmup_until=int(args.start) * 1_000_000,
+        strategy=strategy, params=strategy_params,
+        init_cash=INIT_CASH, init_position=INIT_POSITION,
+        trade_qty=args.trade_qty, scale=args.scale,
+        buy_pct=buy_pct, sell_pct=sell_pct,
+        device=args.device)
+    dt = _time.perf_counter() - t0
+
+    s = result["summary"]
+    for t in s["trades"]:
+        side = "BUY " if t["side"] == "BUY" else "SELL"
+        print(f"        >> {side} {t['qty']:.0f}股 @ {t['price']:.4f}  "
+              f"[{t['ts']}]  剩余资金 {t['cash_after']:.2f}", flush=True)
+
+    print("\n" + "=" * 60)
+    print("回测盈亏汇总 (vectorized)")
+    print("=" * 60)
+    print(f"期末价 (最后一根close) : {s['final_price']:.4f}")
+    print(f"交易次数              : {s['n_trades']} (BUY {s['n_buy']} / SELL {s['n_sell']})")
+    print(f"期初资金 / 期初持仓    : {INIT_CASH:.0f} / {INIT_POSITION:.0f}股")
+    print(f"期末资金 / 期末持仓    : {s['final_cash']:.2f} / {s['final_position']:.0f}股")
+    print(f"期末持仓市值           : {s['final_position'] * s['final_price']:.2f}")
+    print(f"策略总资产 (资金+市值) : {s['final_equity']:.2f}")
+    print(f"不操作基线 (资金+市值) : {s['baseline']:.2f}")
+    print(f"盈亏差额 (策略-基线)   : {s['excess']:+.2f}")
+    print(f"盈亏比例              : {s['excess_pct']:+.2f}%")
+    print(f"年化超额 (择时贡献)   : {s['ann_excess_pct']:+.2f}%/年")
+    print(f"成交额合计            : {s['turnover']:.0f}")
+    print(f"引擎耗时              : {dt * 1000:.1f} ms ({n} 根 1m bar, {args.device})")
+    print("=" * 60)
+
+
 def backtest_main(argv=None):
     args = build_backtest_parser().parse_args(argv)
     if args.engine == "ref":
         _run_ref(args)
+    elif args.engine == "vectorized":
+        _run_vectorized(args)
     else:
         _run_kernel(args)
 
