@@ -1,10 +1,12 @@
 """调度层能力探测 (evtrade.core.capability)
 
-覆盖:
-  - can_run: 在 cpu/gpu 上的能力校验
-  - select_device: auto / cpu / gpu 三种请求的最终 device
-  - gpu_available: 环境探测
-  - DSL 编译期参数校验: render_cuda_device_function 对 n_params > 8 即抛
+DSL/numba/CUDA 已下线. CPU 和 GPU 走同一条 vectorized 路径,
+能力探测只剩两件事:
+  - can_run: DSL 删除后策略永远能跑 (返回 True, "")
+  - select_device: 按 requested + gpu_available 决定 cpu/gpu
+  - gpu_available: 环境探测 (cupy 是否能 import)
+
+策略参数上限不再按设备分化 (DSL 三端投影不存在了)。
 """
 from __future__ import annotations
 
@@ -16,47 +18,35 @@ from evtrade.core.capability import (
     gpu_available,
     select_device,
 )
-from evtrade.strategies.dsl import (
-    CompileError,
-    render_cuda_device_function,
-)
 
 
-def test_target_caps_limits():
-    assert TARGET_CAPS["cpu"]["max_params"] == 16
-    assert TARGET_CAPS["gpu"]["max_params"] == 8
+def test_target_caps_lists_cpu_gpu():
+    """DSL 删除后 TARGET_CAPS 只剩 cpu / gpu 两条 entry, 没有 max_params 限制"""
+    assert set(TARGET_CAPS.keys()) == {"cpu", "gpu"}
+    assert "label" in TARGET_CAPS["cpu"]
+    assert "label" in TARGET_CAPS["gpu"]
+    # DSL 三端投影下线: 不再有 max_params / max_state 字段
+    assert "max_params" not in TARGET_CAPS["cpu"]
+    assert "max_params" not in TARGET_CAPS["gpu"]
 
 
-def test_can_run_cpu_default_strategy():
-    """channel_deviation 默认 4 参数, cpu / gpu 都兼容"""
-    ok, why = can_run("channel_deviation", "cpu")
-    assert ok and why == ""
-    ok, why = can_run("channel_deviation", "gpu")
-    assert ok and why == ""
+def test_can_run_always_true_for_known_strategy():
+    """DSL 删除后, 所有策略在 cpu/gpu 上都兼容"""
+    for dev in ("cpu", "gpu"):
+        ok, why = can_run("channel_deviation", dev)
+        assert ok is True
+        assert why == ""
 
 
-def test_can_run_gpu_rejects_too_many_params(monkeypatch):
-    """注册一个 10 参数的策略, gpu 应拒绝, cpu 应通过"""
-    from evtrade.strategies.base import _STRATEGIES, StrategyBase, register_strategy
-
-    @register_strategy("_cap_test_10p")
-    class _S(StrategyBase):
-        name = "_cap_test_10p"
-        params_spec = {f"p{i}": {"default": 0.0, "type": float} for i in range(10)}
-        state_spec = {}   # DSL 必填字段; capability 测试不依赖持久状态
-
-    try:
-        ok_cpu, _ = can_run("_cap_test_10p", "cpu")
-        ok_gpu, why_gpu = can_run("_cap_test_10p", "gpu")
-        assert ok_cpu is True
-        assert ok_gpu is False
-        assert "10 个参数" in why_gpu
-        assert "_cap_test_10p" in why_gpu
-    finally:
-        _STRATEGIES.pop("_cap_test_10p", None)
+def test_can_run_true_for_arbitrary_name():
+    """DSL 删除后, 即便是未知策略名, can_run 也直接通过
+    (注册校验在 get_strategy 时已经发生, 这里只是设备能力)"""
+    ok, why = can_run("does_not_exist_strategy", "gpu")
+    assert ok is True
+    assert why == ""
 
 
-def test_select_device_cpu_request():
+def test_select_device_cpu_request_returns_cpu():
     assert select_device("channel_deviation", "cpu", gpu_available()) == "cpu"
 
 
@@ -70,74 +60,13 @@ def test_select_device_gpu_request_without_gpu_raises():
         select_device("channel_deviation", "gpu", gpu_available=False)
 
 
-def test_select_device_auto_with_gpu_for_compatible_strategy_returns_gpu():
+def test_select_device_auto_with_gpu_returns_gpu():
+    """auto + 有 gpu -> gpu (不管策略名是什么, DSL 删除后无兼容性差异)"""
     assert select_device("channel_deviation", "auto", gpu_available=True) == "gpu"
+    assert select_device("any_other_strategy", "auto", gpu_available=True) == "gpu"
 
 
-def test_select_device_auto_with_gpu_for_incompatible_strategy_returns_cpu():
-    from evtrade.strategies.base import _STRATEGIES, StrategyBase, register_strategy
-
-    @register_strategy("_cap_test_too_many")
-    class _S(StrategyBase):
-        name = "_cap_test_too_many"
-        params_spec = {f"p{i}": {"default": 0.0, "type": float} for i in range(10)}
-        state_spec = {}   # DSL 必填字段; capability 测试不依赖持久状态
-
-    try:
-        # 即使 gpu_available=True, 策略不兼容也应降级到 cpu
-        assert select_device("_cap_test_too_many", "auto",
-                             gpu_available=True) == "cpu"
-    finally:
-        _STRATEGIES.pop("_cap_test_too_many", None)
-
-
-# ---------- render_cuda_device_function 编译期参数校验 ----------
-
-def _make_cls_with_n_params(n: int):
-    from evtrade.strategies.base import _STRATEGIES, StrategyBase, register_strategy
-
-    name = f"_dsl_cuda_param_test_{n}"
-    spec = {f"p{i}": {"default": 0.0, "type": float} for i in range(n)}
-
-    @register_strategy(name)
-    class _S(StrategyBase):
-        pass
-
-    _S.params_spec = spec
-    _S.state_spec = {}   # DSL 必填字段; 测试用空 (无持久状态)
-
-    def _cleanup():
-        _STRATEGIES.pop(name, None)
-
-    _S._cleanup = staticmethod(_cleanup)  # 让测试 fixture 用
-    return name, _S, _cleanup
-
-
-def test_render_cuda_device_function_rejects_9_params():
-    name, cls, cleanup = _make_cls_with_n_params(9)
-    try:
-        # 必须给 compute_signal 一个合法的 docstring 才能让渲染走通
-        def _sig(self, ctx):
-            return 0
-        _sig.__doc__ = "return 0\n"
-        cls.compute_signal = _sig
-        # 9 参数, 触发 CompileError 而不是到 GPU 运行时才发现
-        with pytest.raises(CompileError, match="超过 CUDA 通用内核上限 8"):
-            render_cuda_device_function(cls)
-    finally:
-        cleanup()
-
-
-def test_render_cuda_device_function_accepts_8_params():
-    name, cls, cleanup = _make_cls_with_n_params(8)
-    try:
-        # 8 参数应通过 (极限内)
-        def _sig(self, ctx):
-            return 0
-        _sig.__doc__ = "return 0\n"
-        cls.compute_signal = _sig
-        out = render_cuda_device_function(cls)
-        assert "p7" in out  # 签名里有 p7
-        assert "p8" not in out  # 签名里没有 p8
-    finally:
-        cleanup()
+def test_gpu_available_returns_bool():
+    """环境探测返回 bool (即使 cupy 不可用也不抛错)"""
+    result = gpu_available()
+    assert isinstance(result, bool)

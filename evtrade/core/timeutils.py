@@ -104,3 +104,65 @@ def daterange(start_ymd: str, end_ymd: str, step_days: int = 7):
         yield (cur.strftime("%Y%m%d") + "000000",
                seg_end_day.strftime("%Y%m%d") + "235959")
         cur = seg_end_day + timedelta(days=1)
+
+
+# ============ 14 位整数时间戳 <-> epoch 秒 (纯整数历法) ============
+# (从 core/kernel.py 迁入; DSL 删除后统一放 timeutils)
+
+def _days_from_civil(y: int, m: int, d: int) -> int:
+    """公历日期 -> 自 1970-01-01 的天数 (Howard Hinnant 算法)"""
+    y = y - (1 if m <= 2 else 0)
+    era = y // 400
+    yoe = y - era * 400                                  # [0, 399]
+    mp = (m + 9) % 12                                    # 3月=0
+    doy = (153 * mp + 2) // 5 + d - 1                    # [0, 365]
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy        # [0, 146096]
+    return era * 146097 + doe - 719468
+
+
+def _civil_from_days(z: int):
+    """自 1970-01-01 的天数 -> 公历日期 (y, m, d)"""
+    z = z + 719468
+    era = z // 146097
+    doe = z - era * 146097                               # [0, 146096]
+    yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+    y = yoe + era * 400
+    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    mp = (5 * doy + 2) // 153
+    d = doy - (153 * mp + 2) // 5 + 1
+    m = mp + (3 if mp < 10 else -9)
+    return y + (1 if m <= 2 else 0), m, d
+
+
+def encoded_to_epoch(t: int) -> int:
+    """YYYYMMDDHHmmss 整数 -> epoch 秒"""
+    y = t // 10000000000
+    mo = (t // 100000000) % 100
+    d = (t // 1000000) % 100
+    h = (t // 10000) % 100
+    mi = (t // 100) % 100
+    s = t % 100
+    return _days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s
+
+
+def epoch_to_encoded(e: int) -> int:
+    """epoch 秒 -> YYYYMMDDHHmmss 整数"""
+    days = e // 86400
+    sod = e % 86400
+    h = sod // 3600
+    mi = (sod % 3600) // 60
+    s = sod % 60
+    y, mo, d = _civil_from_days(days)
+    return ((((y * 100 + mo) * 100 + d) * 100 + h) * 100 + mi) * 100 + s
+
+
+def bucket_ts_encoded(t: int, period_seconds: int) -> int:
+    """合并桶时间戳 (前开后闭, 标注右端点) —— 任意 m/h/d 周期通用 (整数版)。
+
+    与 compute_bucket_general 同式 (字符串版), 给 vectorized 引擎用。
+    """
+    e = encoded_to_epoch(t)
+    e0 = (e // period_seconds) * period_seconds
+    if e == e0:
+        return epoch_to_encoded(e0)
+    return epoch_to_encoded(e0 + period_seconds)

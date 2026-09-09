@@ -1,213 +1,143 @@
-# 14 · 策略 DSL 与三端转译 (2026-09-06; 2026-09-08 同步 state_spec 声明化; 2026-09-09 同步指标 DSL 化)
+# 14 · 统一策略契约 (VectorizedStrategy, 2026-09-09 重写)
 
-> 一份策略主逻辑 (DSL), 三端自动可用: **Python 参考引擎 / numba 流式内核 / CUDA GPU 内核**。
-> 本文说明 DSL 写法、字段契约、三端转译机制与测试锁定。写新策略前必读 11 号文档第 3 节。
+> **本文为 2026-09-09 重构后版本。** 旧的"DSL → 三端转译"章节整体废弃。
 >
-> **2026-09-09 同步 (change `2026-09-09-decouple-indicators-from-framework`)**:
-> 框架层 ctx **不暴露** `up`/`dw` 等指标字段; DSL body 通过白名单内的 `evtrade/indicators/`
-> 增量 API (`ema_push` / `ema_current` / `ema_channel_push` / `ema_channel_current` 等)
-> 自维护指标状态, 三端 (Python exec / numba @njit / CUDA __device__) 渲染路径同时扩展。
-> 详见 §2 白名单扩展 + §3 字段契约修订。
-
-## 1. 为什么做这件事
-
-重构前 (12 号文档) 的状态: `kernel.py._strategy_check` 与 `gpu.py` 的 CUDA 段是
-**手写**的 channel_deviation 策略, 新策略只能走参考引擎 (慢约 500x)。
-策略逻辑因此存在三份拷贝 (参考引擎 / numba / CUDA), 每改一次策略要人工同步三处。
-
-步骤 1~3 (2026-09-06) 的改造: 策略主逻辑写在 `compute_signal` 的 **docstring** 里
-(DSL), 由 `strategies/dsl.py` 的 AST 转译器渲染成三端代码:
-
-| 端 | 渲染入口 | 消费方 |
-|---|---|---|
-| Python | `make_python_runner` (直接 exec, 不重渲染) | 参考引擎 `Engine` (经 `dsl_check`) |
-| numba | `render_numba_state_body` (ctx.X → st.X) | `core/kernel_dsl.py` 特化内核模块 |
-| CUDA | `render_cuda_device_function` (在 `strategies/dsl.py`; ctx.X → 内核名, `__device__` 函数) | `gpu.cuda_sweep_window_generic` (在 `core/gpu.py`) |
-
-物理保证: 同一份 AST → 同一批字面表达式 → 三端浮点路径逐位一致 (bitwise),
-配合 `--fmad=false` 禁止 FMA 合并。
-
-## 2. DSL 白名单
-
-写法约束 (编译期 `CompileError` 拒绝, 见 `dsl._validate`):
-
-- ✅ 算术 `+ - * /`, 比较 `< > <= >= == !=`, 布尔 `and or not`, `if / elif / else`
-- ✅ 常量: 数字 / `True` / `False`; 整数字面量在三端都按 float 语义参与算术
-- ✅ 标量赋值: `ctx.x = v` 与裸名 `x = v` (局部变量, 首赋值前不可读)
-- ✅ `return <int>`: `1` = BUY, `-1` = SELL, `0` = 无信号; **允许提前 return**
-- ✅ **2026-09-09 扩展** 标量函数调用 (DSL 白名单, 三端统一可用):
-  - 基础: `min(a, b)` / `max(a, b)` / `abs(x)`
-  - 指标增量 API (`evtrade/indicators/` 下, @njit 实现, 三端 stub 注入):
-    `ema_push` / `ema_current` / `ema_channel_push` / `ema_channel_current` /
-    `atr_push` / `atr_current` / `rsi_push` / `rsi_current` /
-    `boll_push` / `boll_current` / `sma_push` / `sma_current`
-  - 调用形态: `<fn>(<args>)` 返回值用赋值 `a, b = ema_channel_push(...)`
-    (多返回值仅限指标函数) 或 `v = ema_current(...)`。
-- ❌ 字符串 / 列表 / 字典 / 元组 / 一般函数调用 (除白名单外) / 循环 / 异常 / lambda / f-string
-
-注意: 提前 `return` 在三端语义一致 (CUDA 端靠 `__device__` 函数的函数返回实现),
-但 channel_deviation 保持 **signal 变量形式** (不提前 return), 让本桶的锁存段
-在信号赋值后仍生效 —— 公式与历史实现逐位一致 (test_differential 72 项 bitwise)。
-
-### 2.1 指标函数的三端 stub (2026-09-09)
-
-DSL body 调 `ema_channel_push(...)` 时, 三端渲染器各注入对应实现:
-
-- **Python 端** (`make_python_runner`): 在 `exec` namespace 注入
-  `from evtrade.indicators.ema import ema_channel_push, ema_channel_current`
-- **numba 端** (`render_numba_state_body`): 在函数体顶部插入
-  `from evtrade.indicators.ema import ema_channel_push, ema_channel_current`
-  (`@njit(cache=True)` 已装饰, 第一次调用触发编译; 之后走缓存)
-- **CUDA 端** (`render_cuda_device_function`): 改写为内联 `__device__` 函数
-  (`indicators/ema.py` 内每个 push/current 都有同形 `__device__` 副本, 由
-  `dsl._DSL_CUDA_INDICATOR_FUNCS` 字典映射)
-
-三端实现必须**逐位一致** (同浮点表达式 + 同一初值 seed 公式); 差分测试
-`tests/test_dsl_cuda.py::test_generic_cuda_matches_cpu_channel_deviation` 锁定。
-新增指标需在 `indicators/<name>.py` 同时提供 Python @njit 版 + CUDA `__device__` 版
-+ 写进 `dsl._DSL_NUMBA_RENDERERS` / `dsl._DSL_CUDA_RENDERERS` (两步加, 详见 11 号文档第 5 节)。
-
-## 3. ctx 字段契约 (`dsl.build_ctx_to_kernel_map`, 动态构建)
-
-> **2026-09-08 重构**: 旧的静态常量 `_CTX_TO_KERNEL` 已删除, 改由
-> `dsl.build_ctx_to_kernel_map(strategy_class)` (dsl.py:491-502) 动态构建。
-> 映射来源 = `_FRAMEWORK_CTX_FIELDS` (固定 bar info) + 策略 `state_spec` 字段 + `p0..p15`。
-> **单名空间 identity 映射**: `ctx.<name>` = 内核侧 `<name>` = `state_spec[<name>]`,
-> 旧的 `_bucket_ts → lock_ts` 等改名随 channel_deviation 迁移一并取消 (dsl.py:448-460)。
-> 状态字段来源是策略类 `state_spec`, **框架层无任何 baked-in 字段名**。
+> 一份策略主逻辑 (Python), 两端统一执行: **CPU (numpy) / GPU (cupy)**。
+> 不再有 numba `@njit`、CUDA `__device__` 函数渲染器、AST 白名单、state_spec 三端投影。
+> 性能由 CuPy 高阶封装承担 (cupy.where / cupy.cumsum / cupy.searchsorted 等
+> 映射到 cuBLAS / cuDNN 预编译 kernel, 无需手写 CUDA C99)。
 >
-> **2026-09-09 修订**: 框架字段仅保留行情 (`cur_*`); **不再暴露** `up` / `dw` 等
-> 任何指标字段。指标值由 DSL body 在策略段首部调 `evtrade/indicators/` 增量 API 算得,
-> 通过裸名局部变量 (如 `up`, `dw`) 持有; 跨桶持久化时由策略 `state_spec` 声明
-> 增量状态字段 (如 `up_st` / `dw_st`), DSL body 内调 push 维护。
+> 写新策略前必读 11 号文档第 3 节。
 
-| DSL 写法 | numba 内核 | CUDA device 函数 | 含义 |
-|---|---|---|---|
-| `ctx.p0` .. `ctx.p15` | `st.p0`..`st.p15` | `p0`..`p7` (寄存器) | 策略参数, **按 params_spec 声明顺序** |
-| `ctx.cur_ts` | `st.cur_ts` | `cur_ts` | 当前桶时间戳 (框架字段, 非 state_spec) |
-| `ctx.cur_open/high/low/close/volume` | `st.cur_*` | 同名 | 当前桶运行中 OHLCV (框架字段) |
-| `ctx.low_hit` / `ctx.high_hit` | `st.low_hit` / `st.high_hit` | 同名 | 极端偏离锁存 (**state_spec 声明**) |
-| `ctx.low_acted` / `ctx.high_acted` | `st.low_acted` / `st.high_acted` | 同名 | 本桶已操作锁 (**state_spec 声明**) |
-| `ctx.lock_ts` | `st.lock_ts` | `lock_ts` | 桶切换检测 (≠cur_ts 时重置 *_acted; **state_spec 声明**) |
-| `ctx.up_st` / `ctx.dw_st` | `st.up_st` / `st.dw_st` | 同名 | EMA 通道增量状态 (state_spec 声明; **指标私有**) |
-| `ctx.prev_ts` | `st.prev_ts` | `prev_ts` | 桶切换跟踪 (state_spec 声明; channel_deviation 用) |
-| 裸名 `up` / `dw` 等 | 函数内局部变量 | 函数内局部变量 | **指标当前值**, 由 DSL body 调 `ema_channel_current(...)` 算得 |
-| 其余 `ctx.x` / 裸名 `x` | 局部变量 | 局部变量 (自动声明) | 桶内临时值, 跨桶不保留 |
+## 1. 设计动机 (旧 DSL 痛点)
 
-> 上表中 `low_hit/high_hit/low_acted/high_acted/lock_ts/up_st/dw_st/prev_ts` 是 channel_deviation 的
-> `state_spec` 字段 (channel_deviation.py:77-83), 非框架内置; 换策略后这些字段随之改变。
-> 框架字段 (`cur_*`) 由 dsl_check / kernel step 每根 bar 注入, 不在 state_spec。
-> 框架**不暴露**任何指标字段 (历史曾暴露 `up`/`dw`, 已于 2026-09-09 删除)。
+重构前 (`evtrade/strategies/dsl.py` 907 行 + `core/kernel.py` 889 行 numba
+流式内核 + `core/gpu.py::cuda_sweep_window_generic` NVRTC 编译) 的形态:
 
-CUDA 端参数上限 8 个 (`p0..p7`), numba 端 16 个 (`p0..p15`); 超限在编译/调用期报错。
-**非法引用** (如 CUDA 端用 `ctx.p8`) 在渲染期即被拒绝。
+- 策略主逻辑写在 `compute_signal` 的 **docstring** (DSL body), 由 AST
+  白名单 + 三端渲染器 (Python exec / numba @njit / CUDA C99) 自动转译。
+- 同一份 AST 三端共用, 浮点路径 bitwise 一致 (依赖 `--fmad=false`)。
+- 痛点: AST 白名单维护成本高; 三端语义需手动对齐; numba 编译开销影响冷启动;
+  CUDA 通用 kernel 只支持 ≤8 参数 (字段上限限制); 策略新增一个 `state_spec` 字段
+  要同步改 DSL AST + numba jitclass + CUDA device 三处。
 
-## 4. numba 端: kernel_dsl 按策略特化内核
+本次重构 (2026-09-09, change `2026-09-09-unify-strategy-contract`):
+DSL 渲染管线整体下线。**策略唯一抽象方法 = `compute_signals(xp, bars, params)`**;
+CPU/GPU 两端都是 Python + xp (numpy/cupy) 数组算子, 框架 0 渲染逻辑。
 
-机制 —— **一份内核源, N 个策略特化**:
+## 2. 策略契约 (VectorizedStrategy)
 
-1. `kernel.py` 的 `_strategy_check` 函数体位于
-   `# ==== DSL-STRATEGY-BEGIN/END ====` 标记之间, 是空模板 (占位 `pass`);
-2. `core/kernel_dsl.build_dsl_kernel(name)` 读 kernel.py 源码, 把标记之间的整段
-   函数体替换成该策略 DSL 渲染出的同形代码, `exec` 出一个**独立内核模块**
-   (jitclass / step / run_backtest / summarize 全套; numba 惰性编译, 进程内缓存);
-3. `dsl_kernel(name) = build_dsl_kernel(name)`: 所有 DSL 策略 (含 channel_deviation)
-   走同一渲染路径; 进程内按策略名缓存, 二次调用零额外编译。
+```python
+# evtrade/strategies/vectorized_base.py
+class VectorizedStrategy:
+    params_spec: dict[str, dict] = {}   # 参数 schema 校验
+    strategy_key: str = ""
 
-上层 API:
+    def compute_signals(self, xp, bars: dict, params: dict) -> "xp.ndarray[int8]":
+        """策略唯一入口; 返回 1=BUY / -1=SELL / 0=hold 的桶级信号数组"""
+        raise NotImplementedError
 
-- `make_state_general(name, period, warmup_until, ..., strategy_params)`:
-  按 params_spec 顺序把参数填进 `p0..pN` 构造状态; **无 framework 端 tf1 形参**——
-  `tf1` 等指标周期是策略私有, 由 `strategy_params` 透传 (走 params_spec 声明顺序)。
-- `run_one_dsl(bars, ..., strategy_name, strategy_params)`: 单窗回测,
-  指标口径 = `kernel.summarize`;
-- `strategy_has_dsl(name)`: 是否有可渲染的 DSL (决定 sweep 走哪条路)。
-
-## 5. CUDA 端: 通用 kernel + device 函数
-
-`core/gpu.py::_CUDA_SOURCE_GENERIC_TEMPLATE` = **只含**桶合并/成交/绩效段
-(行情 + 信号 + 账户) + 三个编译期占位符 (gpu.py:320-323 替换);
-**不内嵌**任何指标公式 (旧版曾内嵌 EMA 推入/读出, 2026-09-09 已删除):
-
-- `{STRATEGY_BODY}` — 注入 `render_cuda_device_function` 生成的 `__device__ __forceinline__ int strategy_check(...)`
-  (函数体已包含指标自维护 + 信号判定 + 锁存段; 详见 §2.1 指标函数的三端 stub);
-- `{STATE_DECLS}` — 按 `state_spec` 注入的状态字段寄存器声明 (dsl.py `build_cuda_state_decls`);
-  **框架不预设** `up_st` / `dw_st` 等任何指标字段, 一切来自策略 `state_spec`。
-- `{STRATEGY_STATE_ARGS}` — `strategy_check(...)` 调用处的 state arg 列表 (dsl.py `build_cuda_strategy_check_call`),
-  与 `state_spec` 一一对应。
-
-> **2026-09-08 迁移** (commit `dfd4785`): 上述三个投影函数 (`render_cuda_device_function` /
-> `build_cuda_state_decls` / `build_cuda_strategy_check_call` / `build_cuda_device_header`)
-> 已从 `core/gpu.py` 迁至 **`strategies/dsl.py`**; `gpu.py` 只保留 kernel 源码模板 + 编译 + 调度。
-> 状态字段来源是策略 `state_spec`, 框架无硬编码状态字段 (见第 3 节)。
->
-> **2026-09-09 迁移**: CUDA 模板内的 EMA 推入/读出段已删除; kernel step 与 CUDA
-> `strategy_check` 不再内嵌任何指标公式; 指标状态完全由策略 `state_spec` 声明
-> + DSL body 调 `__device__` 增量 API 维护 (见 §2.1)。
-
-device 函数形态的关键: 状态字段 (low_hit/lock_ts/...) 按**引用**传入可写,
-行情/参数为 const 引用; DSL 的 `return X` 直接成为函数返回 ——
-"提前返回跳过后续语句" 的语义与 Python/numba 完全一致 (内联块做不到)。
-
-调用: `cuda_sweep_window_generic(bars, params_list, warmup_until,
-strategy_name=...)`, 参数矩阵按 params_spec 顺序填充 (一线程一组参数,
-`params_arr[tid * num_params + i]`)。回撤时间戳用 1m bar 的 `stime_arr`
-(与 CPU `peak_eq_ts/valley_ts` 同口径)。
-
-## 6. sweep / CLI 路径选择 (步骤 3)
-
-`sweep()` 对每组参数选路:
-
-| 策略 | device=cpu | device=gpu |
-|---|---|---|
-| **带 DSL** 的策略 (含 channel_deviation) | **DSL 特化内核** `run_one_dsl` | **通用 CUDA kernel** `cuda_sweep_window_generic` |
-| 无 DSL (如 breakout) | 参考引擎 `run_one_general` (兜底) | 同左 |
-
-CLI:
-
-```bash
-# dev_trigger: --grid 直接用 params_spec 里的参数名 (CLI 自动放行)
-python -m evtrade sweep --strategy dev_trigger --synthetic-days 40 \
-    --grid entry_dev=0.5,0.8 --out sweep_dev.csv
-# backtest: DSL 策略走内核路径 (无 DSL 的策略会提示用 --engine ref)
-python -m evtrade backtest --strategy dev_trigger --params "entry_dev:0.5" ...
+    def compute_signals_for_one_bar(self, xp, bar: dict, params: dict) -> int:
+        """framework 包装: 单 bar -> 单元素 xp 数组 -> compute_signals[0]
+        子类可覆写以维护 instance-level FSM (如 channel_deviation 的桶切换累积 EMA)。"""
+        single = {k: xp.asarray([v]) for k, v in bar.items()}
+        return int(self.compute_signals(xp, single, params)[0])
 ```
 
-## 7. 新增 DSL 策略三步法 (抄 `strategies/example_dev_trigger.py`)
+`bars` 契约 (vectorized 引擎传入的桶聚合 dict, 来自 `run_vectorized`):
 
-1. 写 `strategies/my_strategy.py`: `@register_strategy("my_strategy")` +
-   `params_spec` (声明顺序即 p0..pN 顺序) + **`state_spec`** (DSL 必填;
-   schema `{"name": {"type": bool/int/float, "default": 标量}}`; 无持久状态时 `state_spec = {}`;
-   缺声明编译期抛 `CompileError`, 见 12 号文档 2.5 节) +
-   `compute_signal` docstring (DSL) + `check()` 两行样板 (`DSLCtx` + `dsl_check`, 见示例文件);
-2. 在 `strategies/__init__.py` 加一行 `from . import my_strategy`;
-3. 复制 `tests/test_strategy_template.py` 改类名, 再到
-   `tests/test_kernel_dsl.py` 加一条 "kernel vs 参考引擎 bitwise" 测试
-   (抄 `test_dev_trigger_kernel_vs_ref_engine_bitwise`)。
+| 键 | dtype | 说明 |
+|---|---|---|
+| `ts` | int64[N] | 桶右端点 ts (YYYYMMDDHHmmss) |
+| `o` / `h` / `l` / `c` | float64[N] | 桶的 OHLCV |
+| `v` | float64[N] | 桶累计成交量 |
+| `mark` | int8[N] | 1=策略期, 0=预热段 |
+| `n_bars` | int64[N] | 桶内 1m bar 根数 (供调试/统计用) |
 
-写完即可: 参考引擎 / `--engine kernel` / sweep (cpu+gpu) 三端全部生效。
+约定:
+- `xp` 是 `numpy` 或 `cupy` 模块; **策略代码禁止直接 `import numpy` 或 `import cupy`**, 必须通过 `xp` 抽象。
+- 返回数组长度 == `len(bars["ts"])`; 元素 ∈ {-1, 0, 1}。
+- `mark == 0` 桶策略 SHOULD 输出 0; framework 内部再做一次 `sig *= mark` 兜底。
+- 框架层 MUST NOT 在 `bars` 里塞指标键 (无 `up` / `dw` / `low_dev` 等); 指标自维护。
 
-## 8. 测试锁定
+## 3. CPU/GPU 双端统一路径
 
-| 测试 | 锁什么 |
-|---|---|
-| `tests/test_kernel_dsl.py::test_dsl_spliced_channel_deviation_vs_ref_engine_bitwise` | DSL 渲染特化内核 ≡ Python ref 引擎 (信号轨迹, 含倍投; 2026-09 重构后冻结本尊 _strategy_check 已清空, 改与 Python ref 引擎对账) |
-| `tests/test_kernel_dsl.py::test_dev_trigger_kernel_vs_ref_engine_bitwise` | 新策略三端同源: numba 内核 ≡ 参考引擎 |
-| `tests/test_kernel_dsl.py::test_run_one_dsl_channel_deviation_matches_run_one` | 通用入口 ≡ 冻结 `run_one` |
-| `tests/test_dsl_cuda.py` | 渲染产物结构 (ctx 剥离 / 状态映射 / 局部声明 / 溢出拒绝) |
-| `tests/test_dsl_cuda.py::test_generic_cuda_matches_cpu_*` | 通用 CUDA kernel ≡ CPU DSL 内核 (全指标逐位, GPU 可用时) |
-| `tests/test_dsl_cuda.py::test_sweep_gpu_generic_dev_trigger` | sweep GPU 通用路径 ≡ CPU 路径 |
-| `tests/test_strategy_params.py::test_sweep_dev_trigger_uses_kernel_path` | sweep DSL 策略走内核路径且与 `run_one_dsl` 对账 |
+```
+run_vectorized(bars_1m, period, warmup_until,
+               strategy=VectorizedStrategy, params, ..., device)
+├─ xp = evtrade.backends.get_xp(device)              # "cpu"→numpy / "gpu"→cupy
+├─ buckets = _aggregate_buckets_xp(xp, bars_1m, ...) # 向量化桶聚合
+├─ sig = strategy.compute_signals(xp, buckets, params)
+├─ sig = sig * buckets["mark"]                       # 预热段清0
+└─ trades / summary = metrics 顺序执行
+```
 
-## 9. 已知边界
+`Engine.on_bars` (实盘/对账路径) 调 `strategy.compute_signals_for_one_bar(xp, cur, params)`;
+桶切换时用上一桶 finalized OHLCV 驱动一次 (见 kbs/09)。
 
-- 持久状态字段由策略类 `state_spec` 声明 (第 3 节); 需要新状态字段 (如自有锁存/计数器) 时,
-  只需在策略类 `state_spec` 加一行 (schema `{"name": {"type": bool/int/float, "default": 标量}}`),
-  框架自动投影到 numba jitclass / CUDA device 函数 / Python ctx, **无需改内核** (见 12 号文档 2.5 节);
-- breakout (滚动窗口型) 需要 O(N) 窗口状态, DSL 契约装不下, 保持参考引擎路径;
-- CUDA device 函数签名的局部变量类型按字面推断 (纯整数字面量 → int, 其余 →
-  double); 策略里不要用与内核字段同名的局部变量名;
-- GPU 一律走通用 kernel (`cuda_sweep_window_generic`), 所有 DSL 策略 (含
-  channel_deviation) 同路径; 旧 `cuda_sweep_window` 顶层 shim 已删除 (channel_deviation
-  旧 API 的顶层 low1..high2 现在直接装入 params dict 即可)。回撤时间戳用 1m bar stime,
-  与 CPU `kernel.step` 同口径。旧冻结模板 (`_CUDA_SOURCE`, 桶 ts 口径) 已移除。
+## 4. 指标 (evtrade.indicators)
+
+`evtrade/indicators/{ema,atr,rsi,boll}.py` 全部重写为**纯 xp 版 + 纯 Python 增量版**:
+
+| 形态 | 函数 | 用途 |
+|---|---|---|
+| 批量 (xp) | `xp_ema(xp, values, p)` | `compute_signals` 主体使用 |
+| 批量 (xp) | `xp_ema_channel(xp, h, l, p)` | 通道策略 |
+| 增量 (纯 Python, 标量 in/out) | `ema_push / ema_current` | `compute_signals_for_one_bar` 覆写 |
+| 增量 (纯 Python, 6 标量) | `ema_channel_push / ema_channel_current` | 通道逐 bar |
+
+- 文件无 `@njit`、无 `CUDA_DEVICE_*` 字符串常量、无 `numba` import。
+- 表达式与浮点路径与原 numba 版逐位一致 (同一份 k=2/(p+1) SMA seed + 递推)。
+- `pyproject.toml` 已删 `numba` 依赖。
+
+## 5. 策略示例 (channel_deviation)
+
+混合策略 = **xp 数组算子 (EMA 通道 + 偏离) + Python FSM (锁存/桶切换)**:
+- `compute_signals`: xp 算 up/dw + 4 个偏离; Python 循环跑 FSM
+- `compute_signals_for_one_bar`: 覆写, 维护 instance `_up_st / _dw_st / _fsm` 增量 EMA
+
+`ma_crossover` (纯数组算子, 无 FSM):
+```python
+class MACrossoverStrategy(VectorizedStrategy):
+    def compute_signals(self, xp, bars, params):
+        fast = int(params["fast"]); slow = int(params["slow"])
+        ema_fast = xp_ema(xp, bars["c"], fast)
+        ema_slow = xp_ema(xp, bars["c"], slow)
+        diff = ema_fast - ema_slow
+        sig = xp.where(diff > 0, xp.int8(1), xp.int8(0))
+        sig = xp.where(diff < 0, xp.int8(-1), sig)
+        return sig
+```
+
+## 6. 与旧 DSL 的对比
+
+| 维度 | 旧 DSL (2026-09-08) | 统一契约 (2026-09-09) |
+|---|---|---|
+| 策略写法 | docstring DSL body | Python class 覆写 `compute_signals` |
+| 持久状态声明 | `state_spec` (DSL AST 白名单) | 实例字段 (Python 属性) |
+| 渲染层 | Python exec + numba @njit + CUDA C99 | 无 (Python + xp) |
+| 性能路径 | numba (CPU 7000+ bar/s) / CUDA | numpy (CPU) / cupy (GPU) |
+| 指标调用 | DSL 白名单 + 三端 stub | 普通 Python 函数 (xp 兼容) |
+| 参数上限 | CUDA 通用 kernel 限 8 字段 | 无上限 |
+| 三端一致性 | bitwise (依赖 --fmad=false) | 浮点路径 (xp 算子) |
+| `params_spec` 校验 | DSL 编译期 | `_resolve_params` 实例化时 |
+
+## 7. 写新策略的步骤
+
+1. 复制 `tests/test_strategy_template.py` 改 class 名 + 注册 key。
+2. `compute_signals(xp, bars, params)` 内用 `xp_ema / xp_atr / xp_rsi / ...` 算子
+   (见 evtrade.indicators); 无需 import numpy/cupy, 直接用 `xp`。
+3. 需要逐 bar 路径 (Engine.on_bars) 维护 instance 状态? 覆写 `compute_signals_for_one_bar`,
+   用增量 API (`ema_push / ema_current / ...`)。
+4. 测试: `tests/test_strategy_unified.py` 提供 6 项锁定 (子类/注册表/dtype/cpu-vs-gpu/
+   vectorized-vs-Engine reconcile/16 字段 metrics); 复制其中子集即可。
+
+## 8. 跨文档索引
+
+- kbs/02 §2 — 统一路径分层 (CPU 向量化 + Engine 逐 bar)
+- kbs/05 — 指标纯 xp 版 + 纯 Python 增量版实现
+- kbs/06 §5 — 策略主逻辑写法 (channel_deviation / ma_crossover 双范式)
+- kbs/09 §2 — `Engine.on_bars` 桶 CLOSE 语义 (桶切换时驱动)
+- kbs/11 §3 — 新策略开发模板
+- kbs/12 — 重构与性能内核 (旧 numba/CUDA 段已废)
+- spec.md — `Strategy interface contract` + `Indicators are private to strategies`

@@ -70,7 +70,6 @@ def test_sweep_with_two_windows_returns_train_and_test():
 def test_sweep_does_not_crash_when_one_combo_fails():
     """流式收集时, 任一 (wi, ci) 抛异常应当立即 re-raise, 不让其它先完成的结果被吞"""
     from evtrade.core import sweep as sweep_mod
-    from evtrade.core.sweep import run_one_general
 
     bars = _make_bars(64)
     base = {"start": "20260101", "period": "5m", "trade_qty": 10000.0,
@@ -78,30 +77,31 @@ def test_sweep_does_not_crash_when_one_combo_fails():
     combos = [
         {"period": "5m", "init_cash": 200000.0, "init_position": 200000.0,
          "trade_qty": 10000.0, "tf1": 21,
-         "params": {"low1": 1.5, "low2": 1.0, "high1": 1.5, "high2": 0.5}},
+         "low1": 1.5, "low2": 1.0, "high1": 1.5, "high2": 0.5},
         {"period": "5m", "init_cash": 200000.0, "init_position": 200000.0,
          "trade_qty": 10000.0, "tf1": 21,
-         "params": {"low1": 2.5, "low2": 1.5, "high1": 2.0, "high2": 1.0}},
+         "low1": 2.5, "low2": 1.5, "high1": 2.0, "high2": 1.0},
     ]
 
-    # 注入 run_one_dsl 副作用: 让第二个 (wi=0, ci=1) 抛异常
-    # (channel_deviation 路径已统一走 run_one_dsl, 不再经 _run_window)
+    # 注入 run_one_vectorized 副作用: 让第二个 (wi=0, ci=1) 抛异常
     import unittest.mock
-    real = sweep_mod.run_one_dsl
+    real = sweep_mod.run_one_vectorized
     calls = {"n": 0}
 
-    def flaky(bars, period, warmup_until, init_cash, init_position, trade_qty,
-              tf1=21, scale=1.0, buy_pct=0.0, sell_pct=0.0, all_in=False,
-              strategy_name="channel_deviation", strategy_params=None):
+    def flaky(bars, period, warmup_until, strategy_name,
+              strategy_params=None,
+              init_cash=200000.0, init_position=200000.0, trade_qty=10000.0,
+              scale=1.0, buy_pct=0.0, sell_pct=0.0, device="cpu"):
         calls["n"] += 1
         if calls["n"] == 2:
             raise RuntimeError("simulated combo failure")
-        return real(bars, period, warmup_until, init_cash, init_position,
-                    trade_qty, tf1=tf1, scale=scale, buy_pct=buy_pct,
-                    sell_pct=sell_pct, all_in=all_in,
-                    strategy_name=strategy_name, strategy_params=strategy_params)
+        return real(bars, period, warmup_until, strategy_name,
+                    strategy_params=strategy_params,
+                    init_cash=init_cash, init_position=init_position,
+                    trade_qty=trade_qty, scale=scale,
+                    buy_pct=buy_pct, sell_pct=sell_pct, device=device)
 
-    with unittest.mock.patch.object(sweep_mod, "run_one_dsl", flaky):
+    with unittest.mock.patch.object(sweep_mod, "run_one_vectorized", flaky):
         with __import__("pytest").raises(RuntimeError, match="simulated combo failure"):
             sweep_mod.sweep(bars, base, combos, split_ymd=None, n_workers=2,
                             device="cpu", strategy_name="channel_deviation",

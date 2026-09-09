@@ -1,14 +1,11 @@
 from __future__ import annotations
 """向量化引擎 (CuPy 统一 CPU/GPU 路径)
 
-================================================================
-✅  可改层 (core 主调度)  ✅
-================================================================
-第三条执行路径, 与 Engine (ref 逐 bar) / kernel (DSL numba) 并存:
-  - 桶聚合: 向量化 (xp.reduceat / searchsorted), GPU 加速显著
+唯一执行路径 (DSL/ref 引擎已下线):
+  - 桶聚合: 向量化 (xp 算子), GPU 加速显著
   - 信号:   策略 compute_signals(xp, ...) 纯数组算子
   - 成交:   顺序 Python 循环 (cash/position 累积依赖; 先保证正确)
-  - 汇总:   与 kernel.summarize 同口径
+  - 汇总:   metrics.summarize (16 字段, 含 equity_curve)
 
 device="cpu" -> xp=numpy; device="gpu" -> xp=cupy。
 策略代码一份, framework 0 渲染逻辑。
@@ -18,7 +15,14 @@ import numpy as np
 
 from ..backends import get_xp
 from .gpu import precompute_ts_mark
-from .kernel import encoded_to_epoch, resolve_period_seconds
+from .metrics import summarize as _summarize_full
+
+
+# ============ helpers ============
+
+def _to_host(arr):
+    """xp 数组 -> numpy (cupy 拉回 host; numpy 原样)"""
+    return arr.get() if hasattr(arr, "get") else np.asarray(arr)
 
 
 # ============ 桶聚合 (向量化; xp=np|cp) ============
@@ -35,7 +39,7 @@ def _aggregate_buckets_xp(xp, bars_1m: dict, period: str, warmup_until: int) -> 
     stime = bars_1m["stime"]
     # precompute_ts_mark 接受 numpy stime (14 位整数); 返回 (ts int64[n], mark int8[n])
     # GPU 路径下先把 stime 拉到 device
-    stime_np = stime.get() if hasattr(stime, "get") else stime
+    stime_np = _to_host(stime)
     ts_1m_np, mark_1m_np = precompute_ts_mark(
         {"stime": stime_np}, period, warmup_until)
     # 搬到 xp (cupy 时上 device)
@@ -63,7 +67,8 @@ def _aggregate_buckets_xp(xp, bars_1m: dict, period: str, warmup_until: int) -> 
     c_b = c_1m[last_idx]
     v_b = _reduceat_sum(xp, v_1m, first_idx)
     n_bars = xp.diff(xp.concatenate([first_idx, xp.array([n], dtype=first_idx.dtype)]))
-    mark_b = mark_1m[last_idx]
+    # mark 取桶首根 1m bar 的标记 (与 Engine.on_bars 仅在桶首触发语义对齐)
+    mark_b = mark_1m[first_idx]
 
     return {"ts": ts_b, "o": o_b, "h": h_b, "l": l_b, "c": c_b, "v": v_b,
             "mark": mark_b, "n_bars": n_bars}
@@ -110,7 +115,8 @@ def _execute_trades(sig_np: np.ndarray, close_np: np.ndarray, ts_np: np.ndarray,
                     scale: float, buy_pct: float, sell_pct: float):
     """顺序遍历信号数组, 模拟成交 (与 SimulatedExecutor.trade + Account.apply 同式)
 
-    sig_np / close_np / ts_np 已拉回 host (numpy)。返回 trades list + 终态。
+    sig_np / close_np / ts_np 已拉回 host (numpy)。
+    返回: 终态 dict + equity_curve + baseline_curve (供 metrics.summarize 用)。
     """
     cash = init_cash
     position = init_position
@@ -123,13 +129,28 @@ def _execute_trades(sig_np: np.ndarray, close_np: np.ndarray, ts_np: np.ndarray,
     turnover = 0.0
     last_price = 0.0
 
-    all_in = buy_pct >= 1.0 and sell_pct >= 1.0
+    n = len(sig_np)
+    equity_curve = np.empty(n, dtype=np.float64)
+    baseline_curve = np.empty(n, dtype=np.float64)
+    running_max = -np.inf
+    max_dd = 0.0
 
-    for i in range(len(sig_np)):
+    for i in range(n):
+        price = float(close_np[i])
+        # baseline = init_cash + init_position * price (持仓按当前 close 估值)
+        baseline_curve[i] = init_cash + init_position * price
+        equity_curve[i] = cash + position * price
+
+        # 逐 bar 跟踪 max_drawdown (在 equity 收盘时点)
+        if equity_curve[i] > running_max:
+            running_max = equity_curve[i]
+        dd = equity_curve[i] - running_max
+        if dd < max_dd:
+            max_dd = dd
+
         s = int(sig_np[i])
         if s == 0:
             continue
-        price = float(close_np[i])
         ts = int(ts_np[i])
         last_price = price
 
@@ -173,44 +194,43 @@ def _execute_trades(sig_np: np.ndarray, close_np: np.ndarray, ts_np: np.ndarray,
 
     return {"cash": cash, "position": position, "last_price": last_price,
             "n_trades": n_trades, "n_buy": n_buy, "n_sell": n_sell,
-            "turnover": turnover, "trades": trades}
+            "turnover": turnover, "trades": trades,
+            "max_drawdown": -max_dd if max_dd < 0.0 else 0.0,
+            "equity_curve": equity_curve,
+            "baseline_curve": baseline_curve}
 
 
-# ============ 汇总 (与 kernel.summarize 同口径) ============
+# ============ 汇总 (metrics.summarize 16 字段) ============
 
 def _summarize(exec_state: dict, init_cash: float, init_position: float,
                first_ts: int, last_ts: int) -> dict:
-    """终态 -> 绩效字典 (口径与 kernel.summarize 一致; 子集)"""
+    """终态 + equity 序列 -> 绩效字典 (16 字段, 由 metrics.summarize 算)"""
+    eq = exec_state.get("equity_curve")
+    bl = exec_state.get("baseline_curve")
+    last_price = exec_state.get("last_price", 0.0)
     cash = exec_state["cash"]
     position = exec_state["position"]
-    last_price = exec_state["last_price"]
-    baseline = init_cash + init_position * last_price
-    equity = cash + position * last_price
-    diff = equity - baseline
-    pct = (diff / baseline * 100) if baseline else 0.0
 
-    years = 0.0
-    if first_ts and last_ts > first_ts:
-        years = ((encoded_to_epoch(last_ts) - encoded_to_epoch(first_ts))
-                 / (365.25 * 86400.0))
-    ann_excess_pct = (pct / years) if years > 0 else 0.0
-
-    return {
-        "final_price": last_price,
-        "n_trades": exec_state["n_trades"],
-        "n_buy": exec_state["n_buy"],
-        "n_sell": exec_state["n_sell"],
-        "final_cash": cash,
-        "final_position": position,
-        "final_equity": equity,
-        "baseline": baseline,
-        "excess": diff,
-        "excess_pct": pct,
-        "years": years,
-        "ann_excess_pct": ann_excess_pct,
-        "turnover": exec_state["turnover"],
-        "trades": exec_state["trades"],
-    }
+    summary = _summarize_full(
+        final_state={
+            "cash": cash,
+            "position": position,
+            "last_price": last_price,
+            "n_trades": exec_state["n_trades"],
+            "n_buy": exec_state["n_buy"],
+            "n_sell": exec_state["n_sell"],
+            "turnover": exec_state["turnover"],
+            "max_drawdown": exec_state.get("max_drawdown", 0.0),
+        },
+        init_cash=init_cash,
+        init_position=init_position,
+        equity_curve=eq,
+        baseline_curve=bl,
+        first_ts=first_ts,
+        last_ts=last_ts,
+    )
+    summary["trades"] = exec_state["trades"]
+    return summary
 
 
 # ============ 主入口 ============
@@ -239,14 +259,11 @@ def run_vectorized(bars_1m: dict, period: str, warmup_until: int,
     sig = xp.asarray(sig, dtype=xp.int8)
 
     # 3) 成交 (拉回 host 顺序执行; 正确性优先)
-    sig_np = sig.get() if hasattr(sig, "get") else np.asarray(sig)
-    close_np = (buckets["c"].get() if hasattr(buckets["c"], "get")
-                else np.asarray(buckets["c"]))
-    ts_np = (buckets["ts"].get() if hasattr(buckets["ts"], "get")
-             else np.asarray(buckets["ts"]))
+    sig_np = _to_host(sig)
+    close_np = _to_host(buckets["c"])
+    ts_np = _to_host(buckets["ts"])
     # 只在策略期 (mark=1) 成交; mark 也拉回
-    mark_np = (buckets["mark"].get() if hasattr(buckets["mark"], "get")
-               else np.asarray(buckets["mark"]))
+    mark_np = _to_host(buckets["mark"])
 
     # 预热段信号清零 (mark=0 的桶不应成交)
     sig_np = sig_np * mark_np
@@ -262,7 +279,8 @@ def run_vectorized(bars_1m: dict, period: str, warmup_until: int,
 
     summary = _summarize(exec_state, init_cash, init_position, first_ts, last_ts)
 
-    return {"sig": sig_np, "trades": exec_state["trades"],
-            "summary": summary, "buckets": {
-                k: (v.get() if hasattr(v, "get") else np.asarray(v))
-                for k, v in buckets.items()}}
+    # sig 只保留 mark=1 的桶 (与 Engine.bucket_signals 同形: 预热段不进 sig)
+    sig_live = sig_np[mark_np == 1]
+
+    return {"sig": sig_live, "trades": exec_state["trades"],
+            "summary": summary, "buckets": {k: _to_host(v) for k, v in buckets.items()}}

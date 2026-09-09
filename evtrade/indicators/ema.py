@@ -1,22 +1,27 @@
 from __future__ import annotations
-"""EMA / EMAChannel 指标 (纯函数批量 + @njit 增量版; DSL 三端可调)
+"""EMA / EMAChannel 指标 (纯 xp 版 + 纯 Python 增量版)
 
 ================================================================
 ✅  可改层 (indicators 子包)  ✅
 ================================================================
 两种形态:
-  1. 纯函数版 (ema, ema_channel): 一次性批量算整段序列, 用于复盘 / jupyter / 单元测试
-  2. @njit 增量版 (ema_push, ema_current, ema_channel_push, ema_channel_current):
-     逐根 O(1) 维护增量状态, 供 DSL body (三端: Python exec / numba @njit / CUDA __device__)
-     在策略内部调; 浮点表达式与原 _ema_push / _ema_current 逐位一致。
+  1. 纯 xp 版 (xp_ema, xp_ema_channel): 一次性批量算整段序列,
+     接受 xp (numpy|cupy) 模块; 用于 compute_signals(xp, ...) 主体。
+  2. 纯 Python 增量版 (ema_push, ema_current, ema_channel_push,
+     ema_channel_current): 逐根 O(1) 维护增量 state, 供
+     compute_signals_for_one_bar (Engine.on_bars) 逐 bar 路径调用;
+     返回值与浮点表达式与批量版逐位一致。
 
-@njit 增量 API 形式 (DSL 可调):
+@njit / CUDA __device__ 渲染器已下线 (DSL 整体废弃); 本文件不依赖 numba。
+
+@Python 增量 API (Engine 路径调用):
   - ema_push(s_sum, s_count, s_ema, value, p) -> (s_sum', s_count', s_ema')
   - ema_current(s_sum, s_count, s_ema, pending, p) -> float
   - ema_channel_push(us, uc, ue, ds, dc, de, h, l, p) -> (us', uc', ue', ds', dc', de')
   - ema_channel_current(us, uc, ue, ds, dc, de, h, l, p) -> (up, dw)
 
-state 三标量拆开传入 (无 tuple 字段; 兼容 numba jitclass 标量字段约束):
+state 三标量拆开传入 (无 tuple 字段; 与旧 numba jitclass 字段约定一致,
+  refactor 后唯一来源即此处):
   - count < p: 累加 sum; ema 仍为 0.0
   - count == p: ema = sum / p  (SMA seed)
   - count > p: ema = value*k + ema*(1-k) (Wilder EMA 递推)
@@ -24,54 +29,38 @@ ema_current 返回:
   - count < p-1: 0.0 (未就绪)
   - count == p-1: (sum + pending) / p  (凑齐 p 个 -> SMA seed)
   - count >= p: pending*k + ema*(1-k) (递推一次)
-
-新增/调整指标的扩展办法详见 kbs/11 §5 (DSL 增量 API + 白名单)。
 """
-from typing import Sequence
-
-from numba import njit
+import numpy as np
 
 
-# ============ 纯函数版 (复盘 / jupyter 友好) ============
+# ============ 纯 xp 版 (compute_signals 主体调用) ============
 
-def ema(values: Sequence[float], p: int) -> list[float | None]:
-    """EMA(values, p): 输入长度 >= p 时返回完整序列 (前 p-1 个为 None, 之后为递推值)
+def xp_ema(xp, values, p: int):
+    """EMA 批量版 (xp 兼容); 前 p-1 根 NaN, 之后递推。
 
-    SMA seed = 前 p 个均值; 之后 EMA_t = price * k + EMA_{t-1} * (1-k), k = 2/(p+1)
-
-    返回长度 == len(values); len(values) < p 时全部为 None。
+    SMA seed = 前 p 个均值; EMA_t = value*k + EMA_{t-1}*(1-k), k=2/(p+1)。
     """
     n = len(values)
-    out: list[float | None] = [None] * n
+    out = xp.full(n, xp.nan, dtype=xp.float64)
     if n < p:
         return out
     k = 2.0 / (p + 1.0)
-    seed = sum(values[:p]) / p
+    seed = xp.sum(values[:p]) / p
     out[p - 1] = seed
-    e = seed
+    e = float(seed)
     for i in range(p, n):
-        v = values[i]
-        e = v * k + e * (1.0 - k)
+        e = float(values[i]) * k + e * (1.0 - k)
         out[i] = e
     return out
 
 
-def ema_channel(highs: Sequence[float], lows: Sequence[float], p: int) -> tuple[list[float | None], list[float | None]]:
-    """通达信蓝通道轨: 上轨 = EMA(H, p), 下轨 = EMA(L, p)"""
-    return ema(highs, p), ema(lows, p)
+def xp_ema_channel(xp, highs, lows, p: int):
+    """EMA 通道: 上轨 = EMA(H, p), 下轨 = EMA(L, p)"""
+    return xp_ema(xp, highs, p), xp_ema(xp, lows, p)
 
 
-# ============ @njit 增量版 (DSL 三端可调) ============
-# 浮点表达式与原 core/kernel._ema_push / _ema_current 逐位一致, 差分测试锁定
-# (tests/test_differential.py::test_differential + tests/test_kernel_unit.py::test_ema_push_bitwise)。
-# 配套 CUDA __device__ 版本见本文件末尾 (DSL CUDA 渲染器直接内联到 gpu kernel 模板)。
-#
-# 设计要点: state 三标量 (sum/count/ema) 拆开传入传出, 不传 tuple; 这样:
-#   - numba jitclass 字段是 3 个独立标量 (兼容 jitclass 类型约束)
-#   - DSL body 用 Python 多元赋值 `a, b, c = ema_push(a, b, c, v, p)` 自然调
-#   - CUDA 端多元赋值展开为多语句 (device function 改用 in + ref out)
+# ============ 纯 Python 增量版 (Engine.on_bars 路径) ============
 
-@njit(cache=True)
 def ema_push(s_sum, s_count, s_ema, value, p):
     """EMA 增量推入: state=(s_sum, s_count, s_ema) 三标量, 返回新 (sum', count', ema')
 
@@ -90,7 +79,6 @@ def ema_push(s_sum, s_count, s_ema, value, p):
     return s_sum, s_count, s_ema
 
 
-@njit(cache=True)
 def ema_current(s_sum, s_count, s_ema, pending, p):
     """EMA 当前值 (不改 state); 数据不足返回 0.0
 
@@ -105,7 +93,6 @@ def ema_current(s_sum, s_count, s_ema, pending, p):
     return pending * k + s_ema * (1.0 - k)
 
 
-@njit(cache=True)
 def ema_channel_push(us, uc, ue, ds, dc, de, h, l, p):
     """EMA 通道增量推入: up_st 推 h, dw_st 推 l; 返回 6 标量新 state"""
     us, uc, ue = ema_push(us, uc, ue, h, p)
@@ -113,60 +100,34 @@ def ema_channel_push(us, uc, ue, ds, dc, de, h, l, p):
     return us, uc, ue, ds, dc, de
 
 
-@njit(cache=True)
 def ema_channel_current(us, uc, ue, ds, dc, de, h, l, p):
     """EMA 通道当前值: 算得 (up, dw) 当前轨, O(1)"""
     return ema_current(us, uc, ue, h, p), ema_current(ds, dc, de, l, p)
 
 
-# ============ CUDA __device__ 源码 (DSL CUDA 渲染器内联到 gpu kernel 模板) ============
-# CUDA 端: device function 返回 struct (因 C++ 没有 Python tuple unpack 语法);
-# DSL 多元赋值 (`a, b, c = func(...)`) 在 CUDA 端展开为
-# 临时变量 (struct) + 多次赋值 (auto _t = func(...); a = _t.f0; b = _t.f1; c = _t.f2;)
-# 浮点表达式与上面 @njit 版逐字一致 (k = 2.0 / (p + 1.0); sum/p; v*k + e*(1-k))。
+# ============ 纯函数版 (jupyter / 复盘, 返 ndarray) ============
 
-CUDA_DEVICE_EMA_PUSH = r"""
-// __device__ ema_push (in: s_sum, s_count, s_ema, value, p) -> EMAStateRet
-// 表达式与 evtrade.indicators.ema.ema_push 逐字一致
-struct EMAStateRet { double sum; long long count; double ema; };
-__device__ __forceinline__ EMAStateRet ema_push(double s_sum, long long s_count, double s_ema,
-                                                  double value, long long p) {
-    EMAStateRet r;
-    if (s_count < p) {
-        r.sum = s_sum + value;
-        r.count = s_count + 1;
-        r.ema = (r.count == p) ? (r.sum / (double)p) : s_ema;
-    } else {
-        double k = 2.0 / ((double)p + 1.0);
-        r.sum = s_sum;
-        r.count = s_count + 1;
-        r.ema = value * k + s_ema * (1.0 - k);
-    }
-    return r;
-}
-"""
+def ema(values, p: int):
+    """EMA(values, p): 输入长度 >= p 时返回完整 ndarray (前 p-1 个为 NaN, 之后为递推值)
 
-CUDA_DEVICE_EMA_CHANNEL_PUSH = r"""
-// __device__ ema_channel_push (in: us, uc, ue, ds, dc, de, h, l, p) -> EMAChannelRet
-struct EMAChannelRet { EMAStateRet up; EMAStateRet dw; };
-__device__ __forceinline__ EMAChannelRet ema_channel_push(double us, long long uc, double ue,
-                                                            double ds, long long dc, double de,
-                                                            double h, double l, long long p) {
-    EMAChannelRet r;
-    r.up = ema_push(us, uc, ue, h, p);
-    r.dw = ema_push(ds, dc, de, l, p);
-    return r;
-}
-"""
+    SMA seed = 前 p 个均值; 之后 EMA_t = value * k + EMA_{t-1} * (1-k), k = 2/(p+1)
 
-CUDA_DEVICE_EMA_CURRENT = r"""
-// __device__ ema_current (in: state + pending, p) -> ema_now (0.0 if not ready)
-// 表达式与 evtrade.indicators.ema.ema_current 逐字一致
-__device__ __forceinline__ double ema_current(double s_sum, long long s_count, double s_ema,
-                                                double pending, long long p) {
-    if (s_count < p - 1) return 0.0;
-    if (s_count == p - 1) return (s_sum + pending) / (double)p;
-    double k = 2.0 / ((double)p + 1.0);
-    return pending * k + s_ema * (1.0 - k);
-}
-"""
+    返回长度 == len(values); len(values) < p 时全部为 NaN。
+    """
+    n = len(values)
+    out = np.full(n, np.nan, dtype=np.float64)
+    if n < p:
+        return out
+    k = 2.0 / (p + 1.0)
+    seed = np.sum(values[:p]) / p
+    out[p - 1] = seed
+    e = float(seed)
+    for i in range(p, n):
+        e = float(values[i]) * k + e * (1.0 - k)
+        out[i] = e
+    return out
+
+
+def ema_channel(highs, lows, p: int):
+    """EMA 通道 (numpy): 上轨 = EMA(H, p), 下轨 = EMA(L, p)"""
+    return ema(highs, p), ema(lows, p)

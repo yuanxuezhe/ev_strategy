@@ -1,17 +1,16 @@
 [project]
 name = "evtrade"
 version = "0.1.0"
-description = "evtrade: 策略回测 / 参数扫描 / 行情回放 (DSL 三端转译: Python + numba + CUDA)"
+description = "evtrade: 策略回测 / 参数扫描 / 行情回放 (CPU + GPU 统一向量化路径, 基于 VectorizedStrategy + xp 算子)"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "Proprietary" }
 authors = [{ name = "evtrade" }]
-keywords = ["backtest", "quant", "sweep", "dsl", "numba", "cuda"]
+keywords = ["backtest", "quant", "sweep", "vectorized", "cupy", "xp", "walk-forward"]
 
 # 运行依赖 (cupy 列为可选 extra, GPU 机器才装)
 dependencies = [
     "numpy>=1.20",
-    "numba>=0.56",
     "pandas>=1.3",
     "sqlalchemy>=1.4",
     "pymysql>=1.0",

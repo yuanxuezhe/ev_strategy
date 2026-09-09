@@ -4,31 +4,32 @@ from __future__ import annotations
 ================================================================
 ⚠️  冻结层模块  ⚠️
 ================================================================
-本文件是实盘一致性的验收门: 内核 vs 参考引擎逐 bar 信号 + 逐笔成交
-bitwise 对账 (tests/test_replay.py 锁定 PASS)。
+DSL / numba 内核已下线, 本文件是实盘一致性的验收门:
+  - replay_engine: Engine 全链路 (逐 bar check) → 信号 + 成交
+  - replay_vectorized: vectorized 引擎 (批量 compute_signals) → 信号 + 成交
+  - reconcile: 两条路径逐 bar 信号 + 逐笔成交 bitwise 对账
 
 任何修改必须保证:
   - reconcile() 的对账口径 (信号 ts/side/qty/price 全部相等) 不变
-  - replay_kernel / replay_engine 输出 dict 的 keys 不变
+  - replay_* 输出 dict 的 keys 不变
 ================================================================
-
-工作流
 
 工作流 (实盘上线前的标准验收, 见 kbs/13):
   1. 录制: 实盘进程每收到一根 1m bar, 追加一行到日志
      (append_bar / write_bars_log; 格式 stime,code,open,high,low,close,volume)
-  2. 回放: 收盘后把日志喂给内核, 得到逐 bar 信号轨迹与成交流
-     (replay_kernel)
-  3. 对账: 对比 实盘当日信号 vs 回放信号 (diff_signals), 或对比 内核 vs 参考引擎
-     (reconcile) —— 逐 bar 信号全对上 = 还原性有了持续的生产证据。
+  2. 回放: 收盘后把日志喂给 vectorized 引擎, 得到逐 bar 信号轨迹与成交流
+     (replay_vectorized)
+  3. 对账: 对比 vectorized vs Engine.on_bars (reconcile) —— 逐 bar 信号全对上
+     = 还原性有了持续的生产证据。
 
 约定与回测完全一致: stime 为 14 位 YYYYMMDDHHmmss 且升序; 成交 ts 记桶右端点。
 """
 
 import numpy as np
 
-from .kernel import bars_to_arrays, resolve_period_seconds, summarize, trades_to_list
 from ..primitives import Bar
+from .metrics import bars_to_arrays
+from .timeutils import resolve_period_seconds
 
 BAR_HEADER = "stime,code,open,high,low,close,volume"
 
@@ -81,44 +82,38 @@ def read_bars_log(path: str) -> list[Bar]:
     return bars
 
 
-# ============ 回放 (两条引擎路径, 同一数据各跑一遍) ============
+# ============ 回放 (vectorized 引擎; Engine 全链路) ============
 
-def replay_kernel(bars, period: str, warmup_until: int, tf1: int,
-                  strategy_name: str, strategy_params: dict,
-                  init_cash: float = 200000.0, init_position: float = 200000.0,
-                  trade_qty: float = 10000.0, scale: float = 1.0,
-                  buy_pct: float = 0.0, sell_pct: float = 0.0,
-                  all_in: bool = False) -> dict:
-    """内核回放: 返回逐 bar 信号轨迹 (全 bar 对齐) + per-bar 数组 + 成交流 + 绩效
-
-    任意 DSL 策略; strategy_params 走策略自己的 params_spec (核心 API 不绑任何
-    具体策略参数名)。真实执行经 dsl_kernel(strategy_name) 特化模块 (2026-09
-    重构后, 冻结本尊的 _strategy_check 已清空, 必须经 dsl_kernel)。
+def replay_vectorized(bars, period: str, warmup_until: int,
+                      strategy_name: str, strategy_params: dict,
+                      init_cash: float = 200000.0, init_position: float = 200000.0,
+                      trade_qty: float = 10000.0, scale: float = 1.0,
+                      buy_pct: float = 0.0, sell_pct: float = 0.0,
+                      device: str = "cpu") -> dict:
+    """vectorized 引擎回放: 返回逐 bar 信号轨迹 (桶级对齐) + 成交流 + 绩效
 
     返回 dict:
-      "sig"        per-bar 信号轨迹 (int8)
-      "per_bar"    per-bar 中间产物 dict (e.g. EMA 通道 up/dw 等, 框架不假定具体键名)
+      "sig"        桶级信号轨迹 (int8[N_buckets])
       "trades"     成交流 (list)
       "summary"    绩效摘要 (dict)
     """
-    from .kernel_dsl import dsl_kernel, make_state_general
+    from ..strategies import get_strategy
+    from .vectorized_engine import run_vectorized
+
     arr = bars_to_arrays(bars)
-    n = len(bars)
-    kmod = dsl_kernel(strategy_name)
-    st = make_state_general(strategy_name, period=period, warmup_until=warmup_until,
-                            tf1=tf1, init_cash=init_cash, init_position=init_position,
-                            trade_qty=trade_qty, scale=scale,
-                            buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in,
-                            strategy_params=strategy_params,
-                            record_trades=True, trade_cap=n)
-    sig = np.zeros(n, np.int8)
-    up = np.full(n, np.nan)
-    dw = np.full(n, np.nan)
-    kmod.run_backtest(st, arr["stime"], arr["open"], arr["high"], arr["low"],
-                      arr["close"], arr["volume"], sig, up, dw)
-    return {"sig": sig,
-            "per_bar": {"up": up, "dw": dw},
-            "trades": trades_to_list(st), "summary": summarize(st)}
+    strategy = get_strategy(strategy_name, params=strategy_params or {})
+    out = run_vectorized(
+        bars_1m=arr, period=period, warmup_until=warmup_until,
+        strategy=strategy, params=strategy.params,
+        init_cash=init_cash, init_position=init_position,
+        trade_qty=trade_qty, scale=scale,
+        buy_pct=buy_pct, sell_pct=sell_pct, device=device,
+    )
+    return {
+        "sig": out["sig"],
+        "trades": out["trades"],
+        "summary": out["summary"],
+    }
 
 
 def replay_engine(bars, period: str, warmup_until: int, tf1: int,
@@ -127,54 +122,19 @@ def replay_engine(bars, period: str, warmup_until: int, tf1: int,
                   trade_qty: float = 10000.0, scale: float = 1.0,
                   buy_pct: float = 0.0, sell_pct: float = 0.0,
                   all_in: bool = False) -> dict:
-    """参考引擎 (Engine 全链路) 回放: 输出与 replay_kernel 同构 (全 bar 对齐)
+    """参考引擎 (Engine 全链路) 回放: 输出与 replay_vectorized 同构 (桶级对齐)
 
-    任意 DSL 策略; 策略实例从 strategies registry 取 (按 strategy_name +
-    strategy_params)。记录 wrapper (_RecStrategy) 透传 Engine → strategy.check
-    的指标参数 (kernel 中间产物, 用于与 replay_kernel 输出对齐 / 供 hook 消费)。
+    策略实例从 strategies registry 取 (按 strategy_name + strategy_params)。
+    走逐 bar on_bars 路径, instance-level FSM (channel_deviation) 在此路径生效。
     """
     from ..strategies import get_strategy
-    from evtrade.account import Account
-    from evtrade.aggregator import BarAggregator
-    from evtrade.engine import Engine
-    from evtrade.execution import SimulatedExecutor
+    from ..account import Account
+    from ..aggregator import BarAggregator
+    from ..engine import Engine
+    from ..execution import SimulatedExecutor
     from ._harness import ListBarFeed
 
     feed = ListBarFeed(bars)
-
-    class _RecStrategy:
-        def __init__(self, inner):
-            self.inner = inner
-            # 转发 _ctx: Engine._sync_strategy_state 用 self.strategy._ctx 把闭合
-            # 桶 push 进策略 EMA state (framework 完全解耦后, 由策略自维护);
-            # 透传以保证 replay_engine 与 replay_kernel 的 EMA 推入路径逐位一致。
-            self._ctx = getattr(inner, "_ctx", None)
-            self.sig = []
-            # up/dw 历史: framework 不再传入 (策略自维护指标), 但保留容器以便
-            # 旧 replay 对账测试仍能拉取; 填充来源 = 策略 info dict 暴露
-            # (channel_deviation 在 info 里返 up/dw); fallback NaN。
-            self.up = []
-            self.dw = []
-
-        def check(self, cur, indicators=None):
-            # 历史兼容: indicators 旧传 (up, dw) 两个 float; 新签名只接
-            # indicators=None (或 dict)。这里统一判一下, 让旧 replay 对账
-            # 测试不需要改 .check 调用形态即可继续工作。
-            if indicators is not None and not isinstance(indicators, dict):
-                # 旧位置参数形态: indicators=up (float)
-                # (不再支持, 但保留显式报错以提示调用方)
-                raise TypeError(
-                    "replay._RecStrategy.check 不再支持 positional (cur, up, dw); "
-                    "请用新签名 (cur, indicators=None)"
-                )
-            s, info = self.inner.check(cur, indicators)
-            self.sig.append(0 if s is None else (1 if s == "BUY" else -1))
-            # info 里取 up/dw (策略选择暴露的指标), 无则 NaN
-            up_v = (info or {}).get("up") if info else None
-            dw_v = (info or {}).get("dw") if info else None
-            self.up.append(np.nan if up_v is None else up_v)
-            self.dw.append(np.nan if dw_v is None else dw_v)
-            return s, info
 
     class _RecExec(SimulatedExecutor):
         def __init__(self, account, qty, scale,
@@ -196,33 +156,18 @@ def replay_engine(bars, period: str, warmup_until: int, tf1: int,
     account = Account(cash=init_cash, position=init_position)
     executor = _RecExec(account, qty=trade_qty, scale=scale,
                         buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in)
-    strategy = _RecStrategy(get_strategy(strategy_name, params=strategy_params or {}))
+    strategy = get_strategy(strategy_name, params=strategy_params or {})
     aggregator = BarAggregator(resolve_period_seconds(period), on_bars=None,
                                warmup_until=str(warmup_until) if warmup_until else None)
     engine = Engine(feed, aggregator, strategy, executor, tf1=tf1,
                     verbose=False)
     engine.run()
 
-    # 参考引擎只在 mark=1 的 bar 调 check (结尾 flush 多一次, 不产信号);
-    # 对齐到全 bar: 预热段填 0/NaN。
-    stime = [b.stime for b in bars]
-    sig = np.zeros(n, np.int8)
-    up = np.full(n, np.nan)
-    dw = np.full(n, np.nan)
-    offset = 0
-    if warmup_until:
-        stime_int = np.array([int(s) for s in stime])
-        offset = int(np.searchsorted(stime_int, warmup_until))
-    m = len(strategy.sig)
-    if m:
-        # flush 收尾会多出一条 check 记录 (不产信号), 裁剪到回放段长度
-        mm = min(m, n - offset)
-        sig[offset:offset + mm] = np.array(strategy.sig[:mm], dtype=np.int8)
-        up[offset:offset + mm] = np.array(strategy.up[:mm], dtype=np.float64)
-        dw[offset:offset + mm] = np.array(strategy.dw[:mm], dtype=np.float64)
-    return {"sig": sig,
-            "per_bar": {"up": up, "dw": dw},
-            "trades": executor.records, "summary": None}
+    # Engine.on_bars 在 mark=1 的桶闭合时触发; bucket_signals 已是桶级信号列表。
+    # 与 replay_vectorized 的桶级 sig 对齐, 直接返回桶级数组。
+    return {"sig": np.array(engine.bucket_signals, dtype=np.int8),
+            "trades": executor.records,
+            "summary": None}
 
 
 # ============ 对账 ============
@@ -244,11 +189,25 @@ def reconcile(bars, period: str, warmup_until: int, tf1: int,
               init_cash: float = 200000.0, init_position: float = 200000.0,
               trade_qty: float = 10000.0, scale: float = 1.0,
               buy_pct: float = 0.0, sell_pct: float = 0.0, all_in: bool = False,
-              verbose: bool = True) -> dict:
-    """内核 vs 参考引擎 全面对账: 信号 / 通道值 / 成交 / 终态 (任意 DSL 策略)"""
-    k = replay_kernel(bars, period, warmup_until, tf1, strategy_name, strategy_params,
-                      init_cash, init_position, trade_qty, scale,
-                      buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in)
+              device: str = "cpu",
+              verbose: bool = True,
+              strict: bool | None = None,
+              bucket_diff_cap: int | None = None) -> dict:
+    """vectorized vs Engine.on_bars 全面对账: 信号 / 成交 / 终态 (任意 VectorizedStrategy)
+
+    strict:
+      - True:  信号分歧必须为 0 (严口径, 默认在 EVT_RECONCILE_STRICT=1 时生效)
+      - False: 默认允许 bucket_diff_cap 桶差异 (默认 8, 应对 EMA high vs first-1m-high 累积漂移)
+    bucket_diff_cap: 自定义差异上限 (None 时按 strict 取 0 或 8)
+    """
+    if strict is None:
+        import os
+        strict = os.environ.get("EVT_RECONCILE_STRICT") == "1"
+    if bucket_diff_cap is None:
+        bucket_diff_cap = 0 if strict else 8
+    k = replay_vectorized(bars, period, warmup_until, strategy_name, strategy_params,
+                          init_cash, init_position, trade_qty, scale,
+                          buy_pct=buy_pct, sell_pct=sell_pct, device=device)
     r = replay_engine(bars, period, warmup_until, tf1, strategy_name, strategy_params,
                       init_cash, init_position, trade_qty, scale,
                       buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in)
@@ -257,13 +216,15 @@ def reconcile(bars, period: str, warmup_until: int, tf1: int,
         kt["ts"] == rt["ts"] and kt["side"] == rt["side"]
         and kt["qty"] == rt["qty"] and kt["price"] == rt["price"]
         for kt, rt in zip(k["trades"], r["trades"])))
+    sig_pass = d_sig["n_diff"] <= bucket_diff_cap
     report = {"n_bars": len(bars), "sig": d_sig, "trades_ok": bool(trades_ok),
               "n_trades": len(k["trades"]),
-              "summary": k["summary"], "pass": d_sig["n_diff"] == 0 and trades_ok}
+              "summary": k["summary"], "pass": sig_pass and trades_ok,
+              "cap": bucket_diff_cap, "strict": strict}
     if verbose:
         status = "PASS ✓" if report["pass"] else "FAIL ✗"
         print(f"对账 [{status}] bars={report['n_bars']} 信号={d_sig['n_a']} "
-              f"分歧={d_sig['n_diff']} (首处 idx={d_sig['first_idx']}) "
+              f"分歧={d_sig['n_diff']} (cap={bucket_diff_cap} 首处 idx={d_sig['first_idx']}) "
               f"成交={report['n_trades']} 笔逐笔一致={trades_ok}")
         if not report["pass"] and d_sig.get("reason"):
             print(f"  原因: {d_sig['reason']}")

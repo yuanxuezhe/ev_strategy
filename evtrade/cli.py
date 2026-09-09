@@ -1,49 +1,36 @@
 from __future__ import annotations
-"""命令行入口
+"""命令行入口 (DSL/numba 已下线; 唯一路径 = vectorized)
 
 ================================================================
 ✅  可改层模块  ✅  (用户面的主要修改点)
 ================================================================
-本文件定义三个子命令: backtest / sweep / replay, 是用户面的主入口。
+本文件定义四个子命令: backtest / sweep / replay / params。
+
+唯一执行路径 (CPU/GPU 统一):
+  - backtest: vectorized_engine.run_vectorized
+  - sweep:    core.sweep.sweep (内部走 run_one_vectorized)
+  - replay:   replay.replay_vectorized (--against-ref 加 replay.reconcile)
+
+设备选择: --device {cpu, gpu, auto} (默认 auto)
+  - auto: 优先 gpu (cupy 可用), 否则 cpu
+  - cpu:  xp = numpy
+  - gpu:  xp = cupy (需 cupy + CUDA)
 
 常见修改:
-
-  1. 加新参数 (例: --max-position):
-     - 在 build_backtest_parser() / build_sweep_parser() 加 add_argument
-     - 在 _run_kernel / _run_ref 中读取并透传给 make_state 或 executor
-     - 同步给内核加 jitclass 字段 (参照阶段 2 的 buy_pct/sell_pct 加法)
-     - tests/test_xxx.py 加测试锁定
-
-  2. 改输出格式:
-     - _run_kernel() 末尾的 print 段 (汇总 / 信号行)
-     - 保留 "=== 60 字符等号 ===" 包裹风格, 便于日志检索
-
-  3. 加新子命令 (例: live 启动实盘):
-     - 在 main() 的 if/elif 链加一项
-     - 写一个 _run_xxx() 函数, 调用现有 Engine/ChainedFeed/BrokerExecutor
-
-  4. 别忘了:
-     - evtrade/__main__.py 是 `python -m evtrade` 入口, 委托 main()
-     - evtrade/__init__.py 顶层导出符号 (新模块要在此处加 from)
-================================================================
+  1. 加新参数: 在 build_*_parser 加 add_argument; 在对应的 _run_* 中读取并透传。
+  2. 改输出格式: _run_backtest() 末尾的 print 段。
+  3. 加新子命令: 在 main() 的 handlers 字典加一项。
 """
 
 import argparse
 import time
-
-import numpy as np
 
 from .core.config import INIT_CASH, INIT_POSITION, INTERVAL, TF1, TRADE_QTY
 from .core.timeutils import resolve_period_seconds
 
 
 def _parse_params(spec: str) -> dict:
-    """'k1:v1;k2:v2' -> dict (类型自动推导: int / float / bool / str)
-
-    用例:
-      --params "k1:1.5;k2:1.0;k3:21"
-      --params "flag:true;ratio:0.5"
-    """
+    """'k1:v1;k2:v2' -> dict (类型自动推导: int / float / bool / str)"""
     out: dict = {}
     if not spec:
         return out
@@ -76,77 +63,105 @@ def _auto_cast(s: str):
 
 
 def _period_type(s: str) -> str:
-    resolve_period_seconds(s)          # 校验格式, 非法直接报 argparse 错
+    resolve_period_seconds(s)
     return s
 
 
 def _resolve_strategy_params(strategy_name: str, params_arg: str) -> dict:
     """解析策略参数, 优先级 (高 -> 低):
-      1. CLI --params 显式传入 (params_arg 非空)
-      2. evtrade/strategies/_defaults/<strategy_name>.json 落盘默认
-      3. 空 dict (后续 StrategyBase 用 params_spec 默认值)
-
-    返回 dict; 顶层键与 StrategyBase.params_spec 对齐。
+      1. CLI --params 显式传入
+      2. evtrade/strategies/_defaults/<strategy_name>.json
+      3. 空 dict (后续 _resolve_params 用 params_spec 默认值)
     """
-    # 1. CLI --params 显式
     if params_arg:
         return _parse_params(params_arg)
-    # 2. 默认参数落盘
     from .strategies._defaults_loader import exists, load
     if exists(strategy_name):
         data = load(strategy_name)
         return dict(data.get("params") or {})
-    # 3. 空
     return {}
+
+
+def _emit_deprecation_warning(old_key: str, new_key: str, mapping: dict) -> None:
+    """打印 --engine / 旧 key 的 deprecation 警告 + 自动转换"""
+    import warnings
+    warnings.warn(
+        f"--{old_key} 已下线 (DSL/numba 已下线), "
+        f"请改用 --{new_key} {{{', '.join(sorted(mapping))}}}; "
+        f"当前按映射自动转换。",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
+def _coalesce_legacy_engine(argv: list[str]) -> tuple[list[str], str]:
+    """检测旧 --engine 值并转换为 --device; 返回 (new_argv, device)
+
+    映射: kernel -> auto, ref -> cpu, vectorized -> cpu
+    """
+    new_argv = []
+    device = "auto"
+    skip_next = False
+    for i, a in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if a == "--engine":
+            # 下一个 argv[i+1] 是 value
+            if i + 1 < len(argv):
+                v = argv[i + 1].lower()
+                mapping = {"kernel": "auto", "ref": "cpu", "vectorized": "cpu"}
+                if v in mapping:
+                    device = mapping[v]
+                    _emit_deprecation_warning("engine", "device", mapping)
+                    skip_next = True
+                    continue
+        new_argv.append(a)
+    return new_argv, device
 
 
 # ============ backtest 子命令 ============
 
 def build_backtest_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        description="minute_bars 周期合并 + 策略信号 (回测/实盘统一)")
+        description="策略回测 (vectorized; CPU=xp=numpy / GPU=xp=cupy)")
     ap.add_argument("--period", default="5m", type=_period_type,
                     help="K线周期, 任意 数字+m/h/d: 5m/7m/15m/30m/90m/2h/4h/6h/1d/3d ...")
     ap.add_argument("--strategy", default="channel_deviation",
                     help="策略 key (来自 evtrade.strategies.available_strategies())")
     ap.add_argument("--params", default="",
-                    help="策略参数 (通用 dict 形式): 'k1:v1;k2:v2' (分号分隔 kv, "
-                         "类型自动推导 int/float/bool/str)。具体键名见所选策略的 "
-                         "params_spec (StrategyBase.params_spec)。")
+                    help="策略参数 (通用 dict 形式): 'k1:v1;k2:v2'")
     ap.add_argument("--start", default="20250101", help="策略起始日期 YYYYMMDD")
     ap.add_argument("--end", default="20260903", help="策略结束日期 YYYYMMDD")
-    ap.add_argument("--step-days", type=int, default=7, help="[ref] 分段查询天数(闭区间)")
     ap.add_argument("--tf1", type=int, default=TF1, help="EMA 周期 (策略/指标层)")
-    ap.add_argument("--no-sleep", action="store_true",
-                    help="[ref] 去掉每根 bar 的 sleep; kernel 引擎本就全速")
     ap.add_argument("--trade-qty", type=float, default=TRADE_QTY, help="每次信号交易股数")
     ap.add_argument("--scale", type=float, default=1.0,
-                    help="倍投系数: 连续同向信号数量=上次×scale (首次=trade_qty, "
-                         "反向重置); 1.0=关闭, 如 2.0")
+                    help="倍投系数: 连续同向信号数量=上次×scale (反向重置); 1.0=关闭")
     ap.add_argument("--all-in", action="store_true",
-                    help="[阶段 2] 全仓模式: BUY 吃满现金 / SELL 清光持仓 (便捷开关, "
-                         "等价 --buy-pct 1.0 --sell-pct 1.0)")
+                    help="全仓模式 (等价 --buy-pct 1.0 --sell-pct 1.0)")
     ap.add_argument("--buy-pct", type=float, default=0.0,
-                    help="[阶段 2] BUY 时按当前现金的该比例下注 (0=关闭走 --trade-qty, "
-                         "0.5=半仓, 1.0=全仓)")
+                    help="BUY 时按当前现金的该比例下注 (0=关闭走 --trade-qty)")
     ap.add_argument("--sell-pct", type=float, default=0.0,
-                    help="[阶段 2] SELL 时按当前持仓的该比例卖 (0=关闭走 --trade-qty, "
-                         "1.0=清仓)")
-    ap.add_argument("--code", default="159992.SZ", help="证券代码 (如 159992.SZ / 513120.SH)")
-    ap.add_argument("--engine", default="kernel", choices=["kernel", "ref", "vectorized"],
-                    help="kernel=numba流式内核(默认,与ref逐笔等价) / ref=原Python实现 / "
-                         "vectorized=CuPy向量化引擎(数组算子, CPU/GPU 统一, 需 --device)")
-    ap.add_argument("--device", default="cpu", choices=["cpu", "gpu"],
-                    help="[vectorized] array 后端: cpu=numpy / gpu=cupy (需 cupy, "
-                         "仅 --engine vectorized 生效)")
+                    help="SELL 时按当前持仓的该比例卖 (0=关闭走 --trade-qty)")
+    ap.add_argument("--code", default="159992.SZ", help="证券代码")
+    ap.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"],
+                    help="xp 后端: cpu=numpy / gpu=cupy / auto=优先 gpu (默认)")
     ap.add_argument("--warmup-days", type=int, default=365,
-                    help="[kernel] 预热天数 (拉取 start 之前的行情供指标就绪)")
+                    help="预热天数 (拉取 start 之前的行情供指标就绪)")
     ap.add_argument("--data-cache", default=None,
-                    help="[kernel] 行情 npz 缓存目录 (命中后不访问数据库)")
+                    help="行情 npz 缓存目录")
     ap.add_argument("--show-bars", action="store_true",
-                    help="打印每根周期K线 (桶闭合时点) 的 OHLCV 与策略额外列")
+                    help="打印每根周期K线的 OHLCV 与策略额外列")
     ap.add_argument("--bars-out", default=None,
-                    help="同 --show-bars 内容输出 CSV (大数据量建议用这个)")
+                    help="同 --show-bars 内容输出 CSV")
+    ap.add_argument("--signals-out", default=None,
+                    help="信号轨迹 CSV (ts,sig,策略额外列)")
+    # --- 兼容层: --engine 已下线 (DSL/numba 已删除); 仅打 DeprecationWarning + 自动映射 device ---
+    ap.add_argument("--engine", default=None, choices=["kernel", "ref", "vectorized"],
+                    help=argparse.SUPPRESS)
+    # --- 兼容层: --no-sleep / --step-days 是 ref 引擎参数, 已下线 ---
+    ap.add_argument("--no-sleep", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--step-days", type=int, default=7, help=argparse.SUPPRESS)
     return ap
 
 
@@ -160,217 +175,44 @@ def _f4(v) -> str:
     return f"{v:.4f}"
 
 
-def _run_kernel(args):
-    # 策略参数: --params 显式 > _defaults 落盘 > params_spec 默认
+def _run_backtest(args):
+    """统一 backtest 入口 (vectorized 引擎)"""
+    # 兼容旧 --engine: 自动映射到 --device (kernel->auto, ref->cpu, vectorized->cpu)
+    if getattr(args, "engine", None):
+        mapping = {"kernel": "auto", "ref": "cpu", "vectorized": "cpu"}
+        mapped = mapping[args.engine]
+        if args.device == "auto" or args.device != mapped:
+            _emit_deprecation_warning("engine", "device", mapping)
+            args.device = mapped
+
     strategy_params = _resolve_strategy_params(args.strategy, args.params)
 
     from .core.data import load_bars
-    from .core.kernel import bucket_table, bundle_per_bar
-    from .core.kernel_dsl import dsl_kernel, make_state_general, strategy_has_dsl
+    from .core.vectorized_engine import run_vectorized
     from .strategies import get_strategy
 
-    # 无 DSL docstring 的策略不能进内核路径 (numba/CUDA 都由 DSL 渲染)
-    if not strategy_has_dsl(args.strategy):
-        print(f"[警告] 策略 {args.strategy!r} 没有 DSL compute_signal docstring; "
-              f"kernel 引擎不可用, 请用 --engine ref")
-        return
-
+    strategy = get_strategy(args.strategy, params=strategy_params)
     bars = load_bars(args.code, args.start, args.end,
                      warmup_days=args.warmup_days, cache_dir=args.data_cache)
     n = len(bars["stime"])
-    show_bars = args.show_bars or args.bars_out
     print(f"证券: {args.code}  周期: {args.period}  策略日期: {args.start}~{args.end}  "
           f"预热: {args.warmup_days}天  TF1={args.tf1}  "
           f"策略: {args.strategy}  "
           f"scale={args.scale}  "
           f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}  "
-          f"引擎: kernel (numba)\n", flush=True)
+          f"device={args.device}\n", flush=True)
 
-    # 统一入口: 所有 DSL 策略同路径, 由 build_dsl_kernel 渲染;
-    # 参数按 params_spec 顺序填 p0..pN。
-    st = make_state_general(args.strategy, period=args.period,
-                            warmup_until=int(args.start) * 1_000_000,
-                            tf1=args.tf1, init_cash=INIT_CASH,
-                            init_position=INIT_POSITION,
-                            trade_qty=args.trade_qty, scale=args.scale,
-                            buy_pct=args.buy_pct, sell_pct=args.sell_pct,
-                            all_in=args.all_in,
-                            strategy_params=strategy_params,
-                            record_trades=True, trade_cap=n)
-    kmod = dsl_kernel(args.strategy)
     t0 = time.perf_counter()
-    if show_bars:
-        sig_out = np.zeros(n, np.int8)
-        up_out = np.full(n, np.nan)
-        dw_out = np.full(n, np.nan)
-        ts_out = np.zeros(n, np.int64)
-        o_out = np.zeros(n)
-        h_out = np.zeros(n)
-        l_out = np.zeros(n)
-        c_out = np.zeros(n)
-        v_out = np.zeros(n)
-        kmod.run_backtest_trace(st, bars["stime"], bars["open"], bars["high"],
-                                bars["low"], bars["close"], bars["volume"],
-                                sig_out, up_out, dw_out,
-                                ts_out, o_out, h_out, l_out, c_out, v_out)
-        # framework 不在 CLI 层命名指标字段: per-bar 数组由 kernel.bundle_per_bar
-        # 打包为通用契约 dict, 透传给策略钩子。
-        trace = bundle_per_bar(sig_out, up_out, dw_out,
-                               ts_out, o_out, h_out, l_out, c_out, v_out)
-        per_bar = trace["per_bar"]
-        tab = bucket_table(bars["stime"], sig_out,
-                           per_bar["ts"], per_bar["o"], per_bar["h"],
-                           per_bar["l"], per_bar["c"], per_bar["v"])
-        # 只保留策略期 (--start 起) 的桶; 预热期仅用于指标准备, 不输出
-        mask = tab["ts"] >= int(args.start) * 1_000_000
-        tab = {k: v[mask] for k, v in tab.items()}
-    else:
-        kmod.run_backtest(st, bars["stime"], bars["open"], bars["high"],
-                          bars["low"], bars["close"], bars["volume"],
-                          np.empty(0, np.int8), np.empty(0), np.empty(0))
-    dt = time.perf_counter() - t0
-
-    for t in kmod.trades_to_list(st):
-        side = "BUY " if t["side"] == "BUY" else "SELL"
-        arrow = ">>" if t["side"] == "BUY" else ">>"
-        print(f"        {arrow} {side} {t['qty']:.0f}股 @ {t['price']:.4f}  "
-              f"[{t['ts']}]  剩余资金 {t['cash_after']:.2f}", flush=True)
-
-    s = kmod.summarize(st)
-    print("\n" + "=" * 60)
-    print("回测盈亏汇总")
-    print("=" * 60)
-    print(f"期末价 (最后一根close) : {s['final_price']:.4f}")
-    print(f"交易次数              : {s['n_trades']} (BUY {s['n_buy']} / SELL {s['n_sell']})")
-    print(f"期初资金 / 期初持仓    : {st.init_cash:.0f} / {st.init_position:.0f}股")
-    print(f"期末资金 / 期末持仓    : {st.cash:.2f} / {st.position:.0f}股")
-    print(f"期末持仓市值           : {st.position * st.last_price:.2f}")
-    print(f"策略总资产 (资金+市值) : {s['final_equity']:.2f}")
-    print(f"不操作基线 (资金+市值) : {s['baseline']:.2f}")
-    print(f"盈亏差额 (策略-基线)   : {s['excess']:+.2f}")
-    print(f"盈亏比例              : {s['excess_pct']:+.2f}%")
-    print(f"年化超额 (择时贡献)   : {s['ann_excess_pct']:+.2f}%/年")
-    print(f"年化复合 CAGR         : {s['cagr']:+.2f}%/年")
-    print(f"超额 Sharpe           : {s['sharpe_excess']:+.3f}")
-    print(f"超额 Sortino          : {s['sortino_excess']:+.3f}")
-    print(f"Calmar (年化/回撤)    : {s['calmar']:+.3f}")
-    print(f"最大回撤 (逐bar盯市)   : {s['max_drawdown']:.2%}")
-    print(f"最大回撤持续天数       : {s['max_dd_days']:.1f} 天  (恢复={s['max_dd_recovered']})")
-    print(f"超额曲线最大回撤       : {s['x_mdd']:.2%}")
-    print(f"成交额合计            : {s['turnover']:.0f}")
-    print(f"内核耗时              : {dt * 1000:.1f} ms ({n} 根 1m bar)")
-    print("=" * 60)
-
-    if show_bars:
-        # 策略额外列: 由 StrategyBase.get_extra_bucket_columns 钩子提供,
-        # framework 只负责 OHLCV + sig 轨迹; 策略如需展示指标 (e.g. EMA
-        # 通道 up/dw、偏离百分比) 在其自己的 hook 里追加, framework 不假定
-        # 任何特定指标。per-bar 数组由 framework 统一打包 (per_bar dict)
-        # 透传, CLI 不命名指标字段。
-        strategy = get_strategy(args.strategy, params=strategy_params)
-        extra_cols = strategy.get_extra_bucket_columns(tab=tab, per_bar=per_bar)
-        if args.show_bars:
-            print("\n周期K线明细 (每行 = 一个桶在闭合时点; ts 为右端点; sig 为该桶最后一根 bar 的信号):")
-            ts_l = tab["ts"].tolist()
-            cols = {k: tab[k].tolist() for k in
-                    ("open", "high", "low", "close", "volume", "count", "sig", "n_sig")}
-            cols.update({k: v.tolist() for k, v in extra_cols.items()})
-            extra_keys = list(extra_cols.keys())
-            for i in range(len(ts_l)):
-                extra_line = ""
-                if extra_cols:
-                    extra_line = " ".join(f"{k}={_f4(cols[k][i])}" for k in extra_keys) + " | "
-                print(f"[{ts_l[i]}] O:{_f4(cols['open'][i])} H:{_f4(cols['high'][i])} "
-                      f"L:{_f4(cols['low'][i])} C:{_f4(cols['close'][i])} "
-                      f"V:{cols['volume'][i]:.0f} x{cols['count'][i]} | "
-                      f"{extra_line}"
-                      f"sig={cols['sig'][i]} n_sig={cols['n_sig'][i]}", flush=True)
-        if args.bars_out:
-            with open(args.bars_out, "w", encoding="utf-8-sig") as f:
-                header = "ts,open,high,low,close,volume,count"
-                if extra_cols:
-                    header += "," + ",".join(extra_cols.keys())
-                header += ",signal,n_sig\n"
-                f.write(header)
-                for i in range(len(tab["ts"])):
-                    row = (f"{tab['ts'][i]},{tab['open'][i]},{tab['high'][i]},"
-                           f"{tab['low'][i]},{tab['close'][i]},{tab['volume'][i]},"
-                           f"{tab['count'][i]}")
-                    if extra_cols:
-                        row += "," + ",".join(str(extra_cols[k][i]) for k in extra_cols)
-                    row += f",{tab['sig'][i]},{tab['n_sig'][i]}\n"
-                    f.write(row)
-            print(f"\nK线明细已保存: {args.bars_out} ({len(tab['ts'])} 行)")
-
-
-def _run_ref(args):
-    """原 Python 实现路径 (保留逐根 sleep / 分段拉数的原始行为)"""
-    from .core.aggregator import BarAggregator
-    from .execution.account import Account
-    from .core.engine import Engine
-    from .execution.base import SimulatedExecutor
-    from .feeds.mysql_history import MySQLBacktestFeed
-    from .strategies import get_strategy
-    from .strategies import get_strategy as _gs
-
-    delay = 0 if args.no_sleep else INTERVAL
-    feed = MySQLBacktestFeed(code=args.code, start_ymd=args.start, end_ymd=args.end,
-                             step_days=args.step_days, delay=delay, verbose=True)
-    account = Account(cash=INIT_CASH, position=INIT_POSITION)
-    executor = SimulatedExecutor(account, qty=args.trade_qty, verbose=True,
-                                 scale=args.scale,
-                                 buy_pct=args.buy_pct, sell_pct=args.sell_pct,
-                                 all_in=args.all_in)
-    aggregator = BarAggregator(resolve_period_seconds(args.period), on_bars=None,
-                               warmup_until=feed.warmup_until)
-    # 策略参数: --params 显式 > _defaults 落盘 > params_spec 默认
-    strategy_params = _resolve_strategy_params(args.strategy, args.params)
-    strategy = _gs(args.strategy, params=strategy_params)
-    engine = Engine(feed, aggregator, strategy, executor, tf1=args.tf1, verbose=True)
-    print(f"证券: {args.code}  周期: {args.period}  策略: {args.strategy}  "
-          f"策略日期: {args.start}~{args.end}  "
-          f"预热起点: {feed.warmup_start}  分段: {args.step_days}天/段(闭区间)  "
-          f"TF1={args.tf1}  sleep={'OFF' if args.no_sleep else 'ON'}  "
-          f"scale={args.scale}  "
-          f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}  "
-          f"引擎: ref  Ctrl+C 停止\n")
-    engine.run()
-    engine.print_summary()
-
-
-def _run_vectorized(args):
-    """向量化引擎路径 (CuPy 统一 CPU/GPU; 数组算子策略)"""
-    from .core.data import load_bars
-    from .core.vectorized_engine import run_vectorized
-    from .strategies.vectorized_base import get_vectorized_strategy
-
-    strategy_params = _resolve_strategy_params(args.strategy, args.params)
-    strategy = get_vectorized_strategy(args.strategy, params=strategy_params)
-
-    bars = load_bars(args.code, args.start, args.end,
-                     warmup_days=args.warmup_days, cache_dir=args.data_cache)
-    n = len(bars["stime"])
-    print(f"证券: {args.code}  周期: {args.period}  策略日期: {args.start}~{args.end}  "
-          f"预热: {args.warmup_days}天  策略: {args.strategy}  "
-          f"scale={args.scale}  "
-          f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}  "
-          f"引擎: vectorized ({args.device})\n", flush=True)
-
-    import time as _time
-    t0 = _time.perf_counter()
-    buy_pct = args.buy_pct
-    sell_pct = args.sell_pct
-    if args.all_in:
-        buy_pct = max(buy_pct, 1.0)
-        sell_pct = max(sell_pct, 1.0)
+    buy_pct = max(args.buy_pct, 1.0) if args.all_in else args.buy_pct
+    sell_pct = max(args.sell_pct, 1.0) if args.all_in else args.sell_pct
     result = run_vectorized(
         bars, period=args.period, warmup_until=int(args.start) * 1_000_000,
-        strategy=strategy, params=strategy_params,
+        strategy=strategy, params=strategy.params,
         init_cash=INIT_CASH, init_position=INIT_POSITION,
         trade_qty=args.trade_qty, scale=args.scale,
         buy_pct=buy_pct, sell_pct=sell_pct,
         device=args.device)
-    dt = _time.perf_counter() - t0
+    dt = time.perf_counter() - t0
 
     s = result["summary"]
     for t in s["trades"]:
@@ -391,92 +233,90 @@ def _run_vectorized(args):
     print(f"盈亏差额 (策略-基线)   : {s['excess']:+.2f}")
     print(f"盈亏比例              : {s['excess_pct']:+.2f}%")
     print(f"年化超额 (择时贡献)   : {s['ann_excess_pct']:+.2f}%/年")
+    print(f"年化复合 CAGR         : {s['cagr']:+.2f}%/年")
+    print(f"超额 Sharpe           : {s['sharpe_excess']:+.3f}")
+    print(f"超额 Sortino          : {s['sortino_excess']:+.3f}")
+    print(f"Calmar (年化/回撤)    : {s['calmar']:+.3f}")
+    print(f"最大回撤 (逐bar盯市)   : {s['max_drawdown']:.2%}")
+    print(f"最大回撤持续天数       : {s['max_dd_days']:.1f} 天")
     print(f"成交额合计            : {s['turnover']:.0f}")
     print(f"引擎耗时              : {dt * 1000:.1f} ms ({n} 根 1m bar, {args.device})")
     print("=" * 60)
 
+    if args.signals_out:
+        sig = result["sig"]
+        stime = bars["stime"]
+        with open(args.signals_out, "w", encoding="utf-8-sig") as f:
+            f.write("stime,signal\n")
+            for i in range(len(stime)):
+                f.write(f"{int(stime[i])},{int(sig[i])}\n")
+        print(f"信号轨迹已保存: {args.signals_out} ({len(stime)} 行)")
+
 
 def backtest_main(argv=None):
-    args = build_backtest_parser().parse_args(argv)
-    if args.engine == "ref":
-        _run_ref(args)
-    elif args.engine == "vectorized":
-        _run_vectorized(args)
-    else:
-        _run_kernel(args)
+    """backtest 主入口 (检测旧 --engine 自动转换)"""
+    raw = list(argv) if argv is not None else None
+    if raw is not None:
+        raw, device = _coalesce_legacy_engine(raw)
+        if device != "auto":
+            # 把默认 device 改成探测出来的 device; 但仍允许 --device 显式覆盖
+            # 这里仅在 argv 没有 --device 时应用
+            if "--device" not in raw:
+                raw = ["--device", device] + raw
+    args = build_backtest_parser().parse_args(raw)
+    _run_backtest(args)
 
 
 # ============ sweep 子命令 ============
 
 def build_sweep_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="参数并发扫描 (numba 内核, 线程池并行)")
-    ap.add_argument("--strategy", default="channel_deviation",
-                    help="策略 key (来自 evtrade.strategies.available_strategies())")
+    ap = argparse.ArgumentParser(
+        description="参数并发扫描 (vectorized; CPU/GPU 统一)")
+    ap.add_argument("--strategy", default="channel_deviation")
     ap.add_argument("--params", default="",
                     help="基础策略参数: 'k1:v1;k2:v2' (与 --grid 笛卡尔积叠加)")
     ap.add_argument("--code", default="159992.SZ")
-    ap.add_argument("--start", default="20250101", help="策略起始日期 (预热另计)")
+    ap.add_argument("--start", default="20250101")
     ap.add_argument("--end", default="20260903")
-    ap.add_argument("--period", default="5m", type=_period_type,
-                    help="K线周期, 任意 数字+m/h/d")
+    ap.add_argument("--period", default="5m", type=_period_type)
     ap.add_argument("--tf1", type=int, default=TF1)
     ap.add_argument("--trade-qty", type=float, default=TRADE_QTY)
-    ap.add_argument("--scale", type=float, default=1.0,
-                    help="倍投系数 (连续同向信号数量累乘, 反向重置; 1.0=关闭)")
-    ap.add_argument("--all-in", action="store_true",
-                    help="全仓模式 (等价 --buy-pct 1.0 --sell-pct 1.0)")
-    ap.add_argument("--buy-pct", type=float, default=0.0,
-                    help="BUY 时按当前现金的该比例下注 (0=关闭)")
-    ap.add_argument("--sell-pct", type=float, default=0.0,
-                    help="SELL 时按当前持仓的该比例卖 (0=关闭)")
+    ap.add_argument("--scale", type=float, default=1.0)
+    ap.add_argument("--all-in", action="store_true")
+    ap.add_argument("--buy-pct", type=float, default=0.0)
+    ap.add_argument("--sell-pct", type=float, default=0.0)
     ap.add_argument("--grid", action="append", default=[],
-                    help="参数网格, 可多次: --grid key=v1,v2,v3 "
-                         "(支持 tf1/period/trade_qty/scale/buy_pct/sell_pct/all_in, "
-                         "及该策略 params_spec 声明的参数名)")
+                    help="参数网格, 可多次: --grid key=v1,v2,v3")
     ap.add_argument("--split", default=None,
-                    help="单分割日 YYYYMMDD (等价 --splits 该值; 窗口名 train/test)")
+                    help="单分割日 YYYYMMDD")
     ap.add_argument("--splits", default=None,
-                    help="滚动 WFO 分割日, 逗号分隔: --splits 20260101,20260401,20260701 "
-                         "-> train + test1..test3, score 取最差 test 窗")
-    ap.add_argument("--fee-bp", type=float, default=5.0,
-                    help="费率 (万分比, 单边) 用于年化扣费; 默认 5bp")
-    ap.add_argument("--score-lambda", type=float, default=1.0,
-                    help="邻域衰减惩罚 λ: score = 最差窗年化扣费超额 / (1+λ·S)")
-    ap.add_argument("--min-trades", type=int, default=30,
-                    help="硬过滤: 各 test 窗最少成交笔数")
-    ap.add_argument("--max-mdd", type=float, default=1.0,
-                    help="硬过滤: 各 test 窗权益最大回撤上限 (0.15=15%%)")
-    ap.add_argument("--mc", type=int, default=0,
-                    help="对 score 前 --mc-top 名做蒙特卡洛置换检验 (打乱行情 N 次)")
+                    help="滚动 WFO 分割日, 逗号分隔")
+    ap.add_argument("--fee-bp", type=float, default=5.0)
+    ap.add_argument("--score-lambda", type=float, default=1.0)
+    ap.add_argument("--min-trades", type=int, default=30)
+    ap.add_argument("--max-mdd", type=float, default=1.0)
+    ap.add_argument("--mc", type=int, default=0)
     ap.add_argument("--mc-top", type=int, default=5)
     ap.add_argument("--warmup-days", type=int, default=365)
-    ap.add_argument("--workers", type=int, default=None, help="并发线程数 (默认=CPU核数)")
+    ap.add_argument("--workers", type=int, default=None)
     ap.add_argument("--device", default="auto",
                     choices=["auto", "cpu", "gpu"],
-                    help="auto=优先 GPU (可用且策略兼容), 否则 cpu (默认); "
-                         "cpu=numba内核+线程池 / gpu=CUDA单launch (需 cupy, 见 gpu.py)")
-    ap.add_argument("--data-cache", default=None, help="行情 npz 缓存目录")
+                    help="xp 后端: cpu / gpu / auto (默认)")
+    ap.add_argument("--data-cache", default=None)
     ap.add_argument("--synthetic-days", type=int, default=0,
-                    help=">0 时用合成数据 (不连库); 数值=截至 --end 的数据天数, "
-                         "应覆盖预热需求")
-    ap.add_argument("--out", default="sweep_results.csv", help="结果 CSV 路径")
-    ap.add_argument("--top", type=int, default=20, help="控制台展示前 N 组")
-    ap.add_argument("--save-defaults", action="store_true", default=False,
-                    help="扫描后自动选最优 (filter_pass 优先 / 否则 score 第一行), "
-                         "写入 evtrade/strategies/_defaults/<strategy>.json, "
-                         "并尝试单独 git commit (中文 message 含选择原因)。"
-                         "不传本参数 = 仅写 CSV, 不动默认参数文件。")
-    ap.add_argument("--no-save-defaults", dest="save_defaults",
-                    action="store_false",
-                    help="明确跳过默认参数落盘 (与不传 --save-defaults 等价)。")
+                    help=">0 时用合成数据 (不连库)")
+    ap.add_argument("--out", default="sweep_results.csv")
+    ap.add_argument("--top", type=int, default=20)
+    ap.add_argument("--save-defaults", action="store_true", default=False)
+    ap.add_argument("--no-save-defaults", dest="save_defaults", action="store_false")
     return ap
 
 
 def sweep_main(argv=None):
     args = build_sweep_parser().parse_args(argv)
-    from .data import load_bars, synthetic_bars
-    from .kernel import bars_to_arrays
-    from .sweep import GRID_KEYS, parse_grid, sweep as run_sweep
+    from .core.data import load_bars, synthetic_bars
+    from .core.metrics import bars_to_arrays
+    from .core.sweep import GRID_KEYS, parse_grid, sweep as run_sweep
     from .strategies import get_strategy_param_spec
 
     if args.synthetic_days > 0:
@@ -491,16 +331,13 @@ def sweep_main(argv=None):
         bars = load_bars(args.code, args.start, args.end,
                          warmup_days=args.warmup_days, cache_dir=args.data_cache)
 
-    # 基础策略参数: --params 显式 > _defaults 落盘 > params_spec 默认
     base_params = _resolve_strategy_params(args.strategy, args.params)
-
     base = {"start": args.start, "period": args.period, "tf1": args.tf1,
             "trade_qty": args.trade_qty, "scale": args.scale,
             "buy_pct": args.buy_pct, "sell_pct": args.sell_pct,
             "all_in": args.all_in,
             "init_cash": INIT_CASH, "init_position": INIT_POSITION,
             "params": base_params}
-    # 网格 key = 内置 GRID_KEYS + 该策略 params_spec 的参数名 (--grid lookback=10,20)
     spec_keys = set(get_strategy_param_spec(args.strategy))
     combos = parse_grid(args.grid, extra_keys=spec_keys) or [{}]
     splits = [s.strip() for s in args.splits.split(",") if s.strip()] if args.splits else None
@@ -524,7 +361,6 @@ def sweep_main(argv=None):
     print(df[show].head(args.top).to_string(index=False))
     print(f"\n全部结果已保存: {args.out} ({len(df)} 行; 列: {cols})")
 
-    # ---- 自动选最优 + 落盘 + 单独 git commit (--save-defaults) ----
     if args.save_defaults:
         from .strategies._defaults_loader import (
             save_best_from_sweep, format_reason_log,
@@ -540,9 +376,8 @@ def sweep_main(argv=None):
                   flush=True)
 
     if args.mc > 0:
-        from .permutation import permutation_test
-        print(f"\n蒙特卡洛置换检验 (前 {args.mc_top} 名, 各打乱 {args.mc} 次, "
-              f"统计量=费前年化超额):")
+        from .core.permutation import permutation_test
+        print(f"\n蒙特卡洛置换检验 (前 {args.mc_top} 名, 各打乱 {args.mc} 次):")
         warm = int(base["start"]) * 1_000_000
         for _, row in df.head(args.mc_top).iterrows():
             combo = {k: row[k] for k in GRID_KEYS if k in row}
@@ -551,46 +386,40 @@ def sweep_main(argv=None):
                                  fee_bp=args.fee_bp)
             print(f"  {' '.join(f'{k}={row[k]}' for k in combo)}  "
                   f"真实年化超额 {r['real_ann_net']:+.2f}%/年  "
-                  f"p={r['p_value']:.3f}  (随机分布均值 {r['null_mean']:+.2f}, "
-                  f"95分位 {r['null_p95']:+.2f})", flush=True)
+                  f"p={r['p_value']:.3f}", flush=True)
 
 
 # ============ replay 子命令 ============
 
 def build_replay_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        description="录制回放对账: bar 日志 -> 内核信号轨迹 (可选: 与参考引擎对账)")
+        description="录制回放对账 (vectorized 引擎; --against-ref 走 Engine.on_bars 对账)")
     ap.add_argument("--log", required=True,
-                    help="bar 日志 (CSV: stime,code,open,high,low,close,volume; "
-                         "由 append_bar/write_bars_log 产生)")
-    ap.add_argument("--strategy", default="channel_deviation",
-                    help="回放策略 key (默认 channel_deviation)")
-    ap.add_argument("--period", default="5m", type=_period_type,
-                    help="K线周期, 任意 数字+m/h/d")
+                    help="bar 日志 (CSV: stime,code,open,high,low,close,volume)")
+    ap.add_argument("--strategy", default="channel_deviation")
+    ap.add_argument("--period", default="5m", type=_period_type)
     ap.add_argument("--tf1", type=int, default=TF1)
     ap.add_argument("--params", default="",
-                    help="策略参数 (通用 dict 形式): 'k1:v1;k2:v2' (分号分隔 kv, "
-                         "类型自动推导 int/float/bool/str)。具体键名见所选策略的 "
-                         "params_spec (StrategyBase.params_spec)。")
+                    help="策略参数 (通用 dict 形式)")
     ap.add_argument("--scale", type=float, default=1.0)
-    ap.add_argument("--all-in", action="store_true",
-                    help="全仓模式 (等价 buy_pct=sell_pct=1)")
+    ap.add_argument("--all-in", action="store_true")
     ap.add_argument("--buy-pct", type=float, default=0.0)
     ap.add_argument("--sell-pct", type=float, default=0.0)
-    ap.add_argument("--warmup-until", default=None,
-                    help="预热阈值 YYYYMMDD (可选; 日志从更早开始时用于只回放策略期)")
+    ap.add_argument("--warmup-until", default=None)
     ap.add_argument("--against-ref", action="store_true",
-                    help="同时用参考 Python 引擎回放并逐 bar 对账")
-    ap.add_argument("--signals-out", default=None, help="信号轨迹输出 CSV")
+                    help="同时用 Engine.on_bars 回放并逐 bar 对账")
+    ap.add_argument("--signals-out", default=None, help="信号轨迹 CSV")
+    ap.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"])
     return ap
 
 
 def replay_main(argv=None):
     args = build_replay_parser().parse_args(argv)
-    from .replay import (read_bars_log, reconcile, replay_kernel, write_bars_log)
+    from .core.replay import (
+        read_bars_log, reconcile, replay_vectorized,
+    )
     from .strategies import get_strategy
 
-    # 回放策略: 录制侧只写原始 bar, 回放需选一个策略产信号
     strategy_name = args.strategy
     sp = _resolve_strategy_params(strategy_name, args.params)
 
@@ -600,31 +429,28 @@ def replay_main(argv=None):
     warm = int(args.warmup_until) * 1_000_000 if args.warmup_until else 0
     print(f"回放: {len(bars)} 根 bar [{bars[0].stime} ~ {bars[-1].stime}]  "
           f"period={args.period} tf1={args.tf1} 策略={strategy_name} "
-          f"params={sp or '(默认)'}  "
-          f"scale={args.scale}  "
-          f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}\n",
+          f"params={sp or '(默认)'}  scale={args.scale}  device={args.device}\n",
           flush=True)
 
-    k = replay_kernel(bars, args.period, warm, args.tf1,
-                      strategy_name=strategy_name, strategy_params=sp,
-                      scale=args.scale,
-                      buy_pct=args.buy_pct, sell_pct=args.sell_pct, all_in=args.all_in)
+    k = replay_vectorized(bars, args.period, warm,
+                          strategy_name=strategy_name, strategy_params=sp,
+                          scale=args.scale,
+                          buy_pct=args.buy_pct, sell_pct=args.sell_pct,
+                          device=args.device)
     s = k["summary"]
-    print(f"信号 {int((k['sig'] != 0).sum())} 个 (BUY {s['n_buy']} / SELL {s['n_sell']}), "
+    n_sig = int((k["sig"] != 0).sum()) if hasattr(k["sig"], "__len__") else 0
+    print(f"信号 {n_sig} 个 (BUY {s['n_buy']} / SELL {s['n_sell']}), "
           f"成交 {s['n_trades']} 笔, 期末总资产 {s['final_equity']:,.2f} "
           f"(基线 {s['baseline']:,.2f}, 超额 {s['excess_pct']:+.2f}%)")
 
     if args.signals_out:
-        # 框架默认只写 (stime, signal); 策略可通过 hook get_extra_signal_columns
-        # 在 per_bar 字典内自己取需要展示的指标字段 (CLI 不命名指标键)。
         strategy = get_strategy(strategy_name, params=sp or {})
-        extra_cols = strategy.get_extra_signal_columns(
-            sig=k["sig"], per_bar=k["per_bar"],
-        )
+        extra_cols = strategy.get_extra_signal_columns(sig=k["sig"])
         with open(args.signals_out, "w", encoding="utf-8-sig") as f:
             cols = ["stime", "signal"] + list(extra_cols.keys())
             f.write(",".join(cols) + "\n")
-            extras = [v.tolist() for v in extra_cols.values()]
+            extras = [v.tolist() if hasattr(v, "tolist") else list(v)
+                      for v in extra_cols.values()]
             for i, b in enumerate(bars):
                 row = f"{b.stime},{int(k['sig'][i])}"
                 for arr in extras:
@@ -637,7 +463,9 @@ def replay_main(argv=None):
         reconcile(bars, args.period, warm, args.tf1,
                   strategy_name=strategy_name, strategy_params=sp,
                   scale=args.scale,
-                  buy_pct=args.buy_pct, sell_pct=args.sell_pct, all_in=args.all_in)
+                  buy_pct=args.buy_pct, sell_pct=args.sell_pct,
+                  all_in=args.all_in,
+                  device=args.device)
 
 
 # ============ params 子命令 (默认参数落盘) ============
@@ -648,22 +476,16 @@ def build_params_parser() -> argparse.ArgumentParser:
         description="策略默认参数管理 (落盘 evtrade/strategies/_defaults/<name>.json)")
     sub = ap.add_subparsers(dest="params_cmd", required=True)
 
-    # save
     p_save = sub.add_parser("save", help="保存最优参数到默认目录")
-    p_save.add_argument("strategy", help="策略 key (来自 available_strategies())")
+    p_save.add_argument("strategy", help="策略 key")
     src = p_save.add_mutually_exclusive_group(required=True)
-    src.add_argument("--params", default="",
-                    help="'k1:v1;k2:v2' (类型自动推导, 同 backtest)")
-    src.add_argument("--from-csv", default=None,
-                    help="sweep 结果 CSV 路径; 与 --rank 配合取第 N 行")
-    p_save.add_argument("--rank", type=int, default=1,
-                    help="--from-csv 时取第 N 行 (1=最高 score, 默认 1)")
+    src.add_argument("--params", default="")
+    src.add_argument("--from-csv", default=None)
+    p_save.add_argument("--rank", type=int, default=1)
 
-    # show
     p_show = sub.add_parser("show", help="打印策略当前默认参数")
-    p_show.add_argument("strategy", help="策略 key")
+    p_show.add_argument("strategy")
 
-    # list
     p_list = sub.add_parser("list", help="列出所有已有默认参数的策略")
     return ap
 
@@ -714,9 +536,6 @@ def params_main(argv=None):
                       flush=True)
                 return 1
             row = rows[idx]
-            # param_keys 顺序来自策略的 params_spec; 让 _defaults_loader 按已知
-            # 字段抽出; 缺则退回到 row 全部键 (含 tf1 等引擎参数, 但 _defaults
-            # 的 params 仅策略参数, 故用 specs 约束)。
             from .strategies import get_strategy_param_spec
             spec = get_strategy_param_spec(args.strategy)
             param_keys = list(spec.keys())
@@ -743,19 +562,11 @@ def params_main(argv=None):
 
 
 def build_root_parser():
-    """根 parser: 用 add_subparsers 让 backtest/sweep/replay 各自独立 --help
-
-    子命令的 build_*_parser 提供各自参数; 子命令分发通过 cmd 字段决定
-    调用哪个 main。
-    """
     ap = argparse.ArgumentParser(
         prog="evtrade",
-        description="evtrade CLI: 策略回测 / 参数扫描 / 行情回放",
+        description="evtrade CLI: 策略回测 / 参数扫描 / 行情回放 / 默认参数管理",
     )
     sub = ap.add_subparsers(dest="cmd", help="子命令")
-
-    # 复用各子命令的 build_*_parser: 它们返回 ArgumentParser, 我们拿它的
-    # _actions 嫁接到子 parser 上, 避免重复定义参数。
     for name, builder in (("backtest", build_backtest_parser),
                           ("sweep", build_sweep_parser),
                           ("replay", build_replay_parser),
@@ -763,7 +574,6 @@ def build_root_parser():
         sub_p = sub.add_parser(name, help=f"{name} 子命令 (见 {name} -h)",
                                add_help=False)
         for action in builder()._actions:
-            # 把所有 action 复制过来 (add_argument 已在各 builder 里)
             sub_p._add_action(action)
     return ap
 
@@ -771,16 +581,12 @@ def build_root_parser():
 def main(argv=None):
     import sys
     raw = sys.argv[1:] if argv is None else argv
-    # 默认行为: 无子命令 = backtest (向后兼容, 不破坏现有脚本调用)
     if not raw or raw[0] not in ("backtest", "sweep", "replay", "params",
                                  "-h", "--help"):
         if raw and raw[0].startswith("-"):
-            # 形如 -h / --help 等根选项, 走 root parser 展示帮助
             return build_root_parser().parse_args(raw)
         if raw:
-            # 把第一个位置参数当 backtest 的策略名等看待, 走 backtest 子命令
             return backtest_main(raw)
-        # 完全无参数: 显示 root help
         build_root_parser().print_help()
         return None
     args = build_root_parser().parse_args(raw)

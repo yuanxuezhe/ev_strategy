@@ -1,25 +1,30 @@
-"""新策略开发模板测试 (抄一份, 改 key 与类名即可)
+"""新策略开发模板测试 (DSL/numba/CUDA 已下线; 唯一契约 VectorizedStrategy)
 
-演示: 一个最简单的"价格突破 N 根最高/最低"策略模板的测试。
-新策略写完后, 复制这个文件, 改 class 名 + 注册 key 即可。
+抄一份, 改 key 与类名即可。compute_signals 是策略与 framework 的唯一接口;
+指标 (EMA/RSI/...) 在 compute_signals 内调用 evtrade.indicators.*。
 """
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
-from evtrade.strategies import (StrategyBase, available_strategies,
-                                 get_strategy, get_strategy_param_spec,
-                                 register_strategy)
+from evtrade.strategies import (
+    VectorizedStrategy,
+    available_strategies,
+    get_strategy,
+    get_strategy_param_spec,
+    register_strategy,
+)
 
 
 # ============ 1. 模板策略定义 (改这部分) ============
 
 @register_strategy("template_demo")
-class TemplateDemoStrategy(StrategyBase):
-    """模板示例: 简单的双均线交叉 (金叉 BUY / 死叉 SELL)
+class TemplateDemoStrategy(VectorizedStrategy):
+    """模板示例: 双均线交叉 (金叉 BUY / 死叉 SELL) 的向量化实现
 
-    这里仅做参数 + 状态维护演示, 真实指标需从 cur["close"] 自行计算
-    或从 indicators dict 拿 (如 indicators["ma_short"])。
+    compute_signals(xp, bars, params) -> xp.ndarray[int8] (1=BUY / -1=SELL / 0=hold)
+    框架在 Engine.on_bars 里会包单 bar -> compute_signals_for_one_bar -> 单值。
     """
 
     params_spec = {
@@ -28,42 +33,23 @@ class TemplateDemoStrategy(StrategyBase):
         "threshold": {"default": 0.0, "type": float, "min": -1.0, "max": 1.0},
     }
 
-    def __init__(self, params: dict | None = None, **kwargs):
-        super().__init__(params=params, **kwargs)
-        self._bucket_ts = None
-        self._acted = False
-        # 简单均值状态
-        self._closes: list[float] = []
-
-    def _push(self, c: float):
-        self._closes.append(c)
-        n = max(self.fast, self.slow)
-        if len(self._closes) > n:
-            self._closes.pop(0)
-
-    def check(self, cur, indicators=None, dw=None):
-        if cur["ts"] != self._bucket_ts:
-            self._bucket_ts = cur["ts"]
-            self._acted = False
-        self._push(cur["close"])
-        if len(self._closes) < self.slow or self._acted:
-            return None, {}
-
-        fast_ma = sum(self._closes[-self.fast:]) / self.fast
-        slow_ma = sum(self._closes[-self.slow:]) / self.slow
-        diff = (fast_ma - slow_ma) / max(slow_ma, 1e-9)
-        info = {"fast_ma": fast_ma, "slow_ma": slow_ma, "diff": diff}
-
-        if diff > self.threshold:
-            self._acted = True
-            return "BUY", info
-        if diff < -self.threshold:
-            self._acted = True
-            return "SELL", info
-        return None, info
+    def compute_signals(self, xp, bars, params):
+        from evtrade.indicators import xp_ema
+        c = bars["c"]
+        fast = int(params["fast"])
+        slow = int(params["slow"])
+        thr = float(params["threshold"])
+        ema_fast = xp_ema(xp, c, fast)
+        ema_slow = xp_ema(xp, c, slow)
+        diff = (ema_fast - ema_slow) / xp.maximum(ema_slow, 1e-9)
+        sig = xp.zeros(len(c), dtype=xp.int8)
+        sig = xp.where(diff > thr, xp.int8(1), sig)
+        sig = xp.where(diff < -thr, xp.int8(-1), sig)
+        # 简单锁存: 同号相邻去重, 与实盘 on_bars 行为对齐 (此模板不演示 FSM)
+        return sig
 
 
-# ============ 2. 验证清单 (这部分的 8 项通常不用改) ============
+# ============ 2. 验证清单 ============
 
 def test_01_registered():
     """1. 注册可见"""
@@ -93,16 +79,16 @@ def test_03_defaults_filled():
 
 
 def test_04_type_rejected():
-    """4. 类型错误抛 TypeError"""
-    with pytest.raises(TypeError, match="期望 int"):
+    """4. 类型错误抛 ValueError (VectorizedStrategy._resolve_params 统一抛 ValueError)"""
+    with pytest.raises(ValueError, match="期望 int"):
         get_strategy("template_demo", params={"fast": "abc"})
 
 
 def test_05_range_rejected():
     """5. 范围错误抛 ValueError"""
-    with pytest.raises(ValueError, match="大于最大值"):
+    with pytest.raises(ValueError, match="大于 max"):
         get_strategy("template_demo", params={"fast": 1000})
-    with pytest.raises(ValueError, match="小于最小值"):
+    with pytest.raises(ValueError, match="小于 min"):
         get_strategy("template_demo", params={"fast": 1})
 
 
@@ -113,26 +99,28 @@ def test_06_unknown_rejected():
 
 
 def test_07_one_run():
-    """7. 跑一次合成数据: 信号格式正确, 不报错"""
+    """7. 跑一次合成数据: compute_signals 形态正确, 不报错"""
     from evtrade.data import synthetic_bars
-    bars = synthetic_bars(days=30, start_ymd="20241101", seed=42)
+    from evtrade.core.vectorized_engine import _aggregate_buckets_xp
+
     s = get_strategy("template_demo", fast=3, slow=10)
-    n_sig = 0
-    for b in bars:
-        cur = {"ts": b.stime, "high": b.high, "low": b.low,
-               "close": b.close, "open": b.open, "volume": b.volume,
-               "code": b.code}
-        sig, info = s.check(cur, {})
-        if sig in ("BUY", "SELL"):
-            n_sig += 1
-            assert isinstance(info, dict) and len(info) > 0
-    # 不断言 n_sig>0 (可能极端参数下不出信号), 只断言能跑通
+    raw = synthetic_bars(days=30, start_ymd="20241101", seed=42)
+    # 1m bars -> 桶级
+    bars = {"stime": np.array([int(b.stime) for b in raw], dtype=np.int64),
+            "open":   np.array([b.open for b in raw], dtype=np.float64),
+            "high":   np.array([b.high for b in raw], dtype=np.float64),
+            "low":    np.array([b.low for b in raw], dtype=np.float64),
+            "close":  np.array([b.close for b in raw], dtype=np.float64),
+            "volume": np.array([b.volume for b in raw], dtype=np.float64)}
+    buckets = _aggregate_buckets_xp(np, bars, "5m", warmup_until=0)
+    sig = s.compute_signals(np, buckets, s.params)
+    assert sig.dtype == np.int8
+    assert len(sig) == len(buckets["ts"])
+    # 极端参数下可能全 0, 不强断
 
 
 def test_08_replay_engine():
-    """8. (可选) 参考引擎回放对账 (用 channel_deviation 当稳定参照, 因为旧版
-    replay_kernel 本来就是硬编码 channel_deviation; 此处保留相同语义,
-    真正对账要写自己的策略级对账)"""
+    """8. (可选) 向量化引擎 vs 逐 bar 引擎 对账 (用 channel_deviation 当稳定参照)"""
     from evtrade.data import synthetic_bars
     from evtrade.replay import reconcile
 

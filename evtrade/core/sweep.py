@@ -1,20 +1,19 @@
 from __future__ import annotations
 """参数并发扫描 + 鲁棒选参框架 (kbs/13)
 
-流程 (对每组参数):
+DSL 已下线, sweep 统一走 vectorized 引擎 (run_vectorized):
   1. WFO 多窗回测: train 窗 + K 个滚动 test 窗 (--splits d1,d2,...)
      窗口 i 的数据截断到其结束日, 预热用其开始日之前的全部数据 -> 指标就绪、
      锁存状态全新起算, 与实盘在该日上线的情形一致。
-  2. 每窗绩效 (kernel.summarize): 年化扣费超额
-     ann_net = excess_pct/years - turnover×fee/baseline/years×100
-  3. 聚合: ann_net_min (最差 test 窗, 主判据) / ann_net_mean / pos_ratio /
-     sharpe_min / 邻域衰减 S (参数平原: 邻居平均绩效相对自己的衰减, [0,1])
-  4. 复合评分: score = ann_net_min / (1 + λ·S)   (ann_net_min<=0 时原样透传)
-     λ 由 --score-lambda 控制; 越高越偏向"参数平原中心"。
+  2. 每窗绩效 (metrics.summarize): 16 字段 (cagr/sharpe/sortino/calmar/max_dd_days/...)
+  3. 聚合: ann_net_min / ann_net_mean / pos_ratio / sharpe_min / sortino_min /
+     calmar_max / cagr_max / max_dd_days_max / 邻域衰减 S
+  4. 复合评分: score = ann_net_min / (1 + λ·S)
   5. 帕累托标记: (ann_net_mean, sharpe_min) 双目标非支配点。
   6. 硬过滤标记 filter_pass: 各 test 窗笔数>=min_trades 且 权益回撤<=max_mdd。
 
-并行模型: 一组参数一个独立 KernelState; nogil 线程池 (cpu) 或按窗单 launch (gpu)。
+并行模型: 一组参数一个独立 vectorized run; cpu 用 ThreadPoolExecutor (numba 释放 GIL
+历史遗留; 现在改为 xp=numpy 单线程已足够, 但保留接口)。
 """
 
 import time
@@ -22,13 +21,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from .kernel_dsl import _EMPTY_F, _EMPTY_SIG, run_one_dsl, strategy_has_dsl
-
 # 引擎级 grid key (框架自带); 策略参数名由各策略 import 时通过
 # register_grid_keys() 注入 (见 evtrade/strategies/<name>.py 末尾)
 GRID_KEYS = ("tf1", "period", "trade_qty", "scale",
              "buy_pct", "sell_pct", "all_in")
-# 网格扫描允许的额外 key (按 strategy_name 的 params_spec 动态加入)
 _GRID_EXTRA_KEYS: set[str] = set()
 
 
@@ -73,8 +69,9 @@ def parse_grid(specs: list, extra_keys: set[str] | None = None) -> list[dict]:
 
 
 def run_one_from_dict(bars: dict, p: dict, warmup_until: int,
-                      strategy_name: str | None = None) -> dict:
-    """单组参数单窗回测 (统一入口, dict 形式; 任意 DSL 策略)
+                      strategy_name: str | None = None,
+                      device: str = "cpu") -> dict:
+    """单组参数单窗回测 (统一入口, dict 形式; 走 vectorized 引擎)
 
     strategy_name: 必填 (策略 key), 见 evtrade.strategies.available_strategies()
     p 必含键: period / init_cash / init_position / trade_qty / params
@@ -82,13 +79,50 @@ def run_one_from_dict(bars: dict, p: dict, warmup_until: int,
     """
     if not strategy_name:
         raise ValueError("run_one_from_dict: strategy_name is required")
-    return run_one_dsl(bars, p["period"], warmup_until,
-                       p["init_cash"], p["init_position"], p["trade_qty"],
-                       tf1=p.get("tf1", 21), scale=p.get("scale", 1.0),
-                       buy_pct=p.get("buy_pct", 0.0), sell_pct=p.get("sell_pct", 0.0),
-                       all_in=p.get("all_in", False),
-                       strategy_name=strategy_name,
-                       strategy_params=p.get("params") or {})
+    from ..strategies import get_strategy
+    from .vectorized_engine import run_vectorized
+
+    strategy = get_strategy(strategy_name, params=p.get("params") or {})
+    return run_vectorized(
+        bars_1m=bars,
+        period=p["period"],
+        warmup_until=warmup_until,
+        strategy=strategy,
+        params=strategy.params,
+        init_cash=p["init_cash"],
+        init_position=p["init_position"],
+        trade_qty=p["trade_qty"],
+        scale=p.get("scale", 1.0),
+        buy_pct=p.get("buy_pct", 0.0),
+        sell_pct=p.get("sell_pct", 0.0),
+        device=device,
+    )["summary"]
+
+
+def run_one_vectorized(bars: dict, period: str, warmup_until: int,
+                       strategy_name: str,
+                       strategy_params: dict | None = None,
+                       init_cash: float = 200000.0,
+                       init_position: float = 200000.0,
+                       trade_qty: float = 10000.0,
+                       scale: float = 1.0,
+                       buy_pct: float = 0.0,
+                       sell_pct: float = 0.0,
+                       device: str = "cpu") -> dict:
+    """单组参数单窗回测 (vectorized 入口; 内部走 run_vectorized)
+
+    strategy_params: 策略参数 dict (会被 _resolve_params 校验)
+    """
+    from ..strategies import get_strategy
+    from .vectorized_engine import run_vectorized
+    strategy = get_strategy(strategy_name, params=strategy_params or {})
+    return run_vectorized(
+        bars_1m=bars, period=period, warmup_until=warmup_until,
+        strategy=strategy, params=strategy.params,
+        init_cash=init_cash, init_position=init_position,
+        trade_qty=trade_qty, scale=scale,
+        buy_pct=buy_pct, sell_pct=sell_pct, device=device,
+    )["summary"]
 
 
 def _empty_metrics(init_cash: float, init_position: float) -> dict:
@@ -101,88 +135,8 @@ def _empty_metrics(init_cash: float, init_position: float) -> dict:
         "ann_excess_pct": 0.0,
         "sharpe_excess": 0.0, "sortino_excess": 0.0,
         "cagr": 0.0, "calmar": 0.0,
-        "max_dd_days": 0.0, "max_dd_recovered": True,
+        "max_dd_days": 0.0, "max_dd_recovered": 0,
         "x_mdd": 0.0, "max_drawdown": 0.0, "turnover": 0.0,
-    }
-
-
-def run_one_general(bars: dict, period: str, warmup_until: int,
-                     init_cash: float, init_position: float, trade_qty: float,
-                     scale: float = 1.0,
-                     buy_pct: float = 0.0, sell_pct: float = 0.0,
-                     all_in: bool = False,
-                     strategy_name: str | None = None,
-                     strategy_params: dict | None = None) -> dict:
-    """通用策略单组参数单窗回测 (走参考引擎, 任意 strategies/ 子包策略)
-
-    strategy_name: 必填 (策略 key); 通过策略的 params_spec 解析所有参数,
-                   不绑定任何具体策略的参数名。
-    走参考引擎 (慢约 500x), 不进 numba/CUDA 加速路径; 用于参数空间探索 /
-    新策略验证。
-    """
-    if not strategy_name:
-        raise ValueError("run_one_general: strategy_name is required")
-    from .engine import build_engine
-    from ._harness import NumpyDictFeed
-
-    feed = NumpyDictFeed(bars)
-
-    tf1 = (strategy_params or {}).get("tf1", 21)
-    eng = build_engine(feed, period=period,
-                       warmup_until=str(warmup_until) if warmup_until else None,
-                       strategy_name=strategy_name,
-                       strategy_params=strategy_params or {},
-                       init_cash=init_cash, init_position=init_position,
-                       trade_qty=trade_qty, scale=scale,
-                       buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in,
-                       tf1=tf1, verbose=False)
-    # 空数据安全 (sweep 单窗可能给到空 bars, 已知 flush 会 IndexError, 跳过即可)
-    if len(bars["stime"]) == 0:
-        return _empty_metrics(init_cash, init_position)
-    eng.run()
-
-    account = eng.executor.account
-    final_price = account.last_price
-    eq = account.equity(final_price)
-    baseline = account.baseline_equity(final_price)
-    diff = eq - baseline
-    pct = (diff / baseline * 100.0) if baseline else 0.0
-
-    # 年数口径与 kernel.summarize / GPU _collect_gpu_results 一致:
-    # 首个 mark=1 (>= warmup_until) 的 bar 到末根, 不含预热段。
-    from .kernel import encoded_to_epoch
-    stime = bars["stime"]
-    years = 0.0
-    idx0 = int(np.searchsorted(stime, int(warmup_until)))
-    if idx0 < len(stime) and stime[-1] > stime[idx0]:
-        years = ((encoded_to_epoch(int(stime[-1])) - encoded_to_epoch(int(stime[idx0])))
-                 / (365.25 * 86400.0))
-
-    ann_excess = (pct / years) if years > 0 else 0.0
-    return {
-        "final_price": final_price,
-        "n_trades": len(account.trades),
-        "n_buy": sum(1 for t in account.trades if t["side"] == "BUY"),
-        "n_sell": sum(1 for t in account.trades if t["side"] == "SELL"),
-        "final_cash": account.cash,
-        "final_position": account.position,
-        "final_equity": eq,
-        "baseline": baseline,
-        "excess": diff,
-        "excess_pct": pct,
-        "years": years,
-        "ann_excess_pct": ann_excess,
-        # 参考引擎未追踪逐日权益曲线, 以下指标仅 kernel/GPU 路径计算;
-        # 此处占位 0.0/True, 与 _empty_metrics 一致 (口径缺口, 待参考层补权益序列后统一)。
-        "sharpe_excess": 0.0,
-        "sortino_excess": 0.0,
-        "cagr": 0.0,
-        "calmar": 0.0,
-        "max_dd_days": 0.0,
-        "max_dd_recovered": True,
-        "x_mdd": 0.0,
-        "max_drawdown": 0.0,
-        "turnover": sum(t["qty"] * t["price"] for t in account.trades),
     }
 
 
@@ -210,10 +164,10 @@ def _neighbor_decay(combos: list[dict], values: np.ndarray) -> np.ndarray:
             and not isinstance(combos[0][k], dict)]
     if not keys:
         return out
-    # 只保留可哈希类型 (排除 dict 等)
+
     def _safe_items(c):
         return tuple(sorted((k, v) for k, v in c.items()
-                           if isinstance(v, (int, float, str, bool))))
+                            if isinstance(v, (int, float, str, bool))))
     lookup = {_safe_items(c): i for i, c in enumerate(combos)}
     axis_vals = {k: sorted({c[k] for c in combos}) for k in keys}
     for i, c in enumerate(combos):
@@ -237,7 +191,7 @@ def _neighbor_decay(combos: list[dict], values: np.ndarray) -> np.ndarray:
 
 def _pareto_flag(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """双目标 (均最大化) 非支配标记"""
-    order = np.lexsort((-b, -a))          # a 降序, 同 a 时 b 降序
+    order = np.lexsort((-b, -a))
     flags = np.zeros(len(a), dtype=bool)
     best_b = -np.inf
     for idx in order:
@@ -248,11 +202,12 @@ def _pareto_flag(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def sweep(bars: dict, base: dict, combos: list[dict],
-          split_ymd: str = None, n_workers: int = None, verbose: bool = True,
+          split_ymd: str = None, n_workers: int | None = None,
+          verbose: bool = True,
           device: str = "cpu", splits: list = None, fee_bp: float = 5.0,
           lam: float = 1.0, min_trades: int = 30, max_mdd: float = 1.0,
           strategy_name: str | None = None):
-    """并发扫描 + 鲁棒评分; 返回 pandas.DataFrame (按 score 降序; 任意 DSL 策略)
+    """并发扫描 + 鲁棒评分; 返回 pandas.DataFrame (按 score 降序)
 
     strategy_name: 必填 (策略 key); 通过 params_spec 解析所有策略参数。
 
@@ -261,20 +216,13 @@ def sweep(bars: dict, base: dict, combos: list[dict],
     splits:  滚动 WFO 分割日列表 ["20260101","20260401"]; 1 个时窗口名为 train/test
              (兼容旧 --split), 多个时为 train/test1..testK。None=单窗 (列名无前缀)。
 
-    路径选择 (三端同源):
-      - 带 DSL docstring 的策略 -> numba 特化内核 (run_one_dsl);
-        device="gpu" 时走通用 CUDA kernel (cuda_sweep_window_generic)
-      - 无 DSL 的策略 -> 参考引擎 (run_one_general, 慢约 500x)
-
-    参数传递 (统一路径): 策略参数以 params dict 为唯一事实源
-    (--params > _defaults 落盘 > params_spec 默认)。
+    唯一执行路径: run_vectorized (cpu=xp=numpy, gpu=xp=cupy)。
     """
     if not strategy_name:
         raise ValueError("sweep: strategy_name is required")
     import pandas as pd
 
-    # 能力探测: requested device + 策略参数上限 + gpu_available
-    # auto 模式下 gpu 不可用或策略不兼容时, 降级到 cpu 并 warn
+    # 能力探测: requested device + gpu_available; auto 模式下 gpu 不可用时降级 cpu
     from .capability import gpu_available, select_device
     import logging
     _log = logging.getLogger("evtrade.sweep")
@@ -284,15 +232,13 @@ def sweep(bars: dict, base: dict, combos: list[dict],
     resolved = select_device(strategy_name, device, gpu_ok)
     if device == "auto" and resolved != device:
         _log.warning("device=auto 降级: 请求 %s -> 实际 %s", device, resolved)
-    device = resolved  # 后续分支统一用 device (cpu/gpu)
+    device = resolved
 
     if split_ymd and not splits:
         splits = [split_ymd]
     start = base["start"]
     if splits:
         sp = sorted(str(s) for s in splits)
-        # 单 split: 1 个 test (从 start 到 split 之后), 列名 train_/test_ 二者皆有
-        # 多 splits: train + K 个 test (test1_/test2_/...)
         if len(sp) == 1:
             wins = [("train", None, start), ("test", None, sp[0])]
         else:
@@ -304,128 +250,84 @@ def sweep(bars: dict, base: dict, combos: list[dict],
         wins = [("full", None, start)]
 
     def window_bars(end_ymd):
-        """按 end_ymd 截取 bars (numpy slice, 一次 searchsorted + 视图切片,
-        避免对每个 key 都做一次 Python boolean mask 拷贝)。
-
-        end_ymd=None 时返回原 bars 引用 (上游只在 wfo=单窗时用一次, 拷贝无意义)。
-        """
         if end_ymd is None:
             return bars
         cutoff = int(end_ymd) * 1_000_000
-        # np.searchsorted(side='left') 找第一个 >= cutoff 的下标, 与原语义
-        # 'stime < cutoff' 等价; 但 searchsorted 是 C 实现的 O(log n) 标量,
-        # 然后用 slice 拿到原数组的视图 (no copy)
         idx = int(np.searchsorted(bars["stime"], cutoff, side="left"))
         return {k: v[:idx] for k, v in bars.items()}
 
     win_data = [(nm, window_bars(e), int(w) * 1_000_000) for nm, e, w in wins]
 
-    # 统一参数路径: 策略参数以 params dict 为唯一事实源 (--params > _defaults 落盘);
-    # 所有 GPU/CPU 路径都读 p["params"]。
+    # ---- 解析 strategy_params: 只保留 params_spec 白名单内键 ----
+    # 兼容历史 combos 同时支持 "顶层 strategy keys" 与 "params={...}" 两种形态
+    from ..strategies import get_strategy_class
+    spec = get_strategy_class(strategy_name).params_spec or {}
     base_params = dict(base.get("params") or {})
-    # 网格 key 覆盖到 base["params"] 上; 缺失的参数继承基础值
-    #   语义: --params 提供基础参数, --grid 在指定 key 上扫描, 未指定 key 沿用基础值
+
+    def _strategy_params(c: dict) -> dict:
+        """从 combo 抽策略参数: 同时认 params 包装层与顶层 spec 键"""
+        nested = dict(c.get("params") or {})
+        merged = {**base_params, **nested, **{k: v for k, v in c.items() if k in spec}}
+        # 仅保留 spec 内的键
+        return {k: v for k, v in merged.items() if k in spec}
+
     new_combos = []
     for c in combos:
-        # 用临时 dict 合并, 不修改原 c (避免 list(c) + 赋值 c[k] 互相污染)
-        merged_params = {**base_params, **c}
-        new_c = dict(c)            # copy of grid keys
-        new_c["params"] = merged_params
+        new_c = dict(c)
+        new_c["params"] = _strategy_params(c)
         new_combos.append(new_c)
     combos = new_combos
     params_list = [{**base, **c} for c in combos]
 
     t0 = time.perf_counter()
-    # 路径选择: dsl_fast -> numba 内核; 无 DSL -> 参考引擎兜底。
-    # GPU 一律走通用 CUDA kernel (cuda_sweep_window_generic, 所有 DSL 策略同路径)。
-    dsl_fast = strategy_has_dsl(strategy_name)
-    metrics = [None] * len(win_data)
-    if device == "gpu" and dsl_fast:
-        from .gpu import cuda_sweep_window_generic
-        for wi, (nm, wb, warm) in enumerate(win_data):
-            metrics[wi] = cuda_sweep_window_generic(wb, params_list, warm,
-                                                    strategy_name=strategy_name)
-    else:
-        # 主线程预热: 把首次 numba specialization 串行化在主线程, 避免并发
-        # worker 同时第一次调用 dsl_kernel(name).run_backtest 时各自触发
-        # numba type specialization, 浪费 CPU 且扭曲冷启动延迟。
-        if dsl_fast:
-            try:
-                from .kernel_dsl import dsl_kernel, make_state_general
-                _first_p = params_list[0]
-                _kmod = dsl_kernel(strategy_name)
-                _probe_st = make_state_general(
-                    strategy_name, _first_p["period"], warmup_until=0,
-                    tf1=_first_p.get("tf1", 21),
-                    init_cash=_first_p["init_cash"],
-                    init_position=_first_p["init_position"],
-                    trade_qty=_first_p["trade_qty"],
-                    strategy_params=_first_p.get("params", {}))
-                # 取第一窗口前 32 个 bar 当探针 (覆盖 warmup 即可, 避免预热开销)
-                _wb = win_data[0][1]
-                _n = min(32, len(_wb["stime"]))
-                _kmod.run_backtest(_probe_st,
-                                   _wb["stime"][:_n], _wb["open"][:_n],
-                                   _wb["high"][:_n], _wb["low"][:_n],
-                                   _wb["close"][:_n], _wb["volume"][:_n],
-                                   _EMPTY_SIG, _EMPTY_F, _EMPTY_F)
-                _kmod.summarize(_probe_st)
-            except Exception as _e:
-                # 预热失败不应中断 sweep —— 后面的 run_one_dsl 会再次触发
-                # 并给出原始错误; 这里只 log warning 让用户感知
-                import logging
-                logging.getLogger("evtrade.sweep").warning(
-                    "numba kernel warm-up 失败 (将走冷启动): %s", _e)
+    # 统一走 vectorized 入口 (CPU/GPU 同 xp)
+    metrics = [[None] * len(params_list) for _ in win_data]
+    if n_workers and n_workers > 1:
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            # 把 (wi, ci) 全部 flatten 一次性提交, 让窗口切片与 kernel 执行
-            # 真正重叠; 用 as_completed 流式收集到预分配 metrics 缓冲,
-            # 哪个先完先写对应槽位 —— 不再按 wi 顺序 barrier 等待整窗完成。
-            metrics = [[None] * len(params_list) for _ in win_data]
             futures = {}
             for wi, (nm, wb, warm) in enumerate(win_data):
                 for ci, p in enumerate(params_list):
-                    if dsl_fast:
-                        # DSL 策略: numba 内核
-                        fut = ex.submit(
-                            run_one_dsl, wb, p["period"], warm,
-                            p["init_cash"], p["init_position"], p["trade_qty"],
-                            p.get("tf1", 21),
-                            p.get("scale", 1.0),
-                            p.get("buy_pct", 0.0), p.get("sell_pct", 0.0),
-                            p.get("all_in", False),
-                            strategy_name=strategy_name,
-                            strategy_params=p.get("params", {}))
-                    else:
-                        # 无 DSL 策略: 走参考引擎, 通用 params dict 透传
-                        sp = p.get("params", {})
-                        fut = ex.submit(
-                            run_one_general, wb, p["period"], warm,
-                            p["init_cash"], p["init_position"], p["trade_qty"],
-                            p.get("scale", 1.0),
-                            p.get("buy_pct", 0.0), p.get("sell_pct", 0.0),
-                            p.get("all_in", False),
-                            strategy_name=strategy_name,
-                            strategy_params=sp)
+                    fut = ex.submit(
+                        run_one_vectorized, wb, p["period"], warm,
+                        strategy_name=strategy_name,
+                        strategy_params=p.get("params", {}),
+                        init_cash=p["init_cash"],
+                        init_position=p["init_position"],
+                        trade_qty=p["trade_qty"],
+                        scale=p.get("scale", 1.0),
+                        buy_pct=p.get("buy_pct", 0.0),
+                        sell_pct=p.get("sell_pct", 0.0),
+                        device=device,
+                    )
                     futures[fut] = (wi, ci)
-
-            # 流式收集: as_completed 按完成顺序返回; 立即写 metrics[wi][ci]
-            # 这样无需等待整窗; 异常也会立刻 re-raise。
             from concurrent.futures import as_completed
             for fut in as_completed(futures):
                 wi, ci = futures[fut]
                 metrics[wi][ci] = fut.result()
+    else:
+        for wi, (nm, wb, warm) in enumerate(win_data):
+            for ci, p in enumerate(params_list):
+                metrics[wi][ci] = run_one_vectorized(
+                    wb, p["period"], warm,
+                    strategy_name=strategy_name,
+                    strategy_params=p.get("params", {}),
+                    init_cash=p["init_cash"],
+                    init_position=p["init_position"],
+                    trade_qty=p["trade_qty"],
+                    scale=p.get("scale", 1.0),
+                    buy_pct=p.get("buy_pct", 0.0),
+                    sell_pct=p.get("sell_pct", 0.0),
+                    device=device,
+                )
     dt = time.perf_counter() - t0
 
-    # ---- 行装配: 每窗原始指标 (单窗 full 不加前缀, 兼容旧输出) + 年化扣费 ----
-    # 通用策略: row 里把 params 拍平 (lookback/breakout_pct 提到顶层)
+    # ---- 行装配 ----
     rows = []
     for ci, combo in enumerate(combos):
         row = {**combo}
         if "params" in row:
-            # 把基础参数拍平到顶层 (grid 值已存在, 不覆盖)
             for k, v in row["params"].items():
                 row.setdefault(k, v)
-            # 不再保留 "params" 字段 (避免与拍平后的 key 重复)
             del row["params"]
         for (nm, _, _), ms in zip(win_data, metrics):
             m = ms[ci]
@@ -438,15 +340,15 @@ def sweep(bars: dict, base: dict, combos: list[dict],
         row["ann_net_min"] = min(anns)
         row["ann_net_mean"] = float(np.mean(anns))
         row["pos_ratio"] = float(np.mean([a > 0 for a in anns]))
-        row["sharpe_min"] = min(m["sharpe_excess"] for m in test_metrics)
+        row["sharpe_min"] = min(m.get("sharpe_excess", 0.0) for m in test_metrics)
         row["sortino_min"] = min(m.get("sortino_excess", 0.0) for m in test_metrics)
         row["calmar_max"] = max(m.get("calmar", 0.0) for m in test_metrics)
         row["cagr_max"] = max(m.get("cagr", 0.0) for m in test_metrics)
         row["max_dd_days_max"] = max(m.get("max_dd_days", 0.0) for m in test_metrics)
-        row["x_mdd_max"] = max(m["x_mdd"] for m in test_metrics)
+        row["x_mdd_max"] = max(m.get("x_mdd", 0.0) for m in test_metrics)
         row["filter_pass"] = bool(
             all(m["n_trades"] >= min_trades for m in test_metrics)
-            and all(m["max_drawdown"] <= max_mdd for m in test_metrics))
+            and all(m.get("max_drawdown", 0.0) <= max_mdd for m in test_metrics))
         rows.append(row)
 
     # ---- 邻域衰减 S + 复合 score + 帕累托 ----
