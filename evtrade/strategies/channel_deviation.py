@@ -70,6 +70,58 @@ def _init_fsm_state():
             "low_acted": False, "high_acted": False}
 
 
+# ============ 共享 helpers (去重 compute_signals / _for_one_bar, dedupe-fsm-helpers) ============
+
+def _parse_thresholds(params: dict) -> tuple[float, float, float, float]:
+    """(low1, low2, high1, high2) 一次性解析, 避免两处重复写 4 个 float(params[k])"""
+    return (float(params["low1"]), float(params["low2"]),
+            float(params["high1"]), float(params["high2"]))
+
+
+def _compute_devs_scalar(up: float, dw: float, h: float, l: float):
+    """4 个偏离 (low_dev, high_dev, low_dev_h, high_dev_l) 标量版
+
+    逐 bar 路径用 (compute_signals_for_one_bar); 通道未就绪 (up==0 或 dw==0)
+    时返 4 个 0.0, 避免 RuntimeWarning: divide by zero。
+    """
+    if up == 0.0 or dw == 0.0:
+        return 0.0, 0.0, 0.0, 0.0
+    return ((dw - l) / dw * 100.0,
+            (h - up) / up * 100.0,
+            (dw - h) / dw * 100.0,
+            (l - up) / up * 100.0)
+
+
+def _compute_devs_xp(xp, up, dw, h, l):
+    """4 个偏离 xp 数组算子版 (批量 compute_signals 用; GPU 加速)
+
+    与原版差异 (顺手修): 原版 (dw_v - l) / dw_v 在 dw_v==0 时产生 inf,
+    FSM 把 inf 视为大数会误触发。新版用 safe_dw/safe_up (0->1) 计算,
+    最后用 ready mask 强制未就绪处返 0。NaN 由 up_v/dw_v 替换前置掉。
+    """
+    up_v = xp.where(xp.isnan(up), 0.0, up)
+    dw_v = xp.where(xp.isnan(dw), 0.0, dw)
+    safe_up = xp.where(up_v == 0, 1.0, up_v)
+    safe_dw = xp.where(dw_v == 0, 1.0, dw_v)
+    low_dev    = (safe_dw - l)   / safe_dw * 100.0
+    high_dev   = (h - safe_up)   / safe_up * 100.0
+    low_dev_h  = (safe_dw - h)   / safe_dw * 100.0
+    high_dev_l = (l - safe_up)   / safe_up * 100.0
+    ready = (up_v != 0) & (dw_v != 0)
+    return (xp.where(ready, low_dev,    0.0),
+            xp.where(ready, high_dev,   0.0),
+            xp.where(ready, low_dev_h,  0.0),
+            xp.where(ready, high_dev_l, 0.0))
+
+
+def _run_fsm(state, ts, low_dev_h, low_dev, high_dev_l, high_dev,
+             low1, low2, high1, high2) -> int:
+    """薄包装 _fsm_step; 把传参顺序定死避免两处调用错位"""
+    return _fsm_step(state, ts,
+                     low_dev_h, low_dev, high_dev_l, high_dev,
+                     low1, low2, high1, high2)
+
+
 # ============ 策略类 (单继承 VectorizedStrategy) ============
 
 @register_strategy("channel_deviation")
@@ -103,20 +155,15 @@ class ChannelDeviationStrategy(VectorizedStrategy):
 
     def compute_signals(self, xp, bars: dict, params: dict):
         tf1 = int(params["tf1"])
-        low1 = float(params["low1"]); low2 = float(params["low2"])
-        high1 = float(params["high1"]); high2 = float(params["high2"])
+        low1, low2, high1, high2 = _parse_thresholds(params)
 
-        # 1) 向量化: EMA 通道 + 4 个偏离 (xp 数组算子)
+        # 1) 向量化: EMA 通道 + 4 个偏离 (xp 数组算子; GPU 加速)
         #    EMA 在桶级 finalized OHLCV 上算 (与 Engine.on_bars 桶 CLOSE 语义对齐:
         #    桶切换时 push 上一桶 high, 然后 ema_current 用本桶 finalized high)
         up, dw = xp_ema_channel(xp, bars["h"], bars["l"], tf1)
-        # NaN -> 0 (未就绪时偏离不触发; FSM 会因 low_dev=0 不置位)
-        up_v = xp.where(xp.isnan(up), 0.0, up)
-        dw_v = xp.where(xp.isnan(dw), 0.0, dw)
-        low_dev = (dw_v - bars["l"]) / dw_v * 100.0
-        high_dev = (bars["h"] - up_v) / up_v * 100.0
-        low_dev_h = (dw_v - bars["h"]) / dw_v * 100.0
-        high_dev_l = (bars["l"] - up_v) / up_v * 100.0
+        # NaN -> 0 + 通道未就绪 (up==0/dw==0) -> 0 由 _compute_devs_xp 处理
+        low_dev, high_dev, low_dev_h, high_dev_l = _compute_devs_xp(
+            xp, up, dw, bars["h"], bars["l"])
 
         # 2) FSM (Python 循环; cupy 时先拉回 host)
         ts = bars["ts"]; mark = bars["mark"]
@@ -131,11 +178,10 @@ class ChannelDeviationStrategy(VectorizedStrategy):
         for i in range(n):
             if mark[i] == 0:
                 continue
-            s = _fsm_step(state, int(ts[i]),
-                          float(low_dev_h[i]), float(low_dev[i]),
-                          float(high_dev_l[i]), float(high_dev[i]),
-                          low1, low2, high1, high2)
-            sig[i] = s
+            sig[i] = _run_fsm(state, int(ts[i]),
+                              float(low_dev_h[i]), float(low_dev[i]),
+                              float(high_dev_l[i]), float(high_dev[i]),
+                              low1, low2, high1, high2)
         return sig
 
     # ---- 逐 bar 路径 (Engine.on_bars / 实盘; 覆写避免每根 O(n) 重算) ----
@@ -161,23 +207,20 @@ class ChannelDeviationStrategy(VectorizedStrategy):
         self._cur_low = cur_low
         self._has_prev = True
 
-        # 当前通道值 (含 pending)
+        # 当前通道值 (含 pending); 通道未就绪由 _compute_devs_scalar 内部短路
         us, uc, ue = self._up_st
         ds, dc, de = self._dw_st
         up = ema_current(us, uc, ue, cur_high, tf1)
         dw = ema_current(ds, dc, de, cur_low, tf1)
+
+        low_dev, high_dev, low_dev_h, high_dev_l = _compute_devs_scalar(
+            up, dw, cur_high, cur_low)
         if up == 0.0 or dw == 0.0:
-            return 0
+            return 0  # 通道未就绪: 偏离全 0, FSM 不触发
 
-        low_dev = (dw - cur_low) / dw * 100.0
-        high_dev = (cur_high - up) / up * 100.0
-        low_dev_h = (dw - cur_high) / dw * 100.0
-        high_dev_l = (cur_low - up) / up * 100.0
-
-        return _fsm_step(self._fsm, cur_ts, low_dev_h, low_dev,
-                         high_dev_l, high_dev,
-                         float(params["low1"]), float(params["low2"]),
-                         float(params["high1"]), float(params["high2"]))
+        return _run_fsm(self._fsm, cur_ts,
+                        low_dev_h, low_dev, high_dev_l, high_dev,
+                        *_parse_thresholds(params))
 
     # ---- 展示 hook ----
 
