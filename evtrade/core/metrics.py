@@ -3,9 +3,9 @@ from __future__ import annotations
 
 公开 API:
   bars_to_arrays       list[Bar] -> numpy dict (vectorized 引擎输入)
-  summarize            终态 + equity 序列 -> 25 字段绩效字典
+  summarize            终态 + equity 序列 -> 30 字段绩效字典
 
-summarize 字段集 (25):
+summarize 字段集 (30):
   终态 (5):     final_price / final_cash / final_position / final_equity / baseline
   交易 (5):     n_trades / n_buy / n_sell / turnover / excess_pct
   时间 (2):     years / cagr_excess
@@ -133,7 +133,7 @@ def summarize(final_state: dict, init_cash: float, init_position: float,
               first_ts: int = 0, last_ts: int = 0,
               trades: list | None = None,
               bucket_seconds: int = 300) -> dict:
-    """终态 + equity 序列 + 成交记录 -> 25 字段绩效字典
+    """终态 + equity 序列 + 成交记录 -> 30 字段绩效字典
 
     equity_curve / baseline_curve 由 vectorized_engine 在逐 bar 执行中累积:
       equity_curve[i]   = cash_i + position_i * close_i

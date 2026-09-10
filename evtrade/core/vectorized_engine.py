@@ -5,7 +5,7 @@ from __future__ import annotations
   - 桶聚合 (numpy 向量化, 任意 m/h/d 周期)
   - 信号循环: strategy.step(state, bar, params) -> (state, sig)
   - 成交执行 (顺序; 与 SimulatedExecutor 同语义)
-  - 汇总 metrics (25 字段)
+  - 汇总 metrics (30 字段)
 
 state 由引擎持有, 跨调用持续。strategy.step 是策略唯一入口。
 """
@@ -13,7 +13,8 @@ state 由引擎持有, 跨调用持续。strategy.step 是策略唯一入口。
 import numpy as np
 
 from ..execution.base import trade_decision
-from .metrics import summarize as _summarize_full
+from .config import INIT_CASH, INIT_POSITION, TRADE_QTY
+from .metrics import summarize
 from .timeutils import resolve_period_seconds
 from .tsbucket import precompute_ts_mark
 
@@ -168,45 +169,12 @@ def _compute_signals(strategy, params: dict, buckets: dict,
 
 
 
-# ============ 汇总 (metrics.summarize 25 字段) ============
-
-def _summarize(exec_state: dict, init_cash: float, init_position: float,
-               first_ts: int, last_ts: int, bucket_seconds: int = 300) -> dict:
-    eq = exec_state.get("equity_curve")
-    bl = exec_state.get("baseline_curve")
-    last_price = exec_state.get("last_price", 0.0)
-    cash = exec_state["cash"]
-    position = exec_state["position"]
-
-    summary = _summarize_full(
-        final_state={
-            "cash": cash,
-            "position": position,
-            "last_price": last_price,
-            "n_trades": exec_state["n_trades"],
-            "n_buy": exec_state["n_buy"],
-            "n_sell": exec_state["n_sell"],
-            "turnover": exec_state["turnover"],
-        },
-        init_cash=init_cash,
-        init_position=init_position,
-        equity_curve=eq,
-        baseline_curve=bl,
-        first_ts=first_ts,
-        last_ts=last_ts,
-        trades=exec_state["trades"],
-        bucket_seconds=bucket_seconds,
-    )
-    summary["trades"] = exec_state["trades"]
-    return summary
-
-
 # ============ 主入口 ============
 
 def run_vectorized(bars_1m: dict, period: str, warmup_until: int,
                    strategy, params: dict,
-                   init_cash: float = 200000.0, init_position: float = 200000.0,
-                   trade_qty: float = 10000.0, scale: float = 1.0,
+                   init_cash: float = INIT_CASH, init_position: float = INIT_POSITION,
+                   trade_qty: float = TRADE_QTY, scale: float = 1.0,
                    buy_pct: float = 0.0, sell_pct: float = 0.0,
                    verbose: bool = False) -> dict:
     """向量化回测 (strategy-step-only)
@@ -236,9 +204,27 @@ def run_vectorized(bars_1m: dict, period: str, warmup_until: int,
         sig_np, close_np, ts_np, init_cash, init_position, trade_qty,
         scale, buy_pct, sell_pct)
 
-    bucket_seconds = resolve_period_seconds(period)
-    summary = _summarize(exec_state, init_cash, init_position,
-                          first_ts, last_ts, bucket_seconds=bucket_seconds)
+    # 汇总 (metrics.summarize, 30 字段)
+    summary = summarize(
+        final_state={
+            "cash": exec_state["cash"],
+            "position": exec_state["position"],
+            "last_price": exec_state.get("last_price", 0.0),
+            "n_trades": exec_state["n_trades"],
+            "n_buy": exec_state["n_buy"],
+            "n_sell": exec_state["n_sell"],
+            "turnover": exec_state["turnover"],
+        },
+        init_cash=init_cash,
+        init_position=init_position,
+        equity_curve=exec_state.get("equity_curve"),
+        baseline_curve=exec_state.get("baseline_curve"),
+        first_ts=first_ts,
+        last_ts=last_ts,
+        trades=exec_state["trades"],
+        bucket_seconds=resolve_period_seconds(period),
+    )
+    summary["trades"] = exec_state["trades"]
 
     sig_live = sig_np[mark_np == 1]
 

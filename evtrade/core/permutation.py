@@ -1,8 +1,7 @@
 from __future__ import annotations
 """蒙特卡洛置换检验: 排除"好绩效是运气"
 
-置换方式 (日块打乱, 不是逐 bar 打乱) 是 kbs/13 的核心方法论, 已被
-tests/test_sweep.py::test_permutation_sanity 锁定。
+置换方式 (日块打乱, 不是逐 bar 打乱) 是 kbs/13 第 3 层的核心方法论。
 逐 bar 打乱会人工制造跳变, null 被打穿到 -60%/年, 完全失去参考价值。
 
 原理 (日块自助置换, stationary bootstrap 的离散版):

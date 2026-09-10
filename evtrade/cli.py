@@ -103,13 +103,8 @@ def _data_parent() -> argparse.ArgumentParser:
 
 # ============ backtest 子命令 ============
 
-def build_backtest_parser(ap: argparse.ArgumentParser | None = None
-                          ) -> argparse.ArgumentParser:
-    """backtest 选项; ap 为 None 时自建 (独立调用), 否则注册到给定 parser (root 嵌套)"""
-    if ap is None:
-        ap = argparse.ArgumentParser(
-            prog="evtrade backtest",
-            description="策略回测 (vectorized; CPU/GPU 统一走 PyTorch, --device 路由)")
+def build_backtest_parser(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """backtest 选项 (注册到给定 parser; prog/description 在 backtest_main)"""
     ap.add_argument("--verbose", "-v", action="store_true",
                     help="逐根打印 strategy.format_signal_line 输出 (sig!=0 时)")
     ap.add_argument("--init-cash", type=float, default=INIT_CASH,
@@ -119,14 +114,13 @@ def build_backtest_parser(ap: argparse.ArgumentParser | None = None
     return ap
 
 
-def _f4(v) -> str:
-    """数值格式化: NaN -> ----"""
-    try:
-        if v != v:
-            return "----"
-    except TypeError:
-        return "----"
-    return f"{v:.4f}"
+def _write_signals_csv(path: str, rows: list[tuple]) -> None:
+    """写信号轨迹 CSV (stime,signal; utf-8-sig 供 Excel 直开)"""
+    with open(path, "w", encoding="utf-8-sig") as f:
+        f.write("stime,signal\n")
+        for t, s in rows:
+            f.write(f"{t},{s}\n")
+    print(f"信号轨迹已保存: {path} ({len(rows)} 行)")
 
 
 def _run_backtest(args):
@@ -209,13 +203,12 @@ def _run_backtest(args):
     print("=" * 60)
 
     if args.signals_out:
-        sig = result["sig"]
-        stime = bars["stime"]
-        with open(args.signals_out, "w", encoding="utf-8-sig") as f:
-            f.write("stime,signal\n")
-            for i in range(len(stime)):
-                f.write(f"{int(stime[i])},{int(sig[i])}\n")
-        print(f"信号轨迹已保存: {args.signals_out} ({len(stime)} 行)")
+        # sig 是桶级 (mark=1 段); ts 与 sig 同源同 mask, 逐对写出
+        b = result["buckets"]
+        live = b["mark"] == 1
+        _write_signals_csv(
+            args.signals_out,
+            [(int(t), int(s)) for t, s in zip(b["ts"][live], result["sig"])])
 
 
 def backtest_main(argv=None):
@@ -230,13 +223,8 @@ def backtest_main(argv=None):
 
 # ============ sweep 子命令 ============
 
-def build_sweep_parser(ap: argparse.ArgumentParser | None = None
-                       ) -> argparse.ArgumentParser:
-    """sweep 选项; ap 为 None 时自建 (独立调用), 否则注册到给定 parser (root 嵌套)"""
-    if ap is None:
-        ap = argparse.ArgumentParser(
-            prog="evtrade sweep",
-            description="参数并发扫描 (vectorized; CPU/GPU 统一)")
+def build_sweep_parser(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """sweep 选项 (注册到给定 parser; prog/description 在 sweep_main)"""
     ap.add_argument("--grid", action="append", default=[],
                     help="参数网格, 可多次: --grid key=v1,v2,v3")
     ap.add_argument("--split", default=None, help="单分割日 YYYYMMDD")
@@ -285,7 +273,6 @@ def sweep_main(argv=None):
     base = {"start": args.start, "period": args.period,
             "trade_qty": args.trade_qty, "scale": args.scale,
             "buy_pct": args.buy_pct, "sell_pct": args.sell_pct,
-            "all_in": args.all_in,
             "init_cash": INIT_CASH, "init_position": INIT_POSITION,
             "params": base_params}
     spec_keys = set(get_strategy_param_spec(args.strategy))
@@ -342,13 +329,8 @@ def sweep_main(argv=None):
 
 # ============ replay 子命令 ============
 
-def build_replay_parser(ap: argparse.ArgumentParser | None = None
-                        ) -> argparse.ArgumentParser:
-    """replay 选项; ap 为 None 时自建 (独立调用), 否则注册到给定 parser (root 嵌套)"""
-    if ap is None:
-        ap = argparse.ArgumentParser(
-            prog="evtrade replay",
-            description="录制回放对账 (vectorized 引擎; --against-ref 走 Engine.on_bars 对账)")
+def build_replay_parser(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """replay 选项 (注册到给定 parser; prog/description 在 replay_main)"""
     ap.add_argument("--log", required=True,
                     help="bar 日志 (CSV: stime,code,open,high,low,close,volume)")
     ap.add_argument("--warmup-until", default=None)
@@ -383,10 +365,15 @@ def replay_main(argv=None):
           f"params={sp or '(默认)'}  scale={args.scale}  device={args.device}\n",
           flush=True)
 
+    # all_in 两腿对称: 解析为 buy/sell_pct=1.0 后统一传给 vectorized 腿与
+    # reconcile (Engine 腿 SimulatedExecutor 内部同语义); 否则对账必然不对称 FAIL
+    buy_pct = max(args.buy_pct, 1.0) if args.all_in else args.buy_pct
+    sell_pct = max(args.sell_pct, 1.0) if args.all_in else args.sell_pct
+
     k = replay_vectorized(bars, args.period, warm,
                           strategy_name=strategy_name, strategy_params=sp,
                           scale=args.scale,
-                          buy_pct=args.buy_pct, sell_pct=args.sell_pct)
+                          buy_pct=buy_pct, sell_pct=sell_pct)
     s = k["summary"]
     n_sig = int((k["sig"] != 0).sum()) if hasattr(k["sig"], "__len__") else 0
     print(f"信号 {n_sig} 个 (BUY {s['n_buy']} / SELL {s['n_sell']}), "
@@ -394,31 +381,24 @@ def replay_main(argv=None):
           f"(基线 {s['baseline']:,.2f}, 超额 {s['excess_pct']:+.2f}%)")
 
     if args.signals_out:
-        with open(args.signals_out, "w", encoding="utf-8-sig") as f:
-            f.write("stime,signal\n")
-            for i, b in enumerate(bars):
-                f.write(f"{b.stime},{int(k['sig'][i])}\n")
-        print(f"信号轨迹已保存: {args.signals_out} ({len(bars)} 行)")
+        _write_signals_csv(
+            args.signals_out,
+            [(int(t), int(s)) for t, s in zip(k["ts"], k["sig"])])
 
     if args.against_ref:
         print()
         reconcile(bars, args.period, warm,
                   strategy_name=strategy_name, strategy_params=sp,
                   scale=args.scale,
-                  buy_pct=args.buy_pct, sell_pct=args.sell_pct,
+                  buy_pct=buy_pct, sell_pct=sell_pct,
                   all_in=args.all_in)
 
 
 # ============ params 子命令 (默认参数落盘) ============
 
-def build_params_parser(ap: argparse.ArgumentParser | None = None
-                        ) -> argparse.ArgumentParser:
-    """params 选项 (含 save / show / list 二级子命令);
-    ap 为 None 时自建 (独立调用), 否则注册到给定 parser (root 嵌套)"""
-    if ap is None:
-        ap = argparse.ArgumentParser(
-            prog="evtrade params",
-            description="策略默认参数管理 (落盘 evtrade/strategies/_defaults/<name>.json)")
+def build_params_parser(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """params 选项 (含 save / show / list 二级子命令;
+    注册到给定 parser; prog/description 在 params_main)"""
     sub = ap.add_subparsers(dest="params_cmd", required=True)
 
     p_save = sub.add_parser("save", help="保存最优参数到默认目录")

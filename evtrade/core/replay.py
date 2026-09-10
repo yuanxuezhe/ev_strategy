@@ -20,6 +20,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..primitives import Bar
+from .config import INIT_CASH, INIT_POSITION, TRADE_QTY
 from .metrics import bars_to_arrays
 from .timeutils import resolve_period_seconds
 
@@ -75,13 +76,15 @@ def read_bars_log(path: str) -> list[Bar]:
 
 def replay_vectorized(bars, period: str, warmup_until: int,
                       strategy_name: str, strategy_params: dict,
-                      init_cash: float = 200000.0, init_position: float = 200000.0,
-                      trade_qty: float = 10000.0, scale: float = 1.0,
+                      init_cash: float = INIT_CASH,
+                      init_position: float = INIT_POSITION,
+                      trade_qty: float = TRADE_QTY, scale: float = 1.0,
                       buy_pct: float = 0.0, sell_pct: float = 0.0) -> dict:
     """vectorized 引擎回放: 返回逐 bar 信号轨迹 (桶级对齐) + 成交流 + 绩效
 
     返回 dict:
-      "sig"        桶级信号轨迹 (int8[N_buckets])
+      "sig"        桶级信号轨迹 (int8[N_live_buckets])
+      "ts"         桶级 ts (与 sig 对齐, 与 trades 的 ts 同源)
       "trades"     成交流 (list)
       "summary"    绩效摘要 (dict)
     """
@@ -99,6 +102,7 @@ def replay_vectorized(bars, period: str, warmup_until: int,
     )
     return {
         "sig": out["sig"],
+        "ts": out["buckets"]["ts"][out["buckets"]["mark"] == 1],
         "trades": out["trades"],
         "summary": out["summary"],
     }
@@ -106,8 +110,8 @@ def replay_vectorized(bars, period: str, warmup_until: int,
 
 def replay_engine(bars, period: str, warmup_until: int,
                   strategy_name: str, strategy_params: dict,
-                  init_cash: float = 200000.0, init_position: float = 200000.0,
-                  trade_qty: float = 10000.0, scale: float = 1.0,
+                  init_cash: float = INIT_CASH, init_position: float = INIT_POSITION,
+                  trade_qty: float = TRADE_QTY, scale: float = 1.0,
                   buy_pct: float = 0.0, sell_pct: float = 0.0,
                   all_in: bool = False) -> dict:
     """参考引擎 (Engine 全链路) 回放: 输出与 replay_vectorized 同构 (桶级对齐)
@@ -157,8 +161,8 @@ def diff_signals(sig_a: np.ndarray, sig_b: np.ndarray) -> dict:
 
 def reconcile(bars, period: str, warmup_until: int,
               strategy_name: str, strategy_params: dict,
-              init_cash: float = 200000.0, init_position: float = 200000.0,
-              trade_qty: float = 10000.0, scale: float = 1.0,
+              init_cash: float = INIT_CASH, init_position: float = INIT_POSITION,
+              trade_qty: float = TRADE_QTY, scale: float = 1.0,
               buy_pct: float = 0.0, sell_pct: float = 0.0, all_in: bool = False,
               verbose: bool = True,
               strict: bool | None = None,

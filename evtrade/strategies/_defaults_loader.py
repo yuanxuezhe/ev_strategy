@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -135,7 +136,11 @@ def auto_cast(s: str):
 # sweep 自动选最优并落盘 (含原因 + 自动 git commit)
 # ============================================================
 
-import subprocess  # noqa: E402  放在 save() 之后保持模块可读
+
+def _git(*args: str) -> subprocess.CompletedProcess:
+    """git 子进程 (统一 utf-8 捕获; 供 _commit_defaults_file 用)"""
+    return subprocess.run(["git", *args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
 
 
 def pick_best_row(df, strategy_name: str):
@@ -243,16 +248,12 @@ def _commit_defaults_file(path: Path, strategy_name: str,
     rel_unix = rel.replace("\\", "/")
     try:
         # 1. git add
-        r = subprocess.run(["git", "add", "--", rel_unix],
-                           capture_output=True, text=True,
-                           encoding="utf-8", errors="replace")
+        r = _git("add", "--", rel_unix)
         if r.returncode != 0:
             print(f"[警告] git add 失败: {r.stderr.strip()}", flush=True)
             return False
         # 2. 检查是否有差异 (空 commit 不必做)
-        r = subprocess.run(["git", "diff", "--cached", "--name-only"],
-                           capture_output=True, text=True,
-                           encoding="utf-8", errors="replace")
+        r = _git("diff", "--cached", "--name-only")
         if r.returncode != 0 or not r.stdout.strip():
             print(f"[跳过] {rel_unix} 无差异, 不 commit", flush=True)
             return False
@@ -274,9 +275,7 @@ def _commit_defaults_file(path: Path, strategy_name: str,
                 + ", ".join(f"{k}={v!r}" for k, v in
                             (reason.get("chosen_params") or {}).items())
                 + f"\n\n来源: 自动从 sweep 结果挑选 (CSV={reason.get('csv', '?')})")
-        r = subprocess.run(["git", "commit", "-m", msg],
-                           capture_output=True, text=True,
-                           encoding="utf-8", errors="replace")
+        r = _git("commit", "-m", msg)
         if r.returncode != 0:
             print(f"[警告] git commit 失败: {r.stderr.strip()}",
                   flush=True)

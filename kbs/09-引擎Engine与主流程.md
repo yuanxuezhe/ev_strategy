@@ -88,7 +88,7 @@ def run(self):
 盈亏汇总**不是 Engine 的方法**，统一由 `evtrade/core/metrics.summarize(final_state,
 init_cash, init_position, equity_curve=None, baseline_curve=None, first_ts, last_ts,
 trades=None, bucket_seconds=300) -> dict` 给出，vectorized 路径
-（`vectorized_engine._summarize`）在逐 bar 执行中累积 `equity_curve` / `baseline_curve`
+（`run_vectorized` 内联调用）在逐 bar 执行中累积 `equity_curve` / `baseline_curve`
 后调用。
 
 基础口径（详见 07 文档）：
