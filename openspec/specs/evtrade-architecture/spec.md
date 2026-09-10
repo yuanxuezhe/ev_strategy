@@ -321,9 +321,11 @@ MUST NOT 存在"被接受但从不读取"的 CLI flag（`--no-sleep` / `--step-d
 ### Requirement: PyTorch 统一后端
 
 `evtrade` MUST 使用 PyTorch 作为唯一 array 后端能力来源（`pyproject.toml` 声明
-`torch>=2.0`）；`evtrade.backends.gpu_available()` MUST 委托 `torch.cuda.is_available()`。
-当前热路径（桶预计算 + 策略 step）为设备无关 numpy/标量实现，`backends.get_xp` 仅为
-需要 tensor 的扩展代码提供 `torch.device` 路由。`evtrade/core/capability.py` MUST NOT
+`torch>=2.0`）；MUST NOT 存在 `gpu` / `all` 等 `[project.optional-dependencies]`
+独立安装路径（torch 在核心依赖，CPU/CUDA 是同一 torch 包的不同运行时 wheel）。
+`evtrade.backends.gpu_available()` MUST 委托 `torch.cuda.is_available()`。当前热路径
+（桶预计算 + 策略 step）为设备无关 numpy/标量实现，`backends.get_xp` 仅为需要
+tensor 的扩展代码提供 `torch.device` 路由。`evtrade/core/capability.py` MUST NOT
 存在（能力探测收编至 `backends`）；`evtrade/core/tsbucket.py` MUST 为纯 numpy 桶级
 `ts/mark` 预计算（模块名/内容 MUST NOT 含 gpu/cuda/torch 语义依赖，LRU 缓存行为不变）；
 历法运算（`encoded_to_epoch` / `epoch_to_encoded`）MUST 单一真源于 `core/timeutils.py`
@@ -332,6 +334,11 @@ MUST NOT 存在"被接受但从不读取"的 CLI flag（`--no-sleep` / `--step-d
 #### Scenario: cupy 不再是可选依赖
 - **WHEN** 用户执行 `grep -r "import cupy" evtrade/`
 - **THEN** MUST 0 命中（cupy 已完全下线）
+
+#### Scenario: gpu 不再是独立安装路径
+- **WHEN** 用户执行 `grep -n "optional-dependencies" pyproject.toml`
+- **THEN** MUST 0 命中（`[project.optional-dependencies]` 已删除，CPU/GPU 统一走
+  `uv sync` / `uv sync --group dev`；`--device` 是运行时参数而非安装路径）
 
 #### Scenario: tsbucket 纯 numpy
 - **WHEN** 静态扫描 `evtrade/core/tsbucket.py`
@@ -379,6 +386,22 @@ MUST NOT 各子命令重复声明同义选项。CLI 汇总打印 MUST 使用实�
 - **WHEN** `python -m evtrade backtest --init-cash 99999 ...`
 - **THEN** 汇总头部"期初资金"行 MUST 打印 99999（非默认常量 100000）
 
+### Requirement: 用户文档单一入口
+
+用户文档 MUST 收敛为两条线：根 `README.md`（唯一入口：定位 / 快速上手 / 工作流
+四步 / 命令速查 / 结构 / 指向 `kbs/`）+ `kbs/`（中文详述投影 + `使用说明.md`
+操作手册）。仓库根 MUST NOT 存在 `docs/` 目录（原 `docs/quickstart.md` /
+`docs/params-workflow.md` 内容已并入 `kbs/使用说明.md` 与 `kbs/10-配置参数与运行指南.md`）。
+README 的"详见"清单 MUST 只指向 `kbs/` 内文档（不得指向仓库内不存在的文件）。
+
+#### Scenario: docs/ 目录已删除
+- **WHEN** 执行 `ls docs/`
+- **THEN** MUST 报 "No such file or directory"
+
+#### Scenario: README quickstart 命令现行
+- **WHEN** 按 README「快速上手」的示例命令逐条执行（`python -m evtrade sweep ...` 等）
+- **THEN** MUST 无 "unrecognized arguments" / "No such file" 错误
+
 ## 与 `kbs/` 的对应关系
 
 | 本 spec 节 | `kbs/` 详述 |
@@ -391,5 +414,7 @@ MUST NOT 各子命令重复声明同义选项。CLI 汇总打印 MUST 使用实�
 | Indicators are private to strategies | kbs/05, kbs/11 §5, kbs/12, kbs/14 §2 |
 | metrics.summary covers full field shape | kbs/13, kbs/09 |
 | Code hygiene (no unused imports, internal helpers underscored) | kbs/01 (源码地图: 本次清理 + 改名) |
+| PyTorch 统一后端 (无独立 GPU 安装路径) | kbs/15 §7.1, kbs/10, 使用说明 §0 |
+| 用户文档单一入口 (无 docs/ 目录) | kbs/README, kbs/使用说明 |
 
 修改本 spec 时**必须**同步更新对应 `kbs/` 文档（反之亦然），并在 commit message 中标注。

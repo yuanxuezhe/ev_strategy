@@ -5,17 +5,18 @@
 ## 安装 (uv)
 
 ```bash
-# CPU 路径 (默认; torch CPU wheel 即可)
-uv sync
-
-# GPU 路径 (torch CUDA wheel, 需 NVIDIA + CUDA runtime)
-uv sync --extra gpu
-
-# 开发 (含 pytest)
-uv sync --extra dev
+uv sync                  # 核心依赖 (含 torch; 无独立 GPU extra — CPU/CUDA 是同一个 torch 包的两个 wheel)
+uv sync --group dev      # 开发工具 (pytest 等)
 ```
 
-`uv` 会自动建虚拟环境、装核心依赖。`pyproject.toml` 列出全部依赖 (numpy / pandas / sqlalchemy / pymysql / torch)。
+要跑 GPU：`pip install torch --index-url https://download.pytorch.org/whl/cu124`
+（NVIDIA + CUDA runtime；CPU 与 CUDA wheel 不能并存）。详细安装 / 故障排查 /
+离线内网 / 非 uv 流程见 `kbs/使用说明.md` §0。
+
+> **CPU/GPU 统一**：后端为 torch 单端（`backends.get_xp` 路由 torch.device），策略代码一份、
+> CPU/GPU 同一条路径；`--device {cpu,gpu,auto}`（默认 auto）选择设备，`--device gpu` 无 CUDA
+> 抛错、`auto` 降级 cpu + warning。当前回测热路径为 numpy/Python 标量实现（与设备无关），
+> `--device` 为统一后端预留。
 
 ## 启动
 
@@ -109,12 +110,12 @@ evtrade/
   execution/           Executor 抽象 (Simulated) + trade_decision 单一成交决策
   indicators/          ema (*_step 增量 + numpy 批量参考; 仅 EMA)
 tests/                 140+ pytest 用例
-docs/                  使用说明
-kbs/                   中文设计文档 (spec 投影, 15 份)
+kbs/                   中文设计文档 (spec 投影, 15 份) + 使用说明 (操作手册)
 ```
 
 ## 详见
 
-- `docs/params-workflow.md` — 四步工作流完整说明
-- `docs/quickstart.md` — 快速开始 (含 uv 详细命令)
+- `kbs/使用说明.md` — 操作手册（安装/故障排查/选参工作流/命令清单/输出解读/FAQ）
+- `kbs/10-配置参数与运行指南.md` — 每个参数的工程含义
+- `kbs/13-绩效评估与鲁棒选参框架.md` — 评分/选参方法论（WFO/邻域衰减/置换检验）
 - `kbs/` — 中文设计文档（spec 投影，15 份，与代码同步）

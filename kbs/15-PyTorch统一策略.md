@@ -226,6 +226,11 @@ vectorized 内部逐桶信号循环 = Python 逐桶循环 + 标量 EMA 递推（
 GPU 的价值在数据量大的 tensor 侧操作与未来扩展，当前策略信号路径 CPU/GPU
 数值行为一致。
 
+**`--device` 口径（2026-09-10）**：当前回测热路径为设备无关的 numpy/Python 标量
+实现，`--device {cpu,gpu,auto}`（默认 auto）选择的是 `backends.get_xp` 的
+torch 后端设备，为未来 tensor 热路径预留。`--device gpu` 在 CUDA 不可用时
+**抛错**（提示改用 auto/cpu）；`--device auto` 无 CUDA 时自动降级 cpu 并打 warning。
+
 ### 7.2 实盘滑动窗口
 
 `Engine.on_bars` 在桶 CLOSE 时用 finalized 桶 OHLCV 调一次 `step`；

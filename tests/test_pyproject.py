@@ -6,7 +6,7 @@
   - dev-dependencies 走 [dependency-groups] dev (PEP 735, 替代已废弃的
     tool.uv.dev-dependencies)
   - 核心依赖: numpy/pandas/sqlalchemy/pymysql/torch (2026-09-09 已删 numba)
-  - GPU extra: torch (torch 内置 CUDA, 无需 cupy)
+  - 无 GPU extra: torch 为核心依赖, CPU/GPU 同一 torch 包 (2026-09-10 删 gpu/all extra)
   - 排除目录 (tests/docs/...) 不被打包
   - 若环境有 uv: uv lock --check 通过
 """
@@ -67,12 +67,15 @@ def test_numba_dependency_removed():
     assert '"numba>=' not in text, "numba 已下线, 不应再列为核心依赖"
 
 
-def test_gpu_extra_listed():
-    """2026-09-10 pytorch-unified-strategy: gpu 段走 torch (不再 cupy)"""
+def test_no_optional_gpu_extra():
+    """2026-09-10 simplify-user-surface: 无独立 GPU 安装路径
+
+    torch 在核心依赖; CPU/GPU 是同一 torch 包的不同运行时, 不是两个 extra
+    (`uv sync --extra gpu` 与 `uv sync` 无差别 → extra 空转, 已删)。
+    """
     text = _read_pyproject()
-    assert "[project.optional-dependencies]" in text
-    assert "gpu" in text
-    assert "torch" in text
+    assert "[project.optional-dependencies]" not in text, (
+        "不应再有 [project.optional-dependencies] (gpu/all extra 已删, torch 为核心依赖)")
 
 
 def test_cupy_dependency_removed():

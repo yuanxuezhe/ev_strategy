@@ -17,15 +17,6 @@ dependencies = [
     "torch>=2.0",
 ]
 
-[project.optional-dependencies]
-# GPU 支持: torch 内置 CUDA, 仅在 NVIDIA + 装了 CUDA runtime 的机器才真正能跑 cuda
-# pip install -e . 即可 (CPU 默认); GPU 机器需额外装 nvidia-cuda-runtime / cudnn
-gpu = [
-    "torch>=2.0",
-]
-# 兼容旧环境
-all = ["evtrade[gpu]"]
-
 [project.urls]
 # 暂无
 
@@ -60,8 +51,7 @@ markers = [
 ]
 
 # ============ uv 工具配置 ============
-# uv sync: 装核心依赖 (含 torch CPU)
-# uv sync --extra gpu: 装 torch (含 CUDA runtime 支持, NVIDIA 机器)
+# uv sync: 装核心依赖 (含 torch; CPU 或 CUDA wheel 由平台/安装源决定, 无独立 GPU extra)
 # uv run pytest: 跑测试
 # uv run python -m evtrade sweep ...: 启动 CLI
 [tool.uv]
