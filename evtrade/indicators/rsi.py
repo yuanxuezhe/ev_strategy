@@ -1,23 +1,17 @@
 from __future__ import annotations
 """RSI (Relative Strength Index) 指标
 
-================================================================
-✅  可改层 (indicators 子包)  ✅
-================================================================
 RSI(p) = 100 - 100 / (1 + RS)
 RS = 平均涨幅 / 平均跌幅 (Wilder 平滑: 第一个 RSI 用 SMA, 之后 EMA-like)
 本实现采用 Wilder 标准平滑 (与 TradingView/MT4 一致)。
 
-@step API (策略 step 调):
+step API (策略 step 调):
   - rsi_step(state: RSIState, close, p) -> (RSIState, rsi)
-state: RSIState dataclass (sum_g / sum_l / avg_g / avg_l / count / prev_close)
 """
 from dataclasses import dataclass
 
 import numpy as np
 
-
-# ============ step state (dataclass) ============
 
 @dataclass
 class RSIState:
@@ -29,8 +23,6 @@ class RSIState:
     count: int = 0
     prev_close: float = 0.0
 
-
-# ============ 纯函数版 (复盘 / jupyter 友好, 返 ndarray) ============
 
 def rsi(closes, p: int = 14):
     """Wilder RSI(p); 返回长度 == len(closes); 前 p 个为 NaN"""
@@ -58,8 +50,6 @@ def rsi(closes, p: int = 14):
     return out
 
 
-# ============ step 增量版 (策略 step 调用, strategy-step-only) ============
-
 def rsi_step(state: RSIState, close: float, p: int) -> tuple[RSIState, float]:
     """RSI 单步: state + close -> (new_state, rsi)
 
@@ -70,7 +60,6 @@ def rsi_step(state: RSIState, close: float, p: int) -> tuple[RSIState, float]:
         count >= p+1: avg = avg*(p-1)/p + new/p; count++; ret=100-100/(1+avg_g/avg_l)
     """
     if state.count == 0:
-        # 首根 close, 无 prev_close -> 只记录 prev_close
         return RSIState(prev_close=close, count=1), 0.0
     diff = close - state.prev_close
     g = diff if diff > 0.0 else 0.0
@@ -96,22 +85,3 @@ def rsi_step(state: RSIState, close: float, p: int) -> tuple[RSIState, float]:
     return RSIState(sum_g=state.sum_g, sum_l=state.sum_l,
                     avg_g=avg_g, avg_l=avg_l,
                     count=state.count + 1, prev_close=close), rsi_v
-
-
-# ============ Deprecated shim (2026-09-10: 合并到 rsi_step, 后续删除) ============
-
-def rsi_push(state, close, p):
-    """DEPRECATED: 用 rsi_step(state, close, p) -> (state, rsi)."""
-    s = RSIState(sum_g=state[0], sum_l=state[1], avg_g=state[2], avg_l=state[3],
-                 count=state[4], prev_close=state[5])
-    new_s, _ = rsi_step(s, close, p)
-    return (new_s.sum_g, new_s.sum_l, new_s.avg_g, new_s.avg_l,
-            new_s.count, new_s.prev_close)
-
-
-def rsi_current(state, close, p):
-    """DEPRECATED: 用 rsi_step(state, close, p) -> (state, rsi)."""
-    s = RSIState(sum_g=state[0], sum_l=state[1], avg_g=state[2], avg_l=state[3],
-                 count=state[4], prev_close=state[5])
-    _, rsi_v = rsi_step(s, close, p)
-    return rsi_v

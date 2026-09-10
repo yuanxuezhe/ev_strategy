@@ -1,9 +1,4 @@
-"""目标后端能力表 —— 调度层与 CLI 用 (单一事实源)
-
-DSL/numba/CUDA 已下线, CPU 和 GPU 走同一条 vectorized 路径。
-策略参数上限不再按设备分化 (CPU/GPU 都是 xp=numpy/cupy, 都是 Python 循环 EMA)。
-仅保留设备可达性 (gpu_available) 探测, 供 CLI 在 auto 模式下决策。
-"""
+"""目标后端能力表 —— 调度层与 CLI 用 (单一事实源)"""
 from __future__ import annotations
 
 from typing import Literal
@@ -20,7 +15,7 @@ TARGET_CAPS: dict[str, dict] = {
 
 
 def can_run(strategy_name: str, target: Device) -> tuple[bool, str]:
-    """该策略是否能在 target 上执行 (DSL 删除后唯一限制 = gpu_available)
+    """该策略是否能在 target 上执行 (唯一限制 = gpu_available)
 
     返回 (ok, reason): ok=False 时 reason 是给用户看的诊断 (>= 1 句);
     ok=True 时 reason 为空字符串。
@@ -46,7 +41,6 @@ def select_device(strategy_name: str,
             raise ValueError("请求 gpu 但环境无可用 cupy/CUDA")
         return "gpu"
 
-    # auto
     if gpu_available:
         return "gpu"
     return "cpu"

@@ -1,19 +1,10 @@
-from __future__ import annotations
-"""资金/持仓记账 (自 mysql_analyze_demo.py 原样迁移)
+"""资金/持仓记账
 
-================================================================
-⚠️  差分锁定参考实现  ⚠️  (原 frozen/account.py, 2026-09 重构迁移)
-================================================================
-Account.apply() 的 BUY/SELL 记账逻辑与 kernel._execute + execution.base.SimulatedExecutor.trade
-逐位等价 (tests/test_funding.py 锁定)。
+Account.apply() 的 BUY/SELL 记账逻辑是模拟/实盘的下单基础。
 
-如果需要改手续费/滑点模型, 不要改 apply 的现金公式, 而是**在外层
-(Executor/BrokerExecutor)** 扣费后再调 apply。
-================================================================
+如果需要改手续费/滑点模型, 在外层 (Executor/BrokerExecutor) 扣费后再调 apply。
 """
 
-
-# ============ 账户 (资金/持仓, 独立于下单方式) ============
 
 class Account:
     """资金与持仓管理 (回测/实盘共用)"""

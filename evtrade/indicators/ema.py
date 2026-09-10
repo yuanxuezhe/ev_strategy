@@ -1,14 +1,11 @@
 from __future__ import annotations
-"""EMA / EMAChannel 指标 (PyTorch 后端, 2026-09-10)
+"""EMA / EMAChannel 指标
 
 四种形态:
-  1. xp 版 (xp_ema, xp_ema_channel): 兼容旧 xp 模块 (numpy|cupy);
-     xp_ema(xp, values, p) 调用时, 内部把所有运算转到 xp 模块 (numpy 或 cupy);
-     返回 numpy/cupy 数组。**保留向后兼容**。
-  2. torch 版 (xp_ema_torch, xp_ema_channel_torch): 输入输出都是 torch.Tensor;
-     新批量路径用 (PyTorch 后端, pytorch-unified-strategy)。
-  3. step 增量版 (ema_step, ema_channel_step): 策略 step() 调; state 用 dataclass。
-  4. 纯函数版 (ema, ema_channel): numpy 返 ndarray, jupyter 用。
+  1. xp 版 (xp_ema, xp_ema_channel): 兼容 numpy/cupy, 接收 xp 模块
+  2. torch 版 (xp_ema_torch, xp_ema_channel_torch): 输入输出均为 torch.Tensor
+  3. step 增量版 (ema_step, ema_channel_step): 策略 step() 调, state 用 dataclass
+  4. 纯函数版 (ema, ema_channel): numpy 数组输入, ndarray 输出 (jupyter 用)
 
 EMA 公式:
   - count < p:   累加 sum; count += 1; ema 仍 NaN (批量版) / 0 (step 版)
@@ -20,8 +17,6 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-
-# ============ step state (dataclass) ============
 
 @dataclass
 class EMAState:
@@ -37,8 +32,6 @@ class EMAChannelState:
     up: EMAState = field(default_factory=EMAState)
     dw: EMAState = field(default_factory=EMAState)
 
-
-# ============ torch 版 (新 PyTorch 后端) ============
 
 def _resolve_period_torch(p, B: int, device: torch.device) -> torch.Tensor:
     if isinstance(p, int):
@@ -96,10 +89,8 @@ def xp_ema_channel_torch(highs: torch.Tensor, lows: torch.Tensor, p) -> tuple:
     return xp_ema_torch(highs, p), xp_ema_torch(lows, p)
 
 
-# ============ xp 版 (numpy|cupy, 保留向后兼容) ============
-
 def xp_ema(xp, values, p: int):
-    """EMA 批量版 (xp 兼容: numpy 或 cupy)。
+    """EMA 批量版 (xp 兼容: numpy 或 cupy)
 
     接受旧签名 `xp_ema(xp, values, p)`; 内部用 xp 模块做前缀和 + 递推。
     返回: xp.ndarray, 形状 (T,) (1D 输入) 或 (B, T) (2D 输入); 前 p-1 根 NaN。
@@ -146,8 +137,6 @@ def xp_ema_channel(xp, highs, lows, p: int):
     return xp_ema(xp, highs, p), xp_ema(xp, lows, p)
 
 
-# ============ step 增量版 (策略 step 调用) ============
-
 def ema_step(state: EMAState, value: float, p: int) -> tuple:
     """EMA 单步: state + 1 标量 -> (new_state, ema_value)"""
     if state.count < p:
@@ -169,8 +158,6 @@ def ema_channel_step(state: EMAChannelState, h: float, l: float,
     return EMAChannelState(up=new_up, dw=new_dw), up, dw
 
 
-# ============ numpy 纯函数版 (jupyter 用) ============
-
 def ema(values, p: int):
     """EMA(values, p): numpy ndarray 输入返 ndarray。前 p-1 个 NaN。"""
     if isinstance(values, torch.Tensor):
@@ -191,36 +178,3 @@ def ema(values, p: int):
 
 def ema_channel(highs, lows, p: int):
     return ema(highs, p), ema(lows, p)
-
-
-# ============ Deprecated shim ============
-
-def ema_push(s_sum, s_count, s_ema, value, p):
-    state = EMAState(sum=s_sum, count=s_count, ema=s_ema)
-    new_state, _ = ema_step(state, value, p)
-    return new_state.sum, new_state.count, new_state.ema
-
-
-def ema_current(s_sum, s_count, s_ema, pending, p):
-    state = EMAState(sum=s_sum, count=s_count, ema=s_ema)
-    _, e = ema_step(state, pending, p)
-    return e
-
-
-def ema_channel_push(us, uc, ue, ds, dc, de, h, l, p):
-    state = EMAChannelState(
-        up=EMAState(sum=us, count=uc, ema=ue),
-        dw=EMAState(sum=ds, count=dc, ema=de),
-    )
-    new_state, _, _ = ema_channel_step(state, h, l, p)
-    return (new_state.up.sum, new_state.up.count, new_state.up.ema,
-            new_state.dw.sum, new_state.dw.count, new_state.dw.ema)
-
-
-def ema_channel_current(us, uc, ue, ds, dc, de, h, l, p):
-    state = EMAChannelState(
-        up=EMAState(sum=us, count=uc, ema=ue),
-        dw=EMAState(sum=ds, count=dc, ema=de),
-    )
-    _, up, dw = ema_channel_step(state, h, l, p)
-    return up, dw

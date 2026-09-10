@@ -1,13 +1,9 @@
 from __future__ import annotations
-"""GPU 环境探测 + 向量化桶预计算 (PyTorch 后端, 2026-09-10)
+"""GPU 环境探测 + 向量化桶预计算 (numpy 中间表示)
 
-cupy 已下线 (pytorch-unified-strategy); 统一走 torch。
-本文件保留:
-  - gpu_info: GPU/CUDA 环境探测 (基于 torch.cuda)
-  - precompute_ts_mark: 向量化桶时间戳 + 预热标记 (numpy 算术)
-
-bucket 算法与 timeutils.bucket_ts_encoded / compute_bucket_general 同式
-(本地锚定 epoch 取整, 任意 m/h/d 周期)。
+公开 API:
+  - gpu_info:              GPU/CUDA 环境探测 (基于 torch.cuda)
+  - precompute_ts_mark:    向量化桶时间戳 + 预热标记 (numpy 算术)
 """
 
 import shutil
@@ -18,8 +14,6 @@ import numpy as np
 
 from .timeutils import resolve_period_seconds
 
-
-# ============ GPU 环境探测 (torch 后端) ============
 
 def gpu_info() -> dict:
     """探测 GPU/CUDA 环境 (基于 torch.cuda; 任何缺失只记 None, 不抛异常)"""
@@ -51,8 +45,6 @@ def gpu_info() -> dict:
         info["torch"] = None
     return info
 
-
-# ============ ts / mark 预计算 (numpy 向量化整数历法) ============
 
 def _encoded_to_epoch_np(t: np.ndarray) -> np.ndarray:
     y = t // 10_000_000_000
@@ -102,7 +94,6 @@ def precompute_ts_mark(bars: dict, period: str, warmup_until: int):
     """(周期, 预热阈值) -> (ts int64[n], mark int8[n]); 与策略参数无关, 每组共享
 
     桶算法与 timeutils.bucket_ts_encoded 同式 (本地锚定 epoch 取整, 任意 m/h/d 周期)。
-    纯 numpy 算术 (cupy 已下线, 走 torch 的策略内部自行 .to(device))。
     """
     key = _precompute_cache_key(bars, period, warmup_until)
     cached = _PRECOMPUTE_TS_MARK_CACHE.get(key)

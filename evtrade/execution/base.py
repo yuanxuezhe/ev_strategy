@@ -1,19 +1,13 @@
-from __future__ import annotations
-"""下单抽象: 模拟 / 真实 (自 mysql_analyze_demo.py 原样迁移)
+"""下单抽象: 模拟 / 真实
 
-================================================================
-✅  可改层模块  ✅
-================================================================
 本文件定义下单撮合逻辑, 是实盘对接的入口点:
 
   - SimulatedExecutor.trade (回测模拟)
-      内部 buy_pct/sell_pct/all_in/scale/qty 计算与 evtrade.kernel._execute
-      是**逐位等价**的 (tests/test_funding.py 锁定)。
-      如果只改 SimulatedExecutor 而不改 kernel._execute, 对账会 FAIL。
-      改两边 (本文件 + kernel._execute + gpu CUDA 段) 即可。
+      scale: 同方向连续信号时, 数量按 scale 倍投; 翻转时重置为基础数量。
+      buy_pct/sell_pct/all_in: 按现金/持仓比例下注 (三者均 0 时走 fixed-qty)
 
   - BrokerExecutor.trade (实盘占位)
-      **这里是接券商 API 的入口**: 调 broker.place_order,
+      这里是接券商 API 的入口: 调 broker.place_order,
       收到成交回报后调 self.account.apply(side, qty, price, ts)。
       当前的占位实现 print [LIVE] 后返回 False, 不改账户。
 
@@ -21,11 +15,11 @@ from __future__ import annotations
   - 手续费/滑点: 在 apply 前扣 cash
   - 部分成交: account.apply 只接收已成交的部分
   - 撤单/拒单: trade 返回 False + 不调 apply
-================================================================
 """
+from __future__ import annotations
 
+from .account import Account
 
-# ============ 执行器 (下单抽象: 模拟 / 真实) ============
 
 class Executor:
     """下单接口: 策略只调 trade(signal), 不关心是模拟还是真实委托"""
@@ -36,7 +30,7 @@ class Executor:
     def update_price(self, price: float) -> None:
         """更新账户最新价 (权益估值用; 由 Engine 在策略期每根 bar 调用)。
 
-        封装 ``self.account.last_price = price``, 避免引擎穿透执行器内部结构。
+        封装 self.account.last_price = price, 避免引擎穿透执行器内部结构。
         """
         self.account.last_price = price
 
@@ -46,13 +40,12 @@ class SimulatedExecutor(Executor):
 
     scale: 倍投系数。连续同方向信号时, 下一次数量 = 上一次 × scale (首次为
     trade_qty); 方向翻转重置为基础数量。信号即计数 (未成交也计)。1.0 = 关闭。
-    与 kernel._execute 语义逐行一致 (差分测试锁定)。
 
-    资金模式 (阶段 2 新增, 与 kernel 对齐):
+    资金模式:
       buy_pct  ∈ [0,1]: BUY 时按当前 cash 的比例下注
       sell_pct ∈ [0,1]: SELL 时按当前 position 的比例卖
       all_in=True: 等价于 buy_pct=sell_pct=1.0
-      三者均 0 时走旧 fixed-qty 路径 (与历史行为 100% 一致)
+      三者均 0 时走 fixed-qty 路径
     """
 
     def __init__(self, account, qty: float, verbose=True, scale: float = 1.0,

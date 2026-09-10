@@ -1,28 +1,20 @@
 from __future__ import annotations
 """录制 / 回放 / 对账: 回测与实盘一致性的验收工具
 
-================================================================
-⚠️  冻结层模块  ⚠️
-================================================================
-DSL / numba 内核已下线, 本文件是实盘一致性的验收门:
-  - replay_engine: Engine 全链路 (逐 bar check) → 信号 + 成交
-  - replay_vectorized: vectorized 引擎 (批量 compute_signals) → 信号 + 成交
+公开 API:
+  - append_bar / write_bars_log / read_bars_log: 实盘日志录制与读取
+  - replay_vectorized: vectorized 引擎回放 -> 信号 + 成交
+  - replay_engine: Engine 全链路回放 -> 信号 + 成交
   - reconcile: 两条路径逐 bar 信号 + 逐笔成交 bitwise 对账
 
-任何修改必须保证:
-  - reconcile() 的对账口径 (信号 ts/side/qty/price 全部相等) 不变
-  - replay_* 输出 dict 的 keys 不变
-================================================================
-
-工作流 (实盘上线前的标准验收, 见 kbs/13):
+工作流:
   1. 录制: 实盘进程每收到一根 1m bar, 追加一行到日志
      (append_bar / write_bars_log; 格式 stime,code,open,high,low,close,volume)
   2. 回放: 收盘后把日志喂给 vectorized 引擎, 得到逐 bar 信号轨迹与成交流
      (replay_vectorized)
-  3. 对账: 对比 vectorized vs Engine.on_bars (reconcile) —— 逐 bar 信号全对上
-     = 还原性有了持续的生产证据。
+  3. 对账: 对比 vectorized vs Engine.on_bars (reconcile)
 
-约定与回测完全一致: stime 为 14 位 YYYYMMDDHHmmss 且升序; 成交 ts 记桶右端点。
+约定: stime 为 14 位 YYYYMMDDHHmmss 且升序; 成交 ts 记桶右端点。
 """
 
 import numpy as np
@@ -33,8 +25,6 @@ from .timeutils import resolve_period_seconds
 
 BAR_HEADER = "stime,code,open,high,low,close,volume"
 
-
-# ============ 录制 (实盘侧: 每根 bar 追加一行) ============
 
 def append_bar(path: str, bar: Bar):
     """实盘进程调用: 把收到的 bar 追加到日志 (首行自动写表头)"""
@@ -80,9 +70,6 @@ def read_bars_log(path: str) -> list[Bar]:
             bars.append(Bar(stime=stime, code=code, open=float(o), high=float(h),
                             low=float(l), close=float(c), volume=int(float(v))))
     return bars
-
-
-# ============ 回放 (vectorized 引擎; Engine 全链路) ============
 
 def replay_vectorized(bars, period: str, warmup_until: int,
                       strategy_name: str, strategy_params: dict,
@@ -163,14 +150,11 @@ def replay_engine(bars, period: str, warmup_until: int, tf1: int,
                     verbose=False)
     engine.run()
 
-    # Engine.on_bars 在 mark=1 的桶闭合时触发; bucket_signals 已是桶级信号列表。
-    # 与 replay_vectorized 的桶级 sig 对齐, 直接返回桶级数组。
+    # bucket_signals 已是桶级信号列表, 直接返桶级数组
     return {"sig": np.array(engine.bucket_signals, dtype=np.int8),
             "trades": executor.records,
             "summary": None}
 
-
-# ============ 对账 ============
 
 def diff_signals(sig_a: np.ndarray, sig_b: np.ndarray) -> dict:
     """逐 bar 对比两条信号轨迹; 返回首个分歧位置与统计"""

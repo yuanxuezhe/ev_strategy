@@ -1,9 +1,5 @@
-from __future__ import annotations
 """MySQLBacktestFeed: 历史回测数据源
 
-================================================================
-✅  可改层 (feeds 子包)  ✅
-================================================================
 MySQL 分段查询, 含预热窗口, verbose 打印进度。
 参数与 evtrade.data._fetch 等价, 但用 yield 而非一次 fetchall,
 适合实盘节奏 (--no-sleep 关闭 delay 即可全速)。

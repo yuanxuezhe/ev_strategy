@@ -1,14 +1,13 @@
 from __future__ import annotations
-"""向量化引擎 (PyTorch 后端 + numpy 中间表示, 2026-09-10)
+"""向量化引擎 (PyTorch 后端 + numpy 中间表示)
 
-PyTorch 作为 array 后端的语义边界 (pytorch-unified-strategy, 2026-09-10):
-  - `xp` 不再是 numpy/cupy 双后端模块; cupy 已下线。
-  - 桶聚合用 numpy (稳定、不依赖 CUDA runtime)。
-  - strategy.step 内部用 ema_step (纯 Python 标量, 无 device 依赖)。
-  - device 参数被接受但**忽略** (保留向后兼容 CLI/sweep), 真实 device 路由由
-    strategy 内部 + backends.get_xp 决定。
+引擎职责:
+  - 桶聚合 (numpy 向量化, 任意 m/h/d 周期)
+  - 信号循环: strategy.step(state, bar, params) -> (state, sig)
+  - 成交执行 (顺序; 与 SimulatedExecutor 同语义)
+  - 汇总 metrics (25 字段)
 
-DSL/numba/NVRTC 已下线。CPU/GPU 唯一的策略契约 = VectorizedStrategy.step。
+state 由引擎持有, 跨调用持续。strategy.step 是策略唯一入口。
 """
 
 import numpy as np
@@ -19,33 +18,15 @@ from .metrics import summarize as _summarize_full
 from .timeutils import resolve_period_seconds
 
 
-def _to_host(arr):
-    """xp 数组 -> numpy。统一 torch/numpy/cupy: 都返 numpy。"""
-    if isinstance(arr, torch.Tensor):
-        return arr.detach().cpu().numpy() if arr.is_cuda else arr.detach().numpy()
-    if hasattr(arr, "get"):  # cupy fallback
-        return arr.get()
-    return np.asarray(arr)
-
-
-import torch  # noqa: E402  # 放最后避免循环
-
-
 # ============ 桶聚合 (numpy 向量化) ============
 
-def _aggregate_buckets(bars_1m: dict, period: str, warmup_until: int) -> dict:
-    """1m bar 数组 -> 周期桶聚合数组 (numpy 向量化)"""
-    return _aggregate_buckets_xp(None, bars_1m, period, warmup_until)
-
-
 def _aggregate_buckets_xp(xp, bars_1m: dict, period: str, warmup_until: int) -> dict:
-    """1m bar 数组 -> 周期桶聚合数组 (兼容旧 xp 参数; 实际只走 numpy)
+    """1m bar 数组 -> 周期桶聚合数组
 
     返回: {"ts", "o", "h", "l", "c", "v", "mark", "n_bars"}
     每行 = 一个闭合桶的最终 OHLCV + 含 1m 根数 + mark。
 
-    xp 参数保留兼容旧测试; PyTorch 后端 (pytorch-unified-strategy, 2026-09-10)
-    后实际不再使用 (内部全 numpy), 但 interface 仍接受 xp。
+    xp 参数保留兼容旧测试; 实际只走 numpy。
     """
     stime = bars_1m["stime"]
     ts_1m_np, mark_1m_np = precompute_ts_mark(
@@ -78,6 +59,11 @@ def _aggregate_buckets_xp(xp, bars_1m: dict, period: str, warmup_until: int) -> 
 
     return {"ts": ts_b, "o": o_b, "h": h_b, "l": l_b, "c": c_b, "v": v_b,
             "mark": mark_b, "n_bars": n_bars}
+
+
+def _aggregate_buckets(bars_1m: dict, period: str, warmup_until: int) -> dict:
+    """1m bar 数组 -> 周期桶聚合数组 (numpy 向量化)"""
+    return _aggregate_buckets_xp(None, bars_1m, period, warmup_until)
 
 
 def _reduceat_max(a, indices):
@@ -200,7 +186,6 @@ def _compute_signals(strategy, params: dict, buckets: dict) -> np.ndarray:
     """vectorized 路径: 循环调 strategy.step, state 由 engine 持有 (Python 对象)
 
     桶级 OHLCV 由 _aggregate_buckets 算好 (numpy 数组)。
-    本函数循环调 step, 每桶一次. state 在 host 维护.
     返回: sig 序列 (numpy int8), 已 mark=0 清零。
     """
     state = strategy.init_state(params)
@@ -273,24 +258,24 @@ def run_vectorized(bars_1m: dict, period: str, warmup_until: int,
                    trade_qty: float = 10000.0, scale: float = 1.0,
                    buy_pct: float = 0.0, sell_pct: float = 0.0,
                    device: str = "cpu") -> dict:
-    """向量化回测 (PyTorch 后端, strategy-step-only)
+    """向量化回测 (strategy-step-only)
 
-    bars_1m: numpy dict (kernel.bars_to_arrays 输出)
+    bars_1m: numpy dict (bars_to_arrays 输出)
     strategy: VectorizedStrategy 实例 (step 方法)
-    device: 接受但忽略 (PyTorch 后端无 device 路由; 保留向后兼容)
+    device: 接受但忽略 (PyTorch 后端无 device 路由)
 
     返回: {"sig", "trades", "summary", "buckets"}
     """
-    # device 参数保留, 但 PyTorch 后端暂不强制路由 (策略内部自行 to(device))
+    # device 参数保留 (策略内部自行 to(device)); 此处仅触发 gpu/cuda 不可用时的早期 warning
     _ = get_xp(device)
 
-    # 1) 桶聚合 (numpy 向量化)
+    # 1) 桶聚合
     buckets = _aggregate_buckets(bars_1m, period, warmup_until)
 
-    # 2) 信号: 循环调 strategy.step(state, bar, params), state 由 engine 持有
+    # 2) 信号: 循环调 strategy.step, state 由引擎持有
     sig_np = _compute_signals(strategy, params, buckets)
 
-    # 3) 成交 (顺序执行; 正确性优先)
+    # 3) 成交 (顺序执行)
     close_np = buckets["c"]
     ts_np = buckets["ts"]
     mark_np = buckets["mark"]

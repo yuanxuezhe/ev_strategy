@@ -1,17 +1,16 @@
 from __future__ import annotations
 """array 后端选择器 (PyTorch 统一 CPU/GPU 路径)
 
-vectorized 引擎 / Engine / 策略通过 `get_xp(device)` 拿到 torch 后端:
-  - device="cpu"  -> torch.device("cpu")
-  - device="gpu"  -> torch.device("cuda")  (CUDA 不可用时 fallback cpu)
-  - device="cuda" -> torch.device("cuda")  (同上, 别名)
-  - device="auto" -> cuda 可用则 cuda, 否则 cpu
+get_xp(device) 返回 torch 后端:
+  - "cpu"  -> torch.device("cpu")
+  - "gpu"  -> torch.device("cuda")  (CUDA 不可用时 fallback cpu)
+  - "cuda" -> torch.device("cuda")  (同上, 别名)
+  - "auto" -> cuda 可用则 cuda, 否则 cpu
 
 策略代码用 torch 写数组算子, 一份代码跑 CPU/GPU 两端。
-PyTorch 在底层把 cumsum / where / unfold 等调用映射到 CPU SIMD 或 CUDA kernel,
-无需手写 C++ / DSL 渲染。
+PyTorch 在底层把 cumsum / where / unfold 等调用映射到 CPU SIMD 或 CUDA kernel。
 
-数据约定: bars 数组形状统一为 (B, T) —— B = batch (实盘/单线 =1, 网格扫描=N),
+bars 数组形状统一为 (B, T) —— B = batch (实盘/单线 =1, 网格扫描=N),
 T = 时间序列长度。Engine.on_bars 维护 (1, T_lookback) 滑动窗口。
 """
 
@@ -59,5 +58,5 @@ def to_tensor(arr, device: torch.device | None = None) -> torch.Tensor:
 
 
 def to_host(t: torch.Tensor) -> torch.Tensor:
-    """tensor -> CPU tensor (cupy 风格 .get() 等价)。"""
+    """tensor -> CPU tensor。"""
     return t.detach().cpu() if t.is_cuda else t.detach()

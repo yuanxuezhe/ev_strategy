@@ -1,7 +1,6 @@
 from __future__ import annotations
-"""VectorizedStrategy 唯一基类 (strategy-step-only, 2026-09-10)
+"""VectorizedStrategy 唯一基类
 
-DSL 渲染层 + numba 流式内核 + NVRTC CUDA 编译已下线 (unify-strategy-contract);
 策略唯一抽象方法 = step(state, bar, params) -> (state, int);
 state 由 engine 持有 (dataclass), 策略无 instance attr。
 
@@ -53,10 +52,10 @@ def register_strategy(name: str):
 
 
 def get_strategy(name: str, params: dict | None = None, **kwargs) -> "VectorizedStrategy":
-    """按 key 构造策略实例 (CPU/GPU/ref 三路径统一入口)
+    """按 key 构造策略实例
 
     params: dict 或 None (策略参数)
-    kwargs: 备用, 自动并入 params (向后兼容 get_strategy('foo', k=v) 风格)
+    kwargs: 自动并入 params (允许 get_strategy('foo', k=v) 风格)
     """
     if name not in _STRATEGIES:
         raise ValueError(f"未知策略 {name!r}; 可用: {sorted(_STRATEGIES)}")
@@ -86,7 +85,7 @@ def available_strategies() -> list[str]:
 
 
 class VectorizedStrategy:
-    """统一策略基类 (strategy-step-only, 2026-09-10)
+    """统一策略基类
 
     子类必须:
       - 声明 params_spec: dict[str, dict[str, Any]]  (可空 {})
@@ -151,10 +150,9 @@ class VectorizedStrategy:
         """返回 state 初值; 无状态策略默认返 None
 
         引擎 (vectorized_engine / engine) 在 strategy 实例化时调一次,
-        把 state 存到 engine 层 (不是 self._state, 是 engine 持有, 策略无感)。
+        把 state 存到 engine 层 (策略无感)。
 
-        stateful 策略覆写此方法返回 @dataclass 实例;
-        策略 MUST NOT 把 state 存到 self.* (instance attr).
+        stateful 策略覆写此方法返回 @dataclass 实例。
         """
         return None
 
@@ -168,7 +166,6 @@ class VectorizedStrategy:
         策略 MUST:
           - 若 bar["mark"] == 0: return state, 0  (预热段)
           - 仅做"算法": 算指标 + FSM, 不持有 instance state
-          - 不 import numba / cupy
           - 不出现 for i in range(n) 批量循环
         """
         raise NotImplementedError
@@ -183,7 +180,7 @@ class VectorizedStrategy:
         return f"{ts} sig={sig:+d} {side}".rstrip()
 
     def get_extra_bucket_columns(self) -> list[str]:
-        """策略展示 hook: 桶表追加列名 (framework bucket_table 拼接用)"""
+        """策略展示 hook: 桶表追加列名"""
         return []
 
     def get_extra_signal_columns(self) -> list[str]:

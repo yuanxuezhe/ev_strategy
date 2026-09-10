@@ -1,23 +1,17 @@
 from __future__ import annotations
 """ATR (Average True Range) 指标
 
-================================================================
-✅  可改层 (indicators 子包)  ✅
-================================================================
 True Range = max(H-L, |H-prev_close|, |L-prev_close|)
 ATR(p) = TR 的 p 期 SMA (默认) 或 EMA。
 本实现默认 SMA (与 MetaTrader/TradingView 一致)。
 
-@step API (策略 step 调):
+step API (策略 step 调):
   - atr_step(state: ATRState, h, l, c, p) -> (ATRState, atr)
-state: ATRState dataclass (sum / count / prev_close / atr)
 """
 from dataclasses import dataclass
 
 import numpy as np
 
-
-# ============ step state (dataclass) ============
 
 @dataclass
 class ATRState:
@@ -27,8 +21,6 @@ class ATRState:
     prev_close: float = 0.0
     atr: float = 0.0
 
-
-# ============ 纯函数版 (jupyter / 复盘, 返 ndarray) ============
 
 def true_range(highs, lows, closes):
     """逐根 true range; 第一根 TR = H - L (无前 close), 之后 = max(H-L, |H-prev_C|, |L-prev_C|)
@@ -80,8 +72,6 @@ def atr(highs, lows, closes, p: int = 14, ema: bool = False):
         return _ema(tr_filled, p)
 
 
-# ============ step 增量版 (策略 step 调用, strategy-step-only) ============
-
 def _tr(h: float, l: float, prev_close: float, has_prev: bool) -> float:
     """单根 true range; has_prev=False 时 (首根) TR = h - l"""
     if not has_prev:
@@ -122,21 +112,3 @@ def atr_step(state: ATRState, h: float, l: float, c: float,
     new_atr = state.atr * ((p - 1.0) / p) + tr / p
     return ATRState(sum=state.sum, count=state.count + 1,
                     prev_close=c, atr=new_atr), new_atr
-
-
-# ============ Deprecated shim (2026-09-10: 合并到 atr_step, 后续删除) ============
-
-def atr_push(state, h, l, c, p):
-    """DEPRECATED: 用 atr_step(state, h, l, c, p) -> (state, atr)."""
-    s = ATRState(sum=state[0], count=state[1],
-                 prev_close=state[2], atr=state[3])
-    new_s, _ = atr_step(s, h, l, c, p)
-    return new_s.sum, new_s.count, new_s.prev_close, new_s.atr
-
-
-def atr_current(state, h, l, c, p):
-    """DEPRECATED: 用 atr_step(state, h, l, c, p) -> (state, atr)."""
-    s = ATRState(sum=state[0], count=state[1],
-                 prev_close=state[2], atr=state[3])
-    _, atr_v = atr_step(s, h, l, c, p)
-    return atr_v

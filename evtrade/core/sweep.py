@@ -1,19 +1,8 @@
 from __future__ import annotations
-"""参数并发扫描 + 鲁棒选参框架 (kbs/13)
+"""参数并发扫描 + 鲁棒选参框架
 
-DSL 已下线, sweep 统一走 vectorized 引擎 (run_vectorized):
-  1. WFO 多窗回测: train 窗 + K 个滚动 test 窗 (--splits d1,d2,...)
-     窗口 i 的数据截断到其结束日, 预热用其开始日之前的全部数据 -> 指标就绪、
-     锁存状态全新起算, 与实盘在该日上线的情形一致。
-  2. 每窗绩效 (metrics.summarize): 16 字段 (cagr/sharpe/sortino/calmar/max_dd_days/...)
-  3. 聚合: ann_net_min / ann_net_mean / pos_ratio / sharpe_min / sortino_min /
-     calmar_max / cagr_max / max_dd_days_max / 邻域衰减 S
-  4. 复合评分: score = ann_net_min / (1 + λ·S)
-  5. 帕累托标记: (ann_net_mean, sharpe_min) 双目标非支配点。
-  6. 硬过滤标记 filter_pass: 各 test 窗笔数>=min_trades 且 权益回撤<=max_mdd。
-
-并行模型: 一组参数一个独立 vectorized run; cpu 用 ThreadPoolExecutor (numba 释放 GIL
-历史遗留; 现在改为 xp=numpy 单线程已足够, 但保留接口)。
+WFO 多窗回测 + 复合评分 (score = ann_net_min / (1 + λ·S)) + 帕累托标记 + 硬过滤。
+单一执行路径: vectorized_engine.run_vectorized。
 """
 
 import time
@@ -22,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 # 引擎级 grid key (框架自带); 策略参数名由各策略 import 时通过
-# register_grid_keys() 注入 (见 evtrade/strategies/<name>.py 末尾)
+# register_grid_keys() 注入
 GRID_KEYS = ("tf1", "period", "trade_qty", "scale",
              "buy_pct", "sell_pct", "all_in")
 _GRID_EXTRA_KEYS: set[str] = set()
@@ -125,21 +114,6 @@ def run_one_vectorized(bars: dict, period: str, warmup_until: int,
     )["summary"]
 
 
-def _empty_metrics(init_cash: float, init_position: float) -> dict:
-    """空数据时返回零交易占位指标 (避免 flush IndexError)"""
-    return {
-        "final_price": 0.0, "n_trades": 0, "n_buy": 0, "n_sell": 0,
-        "final_cash": init_cash, "final_position": init_position,
-        "final_equity": init_cash, "baseline": init_cash,
-        "excess": 0.0, "excess_pct": 0.0, "years": 0.0,
-        "ann_excess_pct": 0.0,
-        "sharpe_excess": 0.0, "sortino_excess": 0.0,
-        "cagr": 0.0, "calmar": 0.0,
-        "max_dd_days": 0.0, "max_dd_recovered": 0,
-        "x_mdd": 0.0, "max_drawdown": 0.0, "turnover": 0.0,
-    }
-
-
 def _ann_net(m: dict, fee_bp: float) -> float:
     """年化扣费超额% = excess_pct/years - turnover×fee/baseline/years×100"""
     fee = fee_bp / 10000.0
@@ -213,10 +187,8 @@ def sweep(bars: dict, base: dict, combos: list[dict],
 
     base 键: start/period/trade_qty/init_cash/init_position + strategy_params
     combos:  parse_grid 的输出, 覆盖 base 中的对应键 (策略参数键)。
-    splits:  滚动 WFO 分割日列表 ["20260101","20260401"]; 1 个时窗口名为 train/test
-             (兼容旧 --split), 多个时为 train/test1..testK。None=单窗 (列名无前缀)。
-
-    唯一执行路径: run_vectorized (cpu=xp=numpy, gpu=xp=cupy)。
+    splits:  滚动 WFO 分割日列表 ["20260101","20260401"]; 1 个时窗口名为 train/test,
+             多个时为 train/test1..testK。None=单窗 (列名无前缀)。
     """
     if not strategy_name:
         raise ValueError("sweep: strategy_name is required")
@@ -259,7 +231,6 @@ def sweep(bars: dict, base: dict, combos: list[dict],
     win_data = [(nm, window_bars(e), int(w) * 1_000_000) for nm, e, w in wins]
 
     # ---- 解析 strategy_params: 只保留 params_spec 白名单内键 ----
-    # 兼容历史 combos 同时支持 "顶层 strategy keys" 与 "params={...}" 两种形态
     from ..strategies import get_strategy_class
     spec = get_strategy_class(strategy_name).params_spec or {}
     base_params = dict(base.get("params") or {})
@@ -268,7 +239,6 @@ def sweep(bars: dict, base: dict, combos: list[dict],
         """从 combo 抽策略参数: 同时认 params 包装层与顶层 spec 键"""
         nested = dict(c.get("params") or {})
         merged = {**base_params, **nested, **{k: v for k, v in c.items() if k in spec}}
-        # 仅保留 spec 内的键
         return {k: v for k, v in merged.items() if k in spec}
 
     new_combos = []
@@ -280,7 +250,6 @@ def sweep(bars: dict, base: dict, combos: list[dict],
     params_list = [{**base, **c} for c in combos]
 
     t0 = time.perf_counter()
-    # 统一走 vectorized 入口 (CPU/GPU 同 xp)
     metrics = [[None] * len(params_list) for _ in win_data]
     if n_workers and n_workers > 1:
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
@@ -346,10 +315,9 @@ def sweep(bars: dict, base: dict, combos: list[dict],
         row["cagr_max"] = max(m.get("cagr", 0.0) for m in test_metrics)
         row["max_dd_days_max"] = max(m.get("max_dd_days", 0.0) for m in test_metrics)
         row["x_mdd_max"] = max(m.get("x_mdd", 0.0) for m in test_metrics)
+        # max_drawdown 是占初始权益的小数; --max-mdd 默认 1.0 = 100% = 不限
         row["filter_pass"] = bool(
             all(m["n_trades"] >= min_trades for m in test_metrics)
-            # max_drawdown 是"占初始权益的小数"(unify-metrics-units);
-            # --max-mdd 默认 1.0 = 100% = 不限; 实盘建议 0.15 (拒回撤 > 15% 的参数)。
             and all(m.get("max_drawdown", 0.0) <= max_mdd for m in test_metrics))
         rows.append(row)
 
@@ -374,3 +342,4 @@ def sweep(bars: dict, base: dict, combos: list[dict],
               f"耗时 {dt:.2f}s ({dt / max(n_runs, 1) * 1000:.2f} ms/次回测)",
               flush=True)
     return df
+

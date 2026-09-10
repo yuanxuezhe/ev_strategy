@@ -1,11 +1,7 @@
 from __future__ import annotations
 """行情加载: MySQL 单次全量拉取 + 本地 npz 缓存 + 合成数据生成器
 
-================================================================
-✅  可改层模块  ✅
-================================================================
-本文件是内核路径的数据加载层 (与参考引擎的 MySQLBacktestFeed 平行):
-
+公开 API:
   - load_bars(code, start, end): MySQL 拉数 + npz 缓存 (默认开 cache)
       缓存键 = (code, warmup_start, end); 命中后零数据库开销
   - synthetic_bars(days, start_ymd, seed): 确定性合成数据 (无库体验/测试)
@@ -14,7 +10,6 @@ from __future__ import annotations
   1. 实现 fetch_xxx() 返回 numpy 数组 {stime, open, high, low, close, volume}
   2. 在 load_bars 里加分支 (例如 if source == 'tushare': ...)
   3. CLI 加 --data-source 参数
-================================================================
 """
 
 import os
@@ -72,7 +67,7 @@ def load_bars(code: str, start_ymd: str, end_ymd: str, warmup_days: int = 365,
 
 
 def _fetch(code: str, start_ymd: str, end_ymd: str, db_url: str):
-    """单次全量查询 (代替参考实现的分段查询; 一次 fetchall 后在本地处理)"""
+    """单次全量查询 (一次 fetchall 后在本地处理)"""
     import pandas as pd
     from sqlalchemy import create_engine
     seg_start = start_ymd + "000000"
@@ -87,8 +82,6 @@ def _fetch(code: str, start_ymd: str, end_ymd: str, db_url: str):
         df = df.sort_values("stime").reset_index(drop=True)
     return df
 
-
-# ============ 合成数据 (确定性, 无库环境测试/演示) ============
 
 def synthetic_bars(days: int = 30, start_ymd: str = "20250101", seed: int = 42,
                    s0: float = 10.0, jump_prob: float = 0.02,

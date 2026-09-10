@@ -1,32 +1,16 @@
 from __future__ import annotations
-"""周期桶时间戳计算与分段区间 (自 mysql_analyze_demo.py 原样迁移 + 任意周期支持)
-
-================================================================
-⚠️  差分锁定参考实现  ⚠️  (原 frozen/timeutils.py, 2026-09 重构迁移)
-================================================================
-本文件的 compute_bucket_general 与 evtrade.kernel.bucket_ts_encoded
-是**逐例等价**的两个实现 (tests/test_timeutils.py 锁定)。
-
-对老 7 周期 (1m/5m/15m/30m/1h/4h/1d) 的等价性是回归测试必过项;
-对任意周期 (90m/7m/3d) 是 kbs/04 第 5 节支持的扩展。
-
-任何修改必须**同步**改:
-  - evtrade/core/timeutils.py (本文件, datetime 字符串版, 给人/参考引擎用)
-  - evtrade/core/kernel.py bucket_ts_encoded (njit, 整数版, 给内核用)
-  - evtrade/core/gpu.py _encoded_to_epoch_np / _epoch_to_encoded_np / precompute_ts_mark
-  - kbs/04-周期合并机制.md
-================================================================
+"""周期桶时间戳计算与分段区间 (支持任意 m/h/d 周期)
 
 两套桶算法:
   * compute_bucket (字符串/字段取整版) —— 原始实现, 仅对 1m/5m/15m/30m/1h/4h/1d
-    这类"能对齐日历字段"的周期正确; 保留作为**历史语义基准** (等价性测试用)。
+    这类"能对齐日历字段"的周期正确; 保留作为历史语义基准 (等价性测试用)。
     对 90m/7m/3d 等任意周期它要么分区错误 (>60m 的分钟字段无法对 90 取整),
     要么直接崩溃 (3d 在月初会拼出 day=00 的非法日期)。
-  * compute_bucket_general (epoch 锚定版) —— 通用实现, 支持**任意** m/h/d 周期:
+  * compute_bucket_general (epoch 锚定版) —— 通用实现, 支持任意 m/h/d 周期:
       e  = bar 的 naive-epoch 秒 (stime 即北京墙钟, 午夜天然对齐 86400 倍数)
       e0 = (e // P) × P                          (P = 周期秒数)
       桶 ts = e0 对应时刻 (恰在边界) 或 e0+P (前开后闭, 右端点标注)
-    对老 7 周期与 compute_bucket **逐例等价** (tests/test_timeutils.py 锁定);
+    对老 7 周期与 compute_bucket 逐例等价 (tests/test_timeutils.py 锁定);
     对 90m/7m/3d 等给出连续、无重叠、确定性的分区 (不整除天长的周期边界会
     相对钟面漂移, 属周期本身的性质, 与加密交易所做法一致)。
 """
@@ -94,7 +78,7 @@ def daterange(start_ymd: str, end_ymd: str, step_days: int = 7):
     每段含 step_days 天: [dayN 00:00:00, dayN+step-1 23:59:59]
     末段对齐到 end_ymd 的 23:59:59, 不超界。
     例: start=20250101, step=7 -> [20250101000000, 20250107235959]
-        下一段           -> [20250108000000, 20250115235959]
+        下一段                  -> [20250108000000, 20250115235959]
     """
     fmt = "%Y%m%d"
     cur = datetime.strptime(start_ymd, fmt)
@@ -107,7 +91,6 @@ def daterange(start_ymd: str, end_ymd: str, step_days: int = 7):
 
 
 # ============ 14 位整数时间戳 <-> epoch 秒 (纯整数历法) ============
-# (从 core/kernel.py 迁入; DSL 删除后统一放 timeutils)
 
 def _days_from_civil(y: int, m: int, d: int) -> int:
     """公历日期 -> 自 1970-01-01 的天数 (Howard Hinnant 算法)"""
@@ -157,7 +140,7 @@ def epoch_to_encoded(e: int) -> int:
 
 
 def bucket_ts_encoded(t: int, period_seconds: int) -> int:
-    """合并桶时间戳 (前开后闭, 标注右端点) —— 任意 m/h/d 周期通用 (整数版)。
+    """合并桶时间戳 (前开后闭, 标注右端点), 任意 m/h/d 周期通用 (整数版)
 
     与 compute_bucket_general 同式 (字符串版), 给 vectorized 引擎用。
     """

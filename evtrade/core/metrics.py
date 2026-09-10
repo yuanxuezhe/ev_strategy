@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""绩效汇总与数据打包工具 (从 core/kernel.py 迁入; DSL 删除后统一放 metrics)
+"""绩效汇总与数据打包工具
 
 公开 API:
   bars_to_arrays       list[Bar] -> numpy dict (vectorized 引擎输入)
@@ -151,6 +151,7 @@ def summarize(final_state: dict, init_cash: float, init_position: float,
                  / (365.25 * 86400.0))
 
     # 持仓行为 (不依赖 equity 序列; 即使 equity 为 None 也能算)
+    # 持仓行为 (不依赖 equity 序列; 即使 equity 为 None 也能算)
     pnls: list[float] = []
     hold_bars: list[int] = []
     if trades:
@@ -184,22 +185,19 @@ def summarize(final_state: dict, init_cash: float, init_position: float,
     max_drawdown = 0.0
     baseline_max_dd = 0.0
     cagr_excess = 0.0
-    x_mdd = 0.0  # 累计超额曲线回撤 (unify-metrics-units)
+    x_mdd = 0.0  # 累计超额曲线回撤
 
     if equity_curve is not None and len(equity_curve) >= 2:
         eq = np.asarray(equity_curve, dtype=np.float64)
         bl = (np.asarray(baseline_curve, dtype=np.float64)
               if baseline_curve is not None else None)
 
-        # === 1. max_drawdown (策略) ===
-        # 单位: 占当时 peak 的小数; 见 spec.md "metrics field units"。
-        # 业界惯例 (Tradestation / PT / 量化回测通用): max_drawdown = max((peak - trough) / peak)
-        # = -min((eq - running_peak) / running_peak) where running_peak = np.maximum.accumulate(eq)
+        # === 1. max_drawdown (策略; 占当时 peak 的小数) ===
         running_peak = np.maximum.accumulate(eq)
         with np.errstate(divide="ignore", invalid="ignore"):
             drawdown = np.where(running_peak > 0,
                                 (eq - running_peak) / running_peak,
-                                0.0)                          # ≤ 0; 占当时 peak 的小数
+                                0.0)
         is_dd = drawdown < 0.0
         if is_dd.any():
             trough_idx = int(np.argmin(drawdown))
@@ -212,7 +210,7 @@ def summarize(final_state: dict, init_cash: float, init_position: float,
                 if bars_per_day > 0:
                     max_dd_days = n_dd_bars / bars_per_day
 
-        # === 2. baseline_max_dd (单位: 占当时 peak 的小数; 与 max_drawdown 同式) ===
+        # === 2. baseline_max_dd (单位与 max_drawdown 同式) ===
         if bl is not None and len(bl) == len(eq):
             bl_peak = np.maximum.accumulate(bl)
             with np.errstate(divide="ignore", invalid="ignore"):
@@ -226,14 +224,13 @@ def summarize(final_state: dict, init_cash: float, init_position: float,
         if eq[0] > 0 and years > 0:
             safe_years = max(years, 1e-9)
             cagr = (eq[-1] / eq[0]) ** (1.0 / safe_years) - 1.0
-            cagr *= 100.0  # 百分比
+            cagr *= 100.0
 
         # === 4. Sharpe / Sortino / IR / Calmar (基于超额收益率) ===
         if bl is not None and len(bl) == len(eq) and bl[0] > 0 and years > 0:
             rets_eq = np.diff(eq) / eq[:-1]
             rets_bl = np.diff(bl) / bl[:-1]
             excess_rets = rets_eq - rets_bl
-            # cagr_excess: 复合年化 (与 cagr 同口径, 替代旧 ann_excess_pct)
             if eq[0] > 0 and bl[0] > 0:
                 safe_years = max(years, 1e-9)
                 cum_excess = (eq[-1] / eq[0]) / (bl[-1] / bl[0]) - 1.0
@@ -243,17 +240,14 @@ def summarize(final_state: dict, init_cash: float, init_position: float,
                 std_ex = float(np.std(excess_rets, ddof=1))
                 downside = excess_rets[excess_rets < 0.0]
                 bars_per_year = len(excess_rets) / years
-                # x_mdd: 累计超额曲线的最大回撤 (占初始 baseline 的小数; 与 mdd 单位一致)
+                # x_mdd: 累计超额曲线最大回撤 (占初始 baseline 的小数)
                 cum_ex_arr = np.cumsum(excess_rets)
                 ex_peak = np.maximum.accumulate(cum_ex_arr)
                 x_mdd = float((ex_peak - cum_ex_arr).max()) if len(cum_ex_arr) else 0.0
                 if std_ex > 0.0:
-                    # Sharpe 年化 (无风险利率假设 0)
                     sharpe_excess = (mean_ex / std_ex
                                      * (bars_per_year ** 0.5) * 100.0)
-                    # IR (信息比率) = 年化超额 / 年化跟踪误差, 数值上 = sharpe
-                    # 当无风险利率 = 0 时, IR ≡ sharpe_excess; 但保留独立字段便于
-                    # 未来引入 rf 参数后区分。
+                    # IR = 年化超额 / 年化跟踪误差; rf=0 时数值上 ≡ sharpe_excess
                     ir = sharpe_excess
                 if len(downside) > 0:
                     down_std = float(np.sqrt(np.mean(downside ** 2)))
@@ -261,8 +255,7 @@ def summarize(final_state: dict, init_cash: float, init_position: float,
                         sortino_excess = (mean_ex / down_std
                                           * (bars_per_year ** 0.5) * 100.0)
 
-            # === Calmar = cagr(%) / max_dd(小数) -> 无量纲 ===
-            # cagr 是 %, max_drawdown 是小数; 必须同单位相除
+            # Calmar = cagr(%) / max_dd(小数); 同单位相除
             if max_drawdown > 0:
                 calmar = (cagr / 100.0) / max_drawdown
 
@@ -295,7 +288,7 @@ def summarize(final_state: dict, init_cash: float, init_position: float,
         "max_drawdown": max_drawdown,
         "max_dd_days": max_dd_days,
         "max_dd_recovered": max_dd_recovered,
-        "x_mdd": x_mdd,  # 累计超额曲线回撤 (unify-metrics-units 保留)
+        "x_mdd": x_mdd,
         # 持仓行为 (7)
         "win_rate": win_rate,
         "profit_factor": profit_factor,

@@ -1,21 +1,11 @@
 from __future__ import annotations
-"""增量周期合并器 (自 mysql_analyze_demo.py 原样迁移 + 任意周期支持)
+"""增量周期合并器 (支持任意 m/h/d 周期)
 
-================================================================
-⚠️  差分锁定参考实现  ⚠️  (原 frozen/aggregator.py, 2026-09 重构迁移)
-================================================================
-本文件的 BarAggregator.update 与 evtrade.kernel.step 的桶合并段
-是**逐例等价**的两个实现 (tests/test_differential.py + test_timeutils.py 锁定)。
+每根 bar -> update(); 更新当前桶, 桶切换时闭合旧桶;
+每次更新后以周期K线集合调用 on_bars(merged_bars), 集合末位为当前桶最新合并bar。
 
-任何修改必须**同步**改以下位置:
-  - evtrade/core/aggregator.py (本文件)
-  - evtrade/core/kernel.py step() 的 "桶切换 + 新桶初始化 + 同桶合并" 段
-  - evtrade/core/gpu.py CUDA source 的对应段 (has_cur / cur_ts / cur_high 等)
-  - kbs/04-周期合并机制.md
-
-桶 ts 始终是右端点 (前开后闭区间);mark 始终跟随最新一根 1m bar;
-warmup_until 是 stime 字符串阈值,字典序 == 时间序。
-================================================================
+桶 ts 始终是右端点 (前开后闭区间); mark 始终跟随最新一根 1m bar;
+warmup_until 是 stime 字符串阈值, 字典序 == 时间序。
 """
 
 from typing import Optional, Union
@@ -24,19 +14,13 @@ from ..primitives import Bar
 from .timeutils import compute_bucket_general
 
 
-# ============ 聚合器 (独立于指标和策略) ============
-
 class BarAggregator:
     """增量周期合并 (独立于指标)
-
-    每根 bar -> update(); 更新当前桶, 桶切换时闭合旧桶;
-    每次更新后以周期K线集合调用 on_bars(merged_bars), 集合末位为当前桶最新合并bar。
 
     period_cfg: 兼容两种写法
       * 传统元组 PERIODS[period] = (单位, 数值, stime起始位, timedelta) —— 取其 timedelta
       * 直接给周期秒数 int (如 resolve_period_seconds("90m"))
-      统一走 compute_bucket_general (支持任意 m/h/d 周期; 对老 7 周期与原
-      字段取整算法逐例等价, 见 tests/test_timeutils.py)。
+      统一走 compute_bucket_general (支持任意 m/h/d 周期)。
 
     warmup_until: stime 字符串阈值; stime < 该值标记 mark=0 (预热, 仅聚合+指标累积),
                   stime >= 该值标记 mark=1 (驱动策略)。同一桶内 mark 取最新一根的值。
@@ -75,9 +59,8 @@ class BarAggregator:
             self.cur["close"] = bar.close
             self.cur["volume"] += bar.volume
             self.cur["count"] += 1
-            self.cur["mark"] = mark   # mark 跟随最新一根
+            self.cur["mark"] = mark
 
-        # 周期K线集合 = 已闭合 + 当前桶(末位=最新行情)
         # 用 append/pop 复用列表, 避免每根 O(n) 复制 self.bars + [self.cur]
         self.bars.append(self.cur)
         try:

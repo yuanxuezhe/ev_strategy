@@ -1,12 +1,9 @@
 from __future__ import annotations
 """ChannelDeviationStrategy: 通道偏离回撤策略
 
-================================================================
-✅  可改层 (strategies 子包)  ✅
-================================================================
 混合策略: EMA 通道 (stateful, step) + 偏离 (stateless, 算) + 锁存 FSM (stateful, step)。
 
-唯一方法 step(state, bar, params) -> (state, sig):
+step(state, bar, params) -> (state, sig):
   - state 由 engine 持有传入, 策略无 instance attr
   - bar 是单桶 OHLCV + mark; mark=0 (预热) 直接返 (state, 0)
   - 算法: ema_channel_step 算 up/dw + 4 偏离 + _fsm_step 锁存
@@ -24,14 +21,9 @@ from ..indicators import EMAChannelState, ema_channel_step
 from .vectorized_base import VectorizedStrategy, register_strategy
 
 
-# ============ 状态 dataclass ============
-
 @dataclass
 class ChannelDeviationState:
-    """策略持久状态: EMA 通道 + FSM 锁存
-
-    engine 在 strategy 实例化时调 init_state() 拿初值, 之后每次 step 调用传入传出。
-    """
+    """策略持久状态: EMA 通道 + FSM 锁存"""
     ema: EMAChannelState = field(default_factory=EMAChannelState)
     fsm: dict = field(default_factory=lambda: {
         "low_hit": False, "high_hit": False, "lock_ts": 0,
@@ -42,13 +34,11 @@ class ChannelDeviationState:
     has_prev: bool = False
 
 
-# ============ 算法 ============
-
 def _fsm_step(state_fsm: dict, cur_ts: int, low_dev_h, low_dev,
               high_dev_l, high_dev, low1, low2, high1, high2) -> int:
     """FSM 单步: 原地改 state_fsm, 返回 signal (0/1/-1)
 
-    语义 (与原 DSL body 逐行一致):
+    语义:
       - 桶切换 (cur_ts != lock_ts) -> 清 low_acted/high_acted
       - low_dev_h < low2 且 low_hit 且未 acted -> BUY, 清 low_hit, 置 low_acted
       - high_dev_l < high2 且 high_hit 且未 acted -> SELL, 清 high_hit, 置 high_acted
@@ -91,14 +81,9 @@ def _compute_devs(up: float, dw: float, h: float, l: float):
             (l - up) / up * 100.0)
 
 
-# ============ 策略类 (单继承 VectorizedStrategy) ============
-
 @register_strategy("channel_deviation")
 class ChannelDeviationStrategy(VectorizedStrategy):
-    """通道偏离回撤策略 (strategy-step-only, 2026-09-10)
-
-    唯一抽象 step(state, bar, params) -> (state, sig); 无 instance state。
-    """
+    """通道偏离回撤策略"""
 
     params_spec = {
         "low1":  {"default": 1.5, "type": float, "min": 0.0, "max": 100.0},
@@ -147,8 +132,6 @@ class ChannelDeviationStrategy(VectorizedStrategy):
                         low_dev_h, low_dev, high_dev_l, high_dev,
                         low1, low2, high1, high2)
         return state, sig
-
-    # ---- 展示 hook ----
 
     def format_signal_line(self, ts: int, sig: int, info: dict | None = None) -> str:
         """自定义信号行打印; info 来自 Engine.on_bars 累积 (up/dw/dev)"""

@@ -1,12 +1,7 @@
 from __future__ import annotations
-"""命令行入口 (DSL/numba 已下线; 唯一路径 = vectorized)
+"""命令行入口: backtest / sweep / replay / params 四个子命令
 
-================================================================
-✅  可改层模块  ✅  (用户面的主要修改点)
-================================================================
-本文件定义四个子命令: backtest / sweep / replay / params。
-
-唯一执行路径 (CPU/GPU 统一):
+唯一执行路径 (CPU/GPU 统一走 vectorized 引擎):
   - backtest: vectorized_engine.run_vectorized
   - sweep:    core.sweep.sweep (内部走 run_one_vectorized)
   - replay:   replay.replay_vectorized (--against-ref 加 replay.reconcile)
@@ -82,23 +77,23 @@ def _resolve_strategy_params(strategy_name: str, params_arg: str) -> dict:
     return {}
 
 
-def _emit_deprecation_warning(old_key: str, new_key: str, mapping: dict) -> None:
-    """打印 --engine / 旧 key 的 deprecation 警告 + 自动转换"""
+# 旧 --engine -> --device 映射 (kernel/ref/vectorized -> auto/cpu/cpu)
+_LEGACY_ENGINE_MAP = {"kernel": "auto", "ref": "cpu", "vectorized": "cpu"}
+
+
+def _emit_legacy_engine_warning():
+    """旧 --engine 触发的 DeprecationWarning"""
     import warnings
     warnings.warn(
-        f"--{old_key} 已下线 (DSL/numba 已下线), "
-        f"请改用 --{new_key} {{{', '.join(sorted(mapping))}}}; "
-        f"当前按映射自动转换。",
+        f"--engine 已弃用, 请改用 --device "
+        f"{{{', '.join(sorted(_LEGACY_ENGINE_MAP))}}}; 当前按映射自动转换。",
         DeprecationWarning,
         stacklevel=3,
     )
 
 
 def _coalesce_legacy_engine(argv: list[str]) -> tuple[list[str], str]:
-    """检测旧 --engine 值并转换为 --device; 返回 (new_argv, device)
-
-    映射: kernel -> auto, ref -> cpu, vectorized -> cpu
-    """
+    """检测旧 --engine 值并转换为 --device; 返回 (new_argv, device)"""
     new_argv = []
     device = "auto"
     skip_next = False
@@ -106,16 +101,13 @@ def _coalesce_legacy_engine(argv: list[str]) -> tuple[list[str], str]:
         if skip_next:
             skip_next = False
             continue
-        if a == "--engine":
-            # 下一个 argv[i+1] 是 value
-            if i + 1 < len(argv):
-                v = argv[i + 1].lower()
-                mapping = {"kernel": "auto", "ref": "cpu", "vectorized": "cpu"}
-                if v in mapping:
-                    device = mapping[v]
-                    _emit_deprecation_warning("engine", "device", mapping)
-                    skip_next = True
-                    continue
+        if a == "--engine" and i + 1 < len(argv):
+            v = argv[i + 1].lower()
+            if v in _LEGACY_ENGINE_MAP:
+                device = _LEGACY_ENGINE_MAP[v]
+                _emit_legacy_engine_warning()
+                skip_next = True
+                continue
         new_argv.append(a)
     return new_argv, device
 
@@ -126,7 +118,7 @@ def build_backtest_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="策略回测 (vectorized; CPU=xp=numpy / GPU=xp=cupy)")
     ap.add_argument("--period", default="5m", type=_period_type,
-                    help="K线周期, 任意 数字+m/h/d: 5m/7m/15m/30m/90m/2h/4h/6h/1d/3d ...")
+                    help="K线周期, 任意数字+m/h/d: 5m/7m/15m/30m/90m/2h/4h/6h/1d/3d ...")
     ap.add_argument("--strategy", default="channel_deviation",
                     help="策略 key (来自 evtrade.strategies.available_strategies())")
     ap.add_argument("--params", default="",
@@ -160,10 +152,9 @@ def build_backtest_parser() -> argparse.ArgumentParser:
                     help="期初资金 (默认 20万); 传 0 忽略, 走零起点")
     ap.add_argument("--init-position", type=float, default=INIT_POSITION,
                     help="期初持仓股数 (默认 20万); 传 0 忽略, 走零起点")
-    # --- 兼容层: --engine 已下线 (DSL/numba 已删除); 仅打 DeprecationWarning + 自动映射 device ---
+    # 兼容旧 --engine / --no-sleep / --step-days (旧 ref 引擎参数)
     ap.add_argument("--engine", default=None, choices=["kernel", "ref", "vectorized"],
                     help=argparse.SUPPRESS)
-    # --- 兼容层: --no-sleep / --step-days 是 ref 引擎参数, 已下线 ---
     ap.add_argument("--no-sleep", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--step-days", type=int, default=7, help=argparse.SUPPRESS)
     return ap
@@ -180,13 +171,12 @@ def _f4(v) -> str:
 
 
 def _run_backtest(args):
-    """统一 backtest 入口 (vectorized 引擎)"""
-    # 兼容旧 --engine: 自动映射到 --device (kernel->auto, ref->cpu, vectorized->cpu)
+    """backtest 入口 (vectorized 引擎)"""
+    # 兼容旧 --engine: 自动映射到 --device
     if getattr(args, "engine", None):
-        mapping = {"kernel": "auto", "ref": "cpu", "vectorized": "cpu"}
-        mapped = mapping[args.engine]
+        mapped = _LEGACY_ENGINE_MAP[args.engine]
         if args.device == "auto" or args.device != mapped:
-            _emit_deprecation_warning("engine", "device", mapping)
+            _emit_legacy_engine_warning()
             args.device = mapped
 
     strategy_params = _resolve_strategy_params(args.strategy, args.params)
@@ -225,7 +215,7 @@ def _run_backtest(args):
               f"[{t['ts']}]  剩余资金 {t['cash_after']:.2f}", flush=True)
 
     print("\n" + "=" * 60)
-    print("回测盈亏汇总 (vectorized) [25 字段]")
+    print("回测盈亏汇总 (vectorized)")
     print("=" * 60)
     print(f"期末价 (最后一根close) : {s['final_price']:.4f}")
     print(f"交易次数              : {s['n_trades']} (BUY {s['n_buy']} / SELL {s['n_sell']})")
@@ -273,15 +263,12 @@ def _run_backtest(args):
 
 
 def backtest_main(argv=None):
-    """backtest 主入口 (检测旧 --engine 自动转换)"""
+    """backtest 主入口"""
     raw = list(argv) if argv is not None else None
     if raw is not None:
         raw, device = _coalesce_legacy_engine(raw)
-        if device != "auto":
-            # 把默认 device 改成探测出来的 device; 但仍允许 --device 显式覆盖
-            # 这里仅在 argv 没有 --device 时应用
-            if "--device" not in raw:
-                raw = ["--device", device] + raw
+        if device != "auto" and "--device" not in raw:
+            raw = ["--device", device] + raw
     args = build_backtest_parser().parse_args(raw)
     _run_backtest(args)
 

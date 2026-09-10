@@ -1,13 +1,9 @@
 from __future__ import annotations
 """蒙特卡洛置换检验: 排除"好绩效是运气"
 
-================================================================
-⚠️  冻结层模块  ⚠️
-================================================================
 置换方式 (日块打乱, 不是逐 bar 打乱) 是 kbs/13 的核心方法论, 已被
 tests/test_sweep.py::test_permutation_sanity 锁定。
 逐 bar 打乱会人工制造跳变, null 被打穿到 -60%/年, 完全失去参考价值。
-================================================================
 
 原理 (日块自助置换, stationary bootstrap 的离散版):
   以自然日为块整日打乱价格路径的顺序 —— 破坏多日结构、保留日内微观结构与
@@ -28,15 +24,15 @@ def permutation_test(bars: dict, params: dict, warmup_until: int,
                      verbose: bool = False) -> dict:
     """对单组参数做置换检验 (日块自助置换), 返回真实年化超额 (费前) 与 p 值。
 
-    置换方式: 以**自然日为块**整日打乱顺序 (日内 OHLC 行情原样保留, stime 槽位
+    置换方式: 以自然日为块整日打乱顺序 (日内 OHLC 行情原样保留, stime 槽位
     不变) —— 破坏多日结构、保留日内微观结构。不能用逐 bar 打乱: 那会制造剧烈的
     人工跳变, 使触发条件 (H 回到下轨/L 回到上轨) 在随机数据上系统性"买贵卖贱",
     null 被机械泄漏打穿, 失去参考价值 (实测 -60%/年, 见 kbs/13)。
 
-    统计量用**费前**年化超额: 费用影响由确定性评分 (ann_net, sweep 层) 单独衡量,
+    统计量用费前年化超额: 费用影响由确定性评分 (ann_net, sweep 层) 单独衡量,
     置换检验只回答"多日维度的择时方向是否异于运气"。
 
-    strategy_name: 必填, 透传给 run_one_from_dict (框架与具体策略解耦后, 不再有默认)。
+    strategy_name: 必填, 透传给 run_one_from_dict。
     """
     real_m = run_one_from_dict(bars, params, warmup_until, strategy_name=strategy_name)
     real = real_m.get("ann_excess_pct", 0.0)

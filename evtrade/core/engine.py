@@ -1,13 +1,10 @@
 from __future__ import annotations
-"""回测/实盘统一引擎 (逐 bar 路径; strategy-step-only, 2026-09-10)
+"""逐 bar 回测/实盘引擎 (实盘/对账用)
 
-DSL/numba 已下线, 唯一策略契约 VectorizedStrategy.step(state, bar, params) -> (state, int)。
-本引擎是"逐 bar"路径 (与 vectorized 引擎的批量路径并存, 用于实盘/对账):
-
-  run(): feed → aggregator → on_bars → strategy.step(self._state, bar) → executor
+run(): feed → aggregator → on_bars → strategy.step(state, bar) → executor
 
 策略在 step(state, bar, params) 内推 EMA / FSM state; state 由 engine 持有
-(`Engine._state`, 跨调用持续); framework 不传任何指标。
+跨调用持续; framework 不传任何指标。
 
 Engine 不假设 info 键集; 信号行打印走 strategy.format_signal_line hook。
 """
@@ -32,14 +29,13 @@ class Engine:
         self.aggregator = aggregator
         self.strategy = strategy
         self.executor = executor
-        # tf1 / **legacy: 兼容历史调用; framework 不再读取 tf1, 策略通过 params 自行管理
+        # tf1 / **legacy: 兼容历史调用, framework 不再使用
         self.verbose = verbose
         # 桶级信号轨迹 (供 replay/reconcile 对账用; 一根 entry = 一个已闭合桶)
         self.bucket_signals: list[int] = []
         # 上一根 1m bar 的 cur 快照 (用于检测桶切换; 此时上一桶 OHLCV 已 finalized)
         self._last_cur: dict | None = None
         # 策略持久 state (strategy-step-only); engine 持有, 跨调用持续
-        # 由 strategy.init_state(params) 在构造时拿初值, 策略无感
         self._state = strategy.init_state(strategy.params)
         # 让 aggregator 的回调指向自己
         self.aggregator.on_bars = self.on_bars
@@ -65,11 +61,9 @@ class Engine:
                     "l": prev["low"], "c": prev["close"],
                     "v": prev["volume"], "mark": 1,
                 }
-                # strategy-step-only: 循环调 step, state 由 engine 持有
                 self._state, sig_int = self.strategy.step(
                     self._state, bar, self.strategy.params)
                 self.bucket_signals.append(int(sig_int))
-                # 触发成交 (1=BUY, -1=SELL, 0=no-op)
                 if sig_int != 0:
                     signal = {1: "BUY", -1: "SELL"}.get(sig_int)
                     if signal:
@@ -81,7 +75,6 @@ class Engine:
                     print(self.strategy.format_signal_line(prev["ts"], sig_int, info),
                           flush=True)
 
-        # 记录 cur 供下一根 bar 时检测切换
         self._last_cur = dict(cur)  # 深拷防 aggregator 复用 list
 
     def run(self):
@@ -114,7 +107,6 @@ class Engine:
             "l": cur["low"], "c": cur["close"],
             "v": cur["volume"], "mark": 1,
         }
-        # strategy-step-only: state 由 engine 持有, 跨调用持续
         self._state, sig_int = self.strategy.step(
             self._state, bar, self.strategy.params)
         self.bucket_signals.append(int(sig_int))

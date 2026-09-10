@@ -1,10 +1,9 @@
-from __future__ import annotations
 """evtrade — 策略回测 / 参数扫描 / 行情回放 (CPU+GPU 统一向量化路径)
 
-包结构 (2026-09 DSL 统一后):
-  顶层   __init__.py / __main__.py / cli.py / backends.py
-  core/      aggregator / timeutils / engine / gpu / sweep / replay
-             / permutation / vectorized_engine / metrics / data / config / capability
+包结构:
+  顶层     __init__.py / __main__.py / cli.py / backends.py
+  core/      aggregator / timeutils / engine / vectorized_engine / gpu
+             / sweep / replay / permutation / metrics / data / config / capability
   execution/ account / base (Executor / SimulatedExecutor / BrokerExecutor)
   feeds/     base / mysql_history / chained / _registry
   strategies/ vectorized_base + 已注册策略 (channel_deviation / ma_crossover)
@@ -20,11 +19,6 @@ from __future__ import annotations
 依赖: pip install pymysql sqlalchemy numpy (cupy 可选 GPU)
 """
 
-# ============================================================
-# 顶层 API 统一导出 + 向后兼容 shim
-# ============================================================
-import sys as _sys
-
 # ---- 核心数据模型 / 时间桶 / 桶合并 / 记账 ----
 from .primitives import Bar, fmt
 from .core.timeutils import (
@@ -35,8 +29,7 @@ from .core.timeutils import (
 from .core.aggregator import BarAggregator
 from .execution.account import Account
 
-# ---- 向后兼容 shim: 让 `from evtrade.X import ...` 继续可用 ----
-# 历史 import 路径 (KB 12 + 旧脚本) 仍指向 core.* 子模块, 这里一次性挂上别名。
+# ---- 兼容旧 import 路径 (evtrade.<module>) ----
 from .core import (
     data as _data_mod, config as _config_mod, timeutils as _timeutils_mod,
     aggregator as _aggregator_mod, engine as _engine_mod, sweep as _sweep_mod,
@@ -46,6 +39,7 @@ from .core import (
 from . import primitives as _primitives_mod
 from .execution import account as _account_mod, base as _execution_mod
 
+import sys as _sys
 for _name, _mod in [
     ("evtrade.data", _data_mod), ("evtrade.config", _config_mod),
     ("evtrade.engine", _engine_mod), ("evtrade.sweep", _sweep_mod),
@@ -58,7 +52,7 @@ for _name, _mod in [
 ]:
     _sys.modules.setdefault(_name, _mod)
 
-# ---- 兼容旧 evtrade.kernel (kernel.py 已下线, 转发到 core.timeutils / core.metrics) ----
+# ---- 兼容旧 evtrade.kernel (转发到 core.timeutils / core.metrics) ----
 import types as _types
 _kernel_stub = _types.ModuleType("evtrade.kernel")
 _kernel_stub.bucket_ts_encoded = _timeutils_mod.bucket_ts_encoded
@@ -94,7 +88,7 @@ from .feeds import (
     get_feed, available_feeds, register_feed,
 )
 
-# ---- strategies (统一 VectorizedStrategy 契约) ----
+# ---- strategies ----
 from .strategies import (
     VectorizedStrategy,
     get_strategy, available_strategies, register_strategy,
@@ -111,51 +105,39 @@ from .core.vectorized_engine import run_vectorized
 from .indicators import (
     ema, ema_channel, atr, rsi, bollinger, sma, true_range,
     xp_ema, xp_ema_channel,
-    ema_push, ema_current, ema_channel_push, ema_channel_current,
-    atr_push, atr_current, rsi_push, rsi_current,
-    sma_push, sma_current, boll_push, boll_current,
+    xp_ema_torch, xp_ema_channel_torch,
+    EMAState, EMAChannelState, ATRState, RSIState, SMAState, BollState,
+    ema_step, ema_channel_step, atr_step, rsi_step, sma_step, boll_step,
 )
 
 
 __all__ = [
-    # 数据模型
     "Bar", "fmt",
-    # 时间桶
     "compute_bucket", "compute_bucket_general", "daterange",
     "resolve_period_seconds", "encoded_to_epoch", "epoch_to_encoded",
     "bucket_ts_encoded", "_days_from_civil",
-    # 桶合并 + 记账
     "BarAggregator", "Account",
-    # 策略 (统一基类 + 已注册)
     "VectorizedStrategy",
     "ChannelDeviationStrategy", "MACrossoverStrategy",
     "get_strategy", "available_strategies", "register_strategy",
     "get_strategy_class", "get_strategy_param_spec",
-    # 指标 (纯函数 + 增量版)
     "ema", "ema_channel", "atr", "rsi", "bollinger", "sma", "true_range",
     "xp_ema", "xp_ema_channel",
-    "ema_push", "ema_current", "ema_channel_push", "ema_channel_current",
-    "atr_push", "atr_current", "rsi_push", "rsi_current",
-    "sma_push", "sma_current", "boll_push", "boll_current",
-    # 执行器
+    "xp_ema_torch", "xp_ema_channel_torch",
+    "EMAState", "EMAChannelState",
+    "ATRState", "RSIState", "SMAState", "BollState",
+    "ema_step", "ema_channel_step",
+    "atr_step", "rsi_step", "sma_step", "boll_step",
     "Executor", "SimulatedExecutor",
-    # 行情
     "Feed", "MySQLBacktestFeed", "ChainedFeed",
     "get_feed", "available_feeds", "register_feed",
-    # 引擎 / 引擎工厂
     "Engine", "build_engine",
-    # 向量化引擎
     "run_vectorized", "run_one_vectorized", "get_xp", "gpu_available",
-    # 度量
     "bars_to_arrays", "summarize", "trades_to_list",
-    # GPU
     "gpu_info",
-    # 扫描 / 评分
     "sweep", "parse_grid", "GRID_KEYS",
-    # 回放 / 置换
     "replay_vectorized", "replay_engine", "reconcile",
     "append_bar", "read_bars_log", "write_bars_log",
     "permutation_test",
-    # 配置
     "DB_URL", "TABLE", "TF1", "INIT_CASH", "INIT_POSITION", "TRADE_QTY",
 ]
