@@ -1,23 +1,15 @@
 from __future__ import annotations
-"""GPU 环境探测 + 向量化桶预计算 (瘦身版; DSL/C++模板已删)
+"""GPU 环境探测 + 向量化桶预计算 (PyTorch 后端, 2026-09-10)
 
-================================================================
-✅  可改层  ✅
-================================================================
-本文件原含 DSL→C++ NVRTC 编译的 cuda_sweep_window_generic (低阶 JIT 路线),
-已删除 (统一到 CuPath 高阶封装路线, 见 core/vectorized_engine.py)。
-
-保留:
-  - _ensure_cupy: cupy 探测 (pip 的 nvidia-*-cu12 轮子提供 DLL)
-  - gpu_info: GPU/CUDA 环境探测
-  - precompute_ts_mark: 向量化桶时间戳 + 预热标记 (numpy 算术, CuPy 兼容)
-    (vectorized_engine 与 backends 复用)
+cupy 已下线 (pytorch-unified-strategy); 统一走 torch。
+本文件保留:
+  - gpu_info: GPU/CUDA 环境探测 (基于 torch.cuda)
+  - precompute_ts_mark: 向量化桶时间戳 + 预热标记 (numpy 算术)
 
 bucket 算法与 timeutils.bucket_ts_encoded / compute_bucket_general 同式
 (本地锚定 epoch 取整, 任意 m/h/d 周期)。
 """
 
-import os
 import shutil
 import subprocess
 from collections import OrderedDict
@@ -26,41 +18,13 @@ import numpy as np
 
 from .timeutils import resolve_period_seconds
 
-_cp = None
 
-
-def _ensure_cupy():
-    """导入 cupy (pip 的 nvidia-*-cu12 轮子提供 DLL, 先补进进程 PATH)"""
-    global _cp
-    if _cp is not None:
-        return _cp
-    import site
-    dirs = []
-    roots = list(site.getsitepackages())
-    try:
-        roots.append(site.getusersitepackages())
-    except Exception:
-        pass
-    for sp in roots:
-        nv = os.path.join(sp, "nvidia")
-        if os.path.isdir(nv):
-            for name in os.listdir(nv):
-                p = os.path.join(nv, name, "bin")
-                if os.path.isdir(p):
-                    dirs.append(p)
-    if dirs:
-        os.environ["PATH"] = ";".join(dirs + [os.environ.get("PATH", "")])
-        for d in dirs:
-            os.add_dll_directory(d)
-    import cupy as cp
-    _cp = cp
-    return cp
-
+# ============ GPU 环境探测 (torch 后端) ============
 
 def gpu_info() -> dict:
-    """探测 GPU/CUDA 环境 (任何缺失只记 None, 不抛异常)"""
+    """探测 GPU/CUDA 环境 (基于 torch.cuda; 任何缺失只记 None, 不抛异常)"""
     info = {"nvidia_gpu": None, "driver": None, "cuda_toolkit": None,
-            "cupy": None}
+            "torch": None, "cuda_available": None}
     if shutil.which("nvidia-smi"):
         try:
             out = subprocess.run(["nvidia-smi", "--query-gpu=name,driver_version",
@@ -74,10 +38,17 @@ def gpu_info() -> dict:
             pass
     info["cuda_toolkit"] = shutil.which("nvcc")
     try:
-        cp = _ensure_cupy()
-        info["cupy"] = f"{cp.__version__} @ {cp.cuda.runtime.getDeviceProperties(0)['name'].decode()}"
-    except Exception:
-        pass
+        import torch
+        info["torch"] = torch.__version__
+        info["cuda_available"] = bool(torch.cuda.is_available())
+        if torch.cuda.is_available():
+            try:
+                props = torch.cuda.get_device_properties(0)
+                info["nvidia_gpu"] = info["nvidia_gpu"] or props.name
+            except Exception:
+                pass
+    except ImportError:
+        info["torch"] = None
     return info
 
 
@@ -131,7 +102,7 @@ def precompute_ts_mark(bars: dict, period: str, warmup_until: int):
     """(周期, 预热阈值) -> (ts int64[n], mark int8[n]); 与策略参数无关, 每组共享
 
     桶算法与 timeutils.bucket_ts_encoded 同式 (本地锚定 epoch 取整, 任意 m/h/d 周期)。
-    纯 numpy 算术, CuPy 兼容 (vectorized_engine 复用)。
+    纯 numpy 算术 (cupy 已下线, 走 torch 的策略内部自行 .to(device))。
     """
     key = _precompute_cache_key(bars, period, warmup_until)
     cached = _PRECOMPUTE_TS_MARK_CACHE.get(key)

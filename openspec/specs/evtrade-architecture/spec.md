@@ -13,15 +13,22 @@ evtrade 是一个多周期 K 线 + 策略回测/扫参框架。本 spec 定义�
 ## Requirements
 ### Requirement: Strategy interface contract
 
-策略 MUST 实现 `VectorizedStrategy.compute_signals(self, xp, bars: dict, params: dict) -> xp.ndarray[int8]`，**这是策略唯一入口**。`xp` MUST 为 `numpy` 或 `cupy` 模块（framework 通过 `evtrade.backends.get_xp(device)` 传入）；策略代码 MUST 仅使用 `xp` 提供的数组算子，禁止直接 `import numpy` / `import cupy` 后用具体名称。`bars` 契约 MUST 为 dict `{"ts", "o", "h", "l", "c", "v", "mark", "n_bars"}`（桶聚合后的 OHLCV + 策略期标记）。返回数组 MUST 为 `xp.int8`，长度 MUST 等于 `len(bars["ts"])`；元素 MUST ∈ {-1, 0, 1}（SELL / 无 / BUY）。`mark == 0` 的桶（预热段）策略 SHOULD 输出 0；framework 会再做一次 `sig *= mark` 兜底。framework MUST NOT 在调用 `compute_signals` 之前预计算任何指标（无 `up` / `dw` 等键出现于 bars dict）。策略如需在逐 bar 路径（`Engine.on_bars`）维护 instance 状态（FSM / 计数器等），SHOULD 覆写 `VectorizedStrategy.compute_signals_for_one_bar(self, xp, bar: dict, params: dict) -> int`；基类默认实现把单 bar 包成单元素 xp 数组后调 `compute_signals` 取 `[0]`（**仅对无状态的纯数组算子策略适用**）。
+策略 MUST 实现 `VectorizedStrategy.compute_signals(self, xp, bars: dict, params: dict) -> torch.Tensor`。
+`xp` MUST 为 `torch.device`（framework 通过 `evtrade.backends.get_xp(device)` 传入；`"cpu"` / `"cuda"` / `"auto"` 三种字符串仍兼容）。
+**pytorch-unified-strategy, 2026-09-10 变化**：cupy 已下线，CPU/GPU 统一走 PyTorch；
+策略代码 MUST 仅使用 torch / 框架提供的算子，禁止 `import cupy`（已删除依赖）。
 
-#### Scenario: framework 不预计算指标
-- **WHEN** `run_vectorized` 调 `strategy.compute_signals(xp, buckets, params)`
-- **THEN** MUST 传入 `buckets` dict 仅含 `ts/o/h/l/c/v/mark/n_bars`；MUST NOT 包含 `up` / `dw` / `low_dev` / `high_dev` 等任何具体指标键
+#### Scenario: 框架传入 torch.device
+- **WHEN** `run_vectorized` / `Engine.on_bars` 调 `strategy.compute_signals(xp, bars, params)`
+- **THEN** `xp` MUST 是 `torch.device`（不是 numpy/cupy 模块）
 
-#### Scenario: 策略 compute_signals 新签名
+#### Scenario: bars 数组为 numpy 或 torch.Tensor
+- **WHEN** 策略读 `bars["c"]` 等
+- **THEN** 框架 MUST 接受 numpy ndarray 与 torch.Tensor 两种输入；策略 MUST NOT 假设特定后端
+
+#### Scenario: 策略 compute_signals 签名不变
 - **WHEN** 一个策略类继承 `VectorizedStrategy` 并实现 `compute_signals(self, xp, bars, params)`
-- **THEN** framework MUST 按新签名调用，策略 MUST 在 body 内用 `xp` 数组算子完成所有计算（不再有 DSL docstring、不再有 `state_spec`、不再有 numba `@njit` / CUDA `__device__` 调用）
+- **THEN** framework MUST 按新签名调用；策略 body 内仍可调 `xp_ema(xp, c, p)` 等算子（保留向后兼容）
 
 ### Requirement: state_spec is mandatory for DSL strategies
 DSL 策略 MUST 在类上声明 `state_spec`；缺声明编译期抛 `CompileError`。schema 为
@@ -97,19 +104,21 @@ Engine MUST 是唯一装配点：构造时把 `aggregator.on_bars` 覆写为自�
 
 ### Requirement: Indicators are private to strategies (framework MUST NOT compute any indicator)
 
-框架 MUST NOT 预计算任何指标（EMA / ATR / RSI / Bollinger 等）任何符号或字段。所有指标计算由策略在 `compute_signals(xp, bars, params)` body 内通过 `evtrade/indicators/` 子包导出的 API 完成。`evtrade/indicators/` 子包 MUST 提供两类函数：批量版（`xp` 兼容，`numpy.ndarray` 或 `cupy.ndarray`，策略主体使用）`xp_ema(xp, close, p)` / `xp_ema_channel(xp, h, l, p)` / `xp_atr` / `xp_true_range` / `xp_rsi` / `xp_sma` / `xp_bollinger` —— 内部走 numpy/cupy 高阶算子；增量版（纯 Python 函数，标量 in/out；供 `compute_signals_for_one_bar` 覆写里逐 bar 增量维护用）`ema_push / ema_current / ema_channel_push / ema_channel_current / atr_push / atr_current / rsi_push / rsi_current / sma_push / sma_current / boll_push / boll_current`。`evtrade/indicators/` 子包 MUST NOT import `numba`、MUST NOT 使用 `@njit` 装饰器、MUST NOT 包含 `CUDA_DEVICE_*` C99 字符串常量。`pyproject.toml` MUST NOT 声明 `numba` 为 required 依赖。
+框架 MUST NOT 预计算任何指标（EMA / ATR / RSI / Bollinger 等）。所有指标计算由策略在 `compute_signals` 或 `step` body 内通过 `evtrade/indicators/` 子包导出的 API 完成。
+**2026-09-10 变化**：`evtrade/indicators/` 子包 MUST 提供三类算子：
+1. **xp 版**（兼容旧 `xp_ema(xp, close, p)` 签名，`xp` 为 numpy/cupy/torch 模块；保留向后兼容）
+2. **torch 版**（`xp_ema_torch(values: torch.Tensor, p) -> torch.Tensor`，新 PyTorch 后端路径用）
+3. **step 增量版**（`ema_step(state, value, p)` 纯 Python 标量 in/out；策略 step() 用）
+子包 MUST NOT import `cupy` / `numba`；MUST NOT 使用 `@njit`；MUST NOT 包含 CUDA C99 字符串。
+`pyproject.toml` MUST NOT 声明 `cupy` 或 `numba` 为依赖；MUST 声明 `torch>=2.0`。
 
-#### Scenario: 框架不假定任何指标名
-- **WHEN** 静态扫描 `evtrade/core/**/*.py`（排除 `__pycache__` 与 `indicators/`）
-- **THEN** MUST NOT 出现 `IncrementalEMA` / `EMAChannel` / `tf1` / `k_ema` 任何符号
+#### Scenario: indicators 提供 xp 版与 torch 版双形态
+- **WHEN** 策略用 `from evtrade.indicators import xp_ema` 调用
+- **THEN** `xp_ema(xp, c, p)` 兼容旧 numpy/cupy/torch 模块；`xp_ema_torch(c_torch, p)` 新 PyTorch 路径用
 
-#### Scenario: 策略 compute_signals 用 xp 算子
-- **WHEN** 一个策略（如 `ChannelDeviationStrategy`）需要 EMA 通道
-- **THEN** 策略 MUST 在 `compute_signals(xp, bars, params)` body 内调 `xp_ema_channel(xp, bars["h"], bars["l"], p)` 或自写 xp 兼容 EMA；CUDA 路径下 `xp.asarray` / `xp.where` / `xp.isfinite` 等高阶算子在 device 上跑
-
-#### Scenario: 策略覆写 compute_signals_for_one_bar 维护 instance FSM
-- **WHEN** 一个策略（如 `ChannelDeviationStrategy`）有跨桶持久状态（锁存、计数器等），且要支持 `Engine.on_bars` 逐 bar 路径
-- **THEN** 策略 MUST 覆写 `compute_signals_for_one_bar`，在内部维护 instance-level FSM（Python dict / list），调 `ema_push(...)` 增量更新；与 `compute_signals` 批量路径在信号轨迹上 MUST bitwise 一致（同公式同初值）
+#### Scenario: 策略 step 用 ema_step 维护增量
+- **WHEN** 策略覆写 `step(state, bar, params)` 维护 EMA 增量
+- **THEN** MUST 用 `ema_step(EMAState, value, p)` 纯 Python 接口；与批量路径 `xp_ema` 信号轨迹 MUST bitwise 一致
 
 ### Requirement: Code hygiene — unused imports and non-underscore internal helpers MUST NOT accumulate
 `evtrade/` 包内的源码文件 MUST NOT 留下未使用的 import 与未加下划线前缀的纯内部辅助函数。"未使用"指该项目内部（含 `tests/`、`scripts/`）无 import / 直接调用 / 字符串反射调用；"纯内部辅助函数"指仅在本文件内部被调用、无项目内外部 caller 的公开名。dev reload 工具（`*_cache` 类）、公共扩展 API（注册表 getter 等）、向后兼容 shim (`evtrade/__init__.py:95-114` 的 `sys.modules.setdefault` 层)、抽象基类的 `NotImplementedError` 占位等 MUST 保留。
@@ -275,15 +284,32 @@ CLI 打印 MUST 与字段单位一致：`max_drawdown` / `baseline_max_dd` / `dd
 
 ### Requirement: CLI surface = `--device {cpu, gpu, auto}`
 
-`python -m evtrade backtest / sweep / replay` MUST 接受 `--device {cpu, gpu, auto}`（默认 `auto`）；`auto` 模式下 framework 优先 GPU（cupy 可用时）否则降级 CPU。CLI MUST NOT 暴露 `--engine kernel|ref|vectorized` 三选一选项（已统一为单 `--device` 控制 xp 后端）。兼容期内检测到旧 `--engine` 时 MUST 打 `DeprecationWarning` 并自动转换（`kernel→auto / ref→cpu / vectorized→cpu`），但不永久保留。
+`python -m evtrade backtest / sweep / replay` MUST 接受 `--device {cpu, gpu, auto, cuda}`（默认 `auto`）；
+`gpu` 与 `cuda` 同义（cupy 时代遗留的 `gpu` 字符串保留），`auto` 优先 cuda（cupy/torch 都已不用，device 由 PyTorch CUDA 自动探测）。
+`evtrade.backends.get_xp("gpu")` 在 CUDA 不可用时 MUST fallback 到 cpu 并打 `RuntimeWarning`。
 
-#### Scenario: 旧 --engine 自动转换
-- **WHEN** `python -m evtrade backtest --engine ref --strategy X ...`
-- **THEN** 打 `DeprecationWarning: --engine 已废弃，请用 --device {cpu, gpu, auto}`，参数 `--engine ref` 自动映射为 `--device cpu`，继续执行
+#### Scenario: 旧 --device gpu 仍接受
+- **WHEN** `python -m evtrade backtest --device gpu ...`
+- **THEN** 自动映射为 cuda；CUDA 不可用时打 RuntimeWarning 并继续跑 cpu
 
-#### Scenario: 端到端 CLI 跑通
-- **WHEN** `python -m evtrade backtest --strategy channel_deviation --device auto --synthetic-days 30`
-- **THEN** MUST 跑通并打印完整盈亏汇总（含 cagr / sharpe_excess / sortino_excess / calmar / max_dd_days）
+#### Scenario: PyTorch 后端端到端跑通
+- **WHEN** `python -m evtrade backtest --device auto --strategy channel_deviation ...`
+- **THEN** MUST 跑通并打印 26 字段盈亏汇总（含 cagr / sharpe / calmar / win_rate / profit_factor / baseline_max_dd / dd_excess / x_mdd 等）
+
+### Requirement: PyTorch 统一后端 (NEW 2026-09-10)
+
+`evtrade` MUST 使用 PyTorch 作为唯一 array 后端，CPU/GPU 透明路由由 `tensor.to(device)` 完成。
+`evtrade.backends.get_xp(device) -> torch.device` 是统一入口。
+`evtrade.core.gpu.py` 的 `cupy` 探测路径 MUST NOT 存在；`gpu_info()` MUST 改用 `torch.cuda` API。
+`evtrade.core.capability.py::gpu_available()` MUST 委托 `torch.cuda.is_available()`。
+
+#### Scenario: cupy 不再是可选依赖
+- **WHEN** 用户执行 `grep -r "import cupy" evtrade/`
+- **THEN** MUST 0 命中（cupy 已完全下线）
+
+#### Scenario: torch 后端单测通过
+- **WHEN** `pytest tests/test_torch_backend.py -v`
+- **THEN** `get_xp` 返 `torch.device`；`gpu_available` 与 `torch.cuda.is_available()` bitwise 一致；`xp_ema_torch` 接受 (B, T) tensor + per-row period 返 (B, T)
 
 ## 与 `kbs/` 的对应关系
 

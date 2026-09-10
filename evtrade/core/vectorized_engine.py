@@ -1,18 +1,14 @@
 from __future__ import annotations
-"""向量化引擎 (CuPy 统一 CPU/GPU 路径, strategy-step-only)
+"""向量化引擎 (PyTorch 后端 + numpy 中间表示, 2026-09-10)
 
-唯一执行路径 (DSL/ref 引擎已下线):
-  - 桶聚合: 向量化 (xp 算子), GPU 加速显著
-  - 信号:   策略 step(state, bar, params) 循环调用 (engine 持有 state)
-  - 成交:   顺序 Python 循环 (cash/position 累积依赖; 先保证正确)
-  - 汇总:   metrics.summarize (16 字段, 含 equity_curve)
+PyTorch 作为 array 后端的语义边界 (pytorch-unified-strategy, 2026-09-10):
+  - `xp` 不再是 numpy/cupy 双后端模块; cupy 已下线。
+  - 桶聚合用 numpy (稳定、不依赖 CUDA runtime)。
+  - strategy.step 内部用 ema_step (纯 Python 标量, 无 device 依赖)。
+  - device 参数被接受但**忽略** (保留向后兼容 CLI/sweep), 真实 device 路由由
+    strategy 内部 + backends.get_xp 决定。
 
-device="cpu" -> xp=numpy; device="gpu" -> xp=cupy。
-策略代码一份, framework 0 渲染逻辑。
-
-(strategy-step-only, 2026-09-10) 算法/执行分层:
-  - 策略仅写 step(state, bar, params) -> (state, sig); 无 instance state
-  - engine 在 batched 路径循环调 step; state 跨调用由 list 累积
+DSL/numba/NVRTC 已下线。CPU/GPU 唯一的策略契约 = VectorizedStrategy.step。
 """
 
 import numpy as np
@@ -23,55 +19,60 @@ from .metrics import summarize as _summarize_full
 from .timeutils import resolve_period_seconds
 
 
-# ============ helpers ============
-
 def _to_host(arr):
-    """xp 数组 -> numpy (cupy 拉回 host; numpy 原样)"""
-    return arr.get() if hasattr(arr, "get") else np.asarray(arr)
+    """xp 数组 -> numpy。统一 torch/numpy/cupy: 都返 numpy。"""
+    if isinstance(arr, torch.Tensor):
+        return arr.detach().cpu().numpy() if arr.is_cuda else arr.detach().numpy()
+    if hasattr(arr, "get"):  # cupy fallback
+        return arr.get()
+    return np.asarray(arr)
 
 
-# ============ 桶聚合 (向量化; xp=np|cp) ============
+import torch  # noqa: E402  # 放最后避免循环
+
+
+# ============ 桶聚合 (numpy 向量化) ============
+
+def _aggregate_buckets(bars_1m: dict, period: str, warmup_until: int) -> dict:
+    """1m bar 数组 -> 周期桶聚合数组 (numpy 向量化)"""
+    return _aggregate_buckets_xp(None, bars_1m, period, warmup_until)
+
 
 def _aggregate_buckets_xp(xp, bars_1m: dict, period: str, warmup_until: int) -> dict:
-    """1m bar 数组 -> 周期桶聚合数组 (向量化)
+    """1m bar 数组 -> 周期桶聚合数组 (兼容旧 xp 参数; 实际只走 numpy)
 
     返回: {"ts", "o", "h", "l", "c", "v", "mark", "n_bars"}
     每行 = 一个闭合桶的最终 OHLCV + 含 1m 根数 + mark。
 
-    复用 gpu.precompute_ts_mark 算每根 1m bar 的桶 ts (已是纯 numpy 算术,
-    CuPy 兼容); 再用 searchsorted 找桶边界, reduceat 聚合。
+    xp 参数保留兼容旧测试; PyTorch 后端 (pytorch-unified-strategy, 2026-09-10)
+    后实际不再使用 (内部全 numpy), 但 interface 仍接受 xp。
     """
     stime = bars_1m["stime"]
-    # precompute_ts_mark 接受 numpy stime (14 位整数); 返回 (ts int64[n], mark int8[n])
-    # GPU 路径下先把 stime 拉到 device
-    stime_np = _to_host(stime)
     ts_1m_np, mark_1m_np = precompute_ts_mark(
-        {"stime": stime_np}, period, warmup_until)
-    # 搬到 xp (cupy 时上 device)
-    ts_1m = xp.asarray(ts_1m_np)
-    mark_1m = xp.asarray(mark_1m_np)
+        {"stime": stime}, period, warmup_until)
+    ts_1m = np.asarray(ts_1m_np)
+    mark_1m = np.asarray(mark_1m_np)
 
-    o_1m = bars_1m["open"]; h_1m = bars_1m["high"]; l_1m = bars_1m["low"]
-    c_1m = bars_1m["close"]; v_1m = bars_1m["volume"]
-    # 确保在 device 上
-    o_1m = xp.asarray(o_1m); h_1m = xp.asarray(h_1m); l_1m = xp.asarray(l_1m)
-    c_1m = xp.asarray(c_1m); v_1m = xp.asarray(v_1m)
+    o_1m = np.asarray(bars_1m["open"])
+    h_1m = np.asarray(bars_1m["high"])
+    l_1m = np.asarray(bars_1m["low"])
+    c_1m = np.asarray(bars_1m["close"])
+    v_1m = np.asarray(bars_1m["volume"])
 
     n = len(stime)
-    # 桶边界: ts 变化处
-    new_bucket = xp.ones(n, dtype=xp.bool_)
+    new_bucket = np.ones(n, dtype=bool)
     new_bucket[1:] = ts_1m[1:] != ts_1m[:-1]
-    first_idx = xp.flatnonzero(new_bucket)
-    last_idx = xp.flatnonzero(xp.concatenate([new_bucket[1:], xp.array([True])]))
+    first_idx = np.flatnonzero(new_bucket)
+    last_idx = np.flatnonzero(np.concatenate([new_bucket[1:], np.array([True])]))
 
-    # 每桶 OHLCV (reduceat 向量化)
     ts_b = ts_1m[first_idx]
     o_b = o_1m[first_idx]
-    h_b = _reduceat_max(xp, h_1m, first_idx)
-    l_b = _reduceat_min(xp, l_1m, first_idx)
+    h_b = _reduceat_max(h_1m, first_idx)
+    l_b = _reduceat_min(l_1m, first_idx)
     c_b = c_1m[last_idx]
-    v_b = _reduceat_sum(xp, v_1m, first_idx)
-    n_bars = xp.diff(xp.concatenate([first_idx, xp.array([n], dtype=first_idx.dtype)]))
+    v_b = _reduceat_sum(v_1m, first_idx)
+    n_bars = np.diff(np.concatenate([first_idx, np.array([n], dtype=first_idx.dtype)]))
+
     # mark 取桶首根 1m bar 的标记 (与 Engine.on_bars 仅在桶首触发语义对齐)
     mark_b = mark_1m[first_idx]
 
@@ -79,48 +80,48 @@ def _aggregate_buckets_xp(xp, bars_1m: dict, period: str, warmup_until: int) -> 
             "mark": mark_b, "n_bars": n_bars}
 
 
-def _reduceat_max(xp, a, indices):
-    """分段 max (reduceat 等价; cupy 兼容)"""
+def _reduceat_max(a, indices):
+    """分段 max (numpy reduceat 等价)"""
     if len(indices) == 0:
-        return xp.empty(0, dtype=a.dtype)
-    out = xp.empty(len(indices), dtype=a.dtype)
+        return np.empty(0, dtype=a.dtype)
+    out = np.empty(len(indices), dtype=a.dtype)
     for i in range(len(indices)):
         s = indices[i]
         e = indices[i + 1] if i + 1 < len(indices) else len(a)
-        out[i] = xp.max(a[s:e])
+        out[i] = a[s:e].max()
     return out
 
 
-def _reduceat_min(xp, a, indices):
+def _reduceat_min(a, indices):
     if len(indices) == 0:
-        return xp.empty(0, dtype=a.dtype)
-    out = xp.empty(len(indices), dtype=a.dtype)
+        return np.empty(0, dtype=a.dtype)
+    out = np.empty(len(indices), dtype=a.dtype)
     for i in range(len(indices)):
         s = indices[i]
         e = indices[i + 1] if i + 1 < len(indices) else len(a)
-        out[i] = xp.min(a[s:e])
+        out[i] = a[s:e].min()
     return out
 
 
-def _reduceat_sum(xp, a, indices):
+def _reduceat_sum(a, indices):
     if len(indices) == 0:
-        return xp.empty(0, dtype=a.dtype)
-    out = xp.empty(len(indices), dtype=a.dtype)
+        return np.empty(0, dtype=a.dtype)
+    out = np.empty(len(indices), dtype=a.dtype)
     for i in range(len(indices)):
         s = indices[i]
         e = indices[i + 1] if i + 1 < len(indices) else len(a)
-        out[i] = xp.sum(a[s:e])
+        out[i] = a[s:e].sum()
     return out
 
 
 # ============ 成交执行 (顺序; 与 SimulatedExecutor 同语义) ============
 
-def _execute_trades(sig_np: np.ndarray, close_np: np.ndarray, ts_np: np.ndarray,
-                    init_cash: float, init_position: float, trade_qty: float,
-                    scale: float, buy_pct: float, sell_pct: float):
+def _execute_trades(sig_np, close_np, ts_np,
+                    init_cash, init_position, trade_qty,
+                    scale, buy_pct, sell_pct):
     """顺序遍历信号数组, 模拟成交 (与 SimulatedExecutor.trade + Account.apply 同式)
 
-    sig_np / close_np / ts_np 已拉回 host (numpy)。
+    sig_np / close_np / ts_np 必须为 numpy 1D array。
     返回: 终态 dict + equity_curve + baseline_curve (供 metrics.summarize 用)。
     """
     cash = init_cash
@@ -140,7 +141,6 @@ def _execute_trades(sig_np: np.ndarray, close_np: np.ndarray, ts_np: np.ndarray,
 
     for i in range(n):
         price = float(close_np[i])
-        # baseline = init_cash + init_position * price (持仓按当前 close 估值)
         baseline_curve[i] = init_cash + init_position * price
         equity_curve[i] = cash + position * price
 
@@ -150,7 +150,6 @@ def _execute_trades(sig_np: np.ndarray, close_np: np.ndarray, ts_np: np.ndarray,
         ts = int(ts_np[i])
         last_price = price
 
-        # 倍投
         if s == last_side:
             cur_qty = cur_qty * scale
         else:
@@ -197,27 +196,24 @@ def _execute_trades(sig_np: np.ndarray, close_np: np.ndarray, ts_np: np.ndarray,
 
 # ============ 信号循环 (strategy-step-only) ============
 
-def _compute_signals_xp(strategy, params: dict, buckets: dict) -> np.ndarray:
-    """vectorized 路径: 循环调 strategy.step, state 由 engine 持有 (list)
+def _compute_signals(strategy, params: dict, buckets: dict) -> np.ndarray:
+    """vectorized 路径: 循环调 strategy.step, state 由 engine 持有 (Python 对象)
 
-    桶级 OHLCV 已由 _aggregate_buckets_xp 算好 (xp 数组, cupy 时在 device 上);
-    本函数循环调 step, 每桶一次. state 在 host 维护 (因为 step 内大多数算法
-    是 Python 标量); 仅桶 OHLCV 数据本身在 device 上.
-
-    返回: sig 序列 (numpy int8, 长度 = len(buckets["ts"])), 已 mark=0 清零
+    桶级 OHLCV 由 _aggregate_buckets 算好 (numpy 数组)。
+    本函数循环调 step, 每桶一次. state 在 host 维护.
+    返回: sig 序列 (numpy int8), 已 mark=0 清零。
     """
     state = strategy.init_state(params)
     n = len(buckets["ts"])
     sig = np.zeros(n, dtype=np.int8)
 
-    # 桶数据预先拉回 host (标量 in/out; cupy 单元素 .get() N 次太慢, 整组拉)
-    ts_np = _to_host(buckets["ts"])
-    o_np = _to_host(buckets["o"])
-    h_np = _to_host(buckets["h"])
-    l_np = _to_host(buckets["l"])
-    c_np = _to_host(buckets["c"])
-    v_np = _to_host(buckets["v"])
-    mark_np = _to_host(buckets["mark"])
+    ts_np = buckets["ts"]
+    o_np = buckets["o"]
+    h_np = buckets["h"]
+    l_np = buckets["l"]
+    c_np = buckets["c"]
+    v_np = buckets["v"]
+    mark_np = buckets["mark"]
 
     for i in range(n):
         bar = {
@@ -229,11 +225,9 @@ def _compute_signals_xp(strategy, params: dict, buckets: dict) -> np.ndarray:
             "v": float(v_np[i]),
             "mark": int(mark_np[i]),
         }
-        # step 内 mark=0 返 0; 但 mark=0 也走 step (engine 一致行为)
         state, s = strategy.step(state, bar, params)
         sig[i] = s
 
-    # 预热段信号清零 (mark=0 的桶不应成交; 与 Engine.on_bars 一致)
     sig = sig * mark_np.astype(np.int8)
     return sig
 
@@ -242,7 +236,6 @@ def _compute_signals_xp(strategy, params: dict, buckets: dict) -> np.ndarray:
 
 def _summarize(exec_state: dict, init_cash: float, init_position: float,
                first_ts: int, last_ts: int, bucket_seconds: int = 300) -> dict:
-    """终态 + equity 序列 -> 绩效字典 (25 字段, 由 metrics.summarize 算)"""
     eq = exec_state.get("equity_curve")
     bl = exec_state.get("baseline_curve")
     last_price = exec_state.get("last_price", 0.0)
@@ -280,28 +273,28 @@ def run_vectorized(bars_1m: dict, period: str, warmup_until: int,
                    trade_qty: float = 10000.0, scale: float = 1.0,
                    buy_pct: float = 0.0, sell_pct: float = 0.0,
                    device: str = "cpu") -> dict:
-    """向量化回测 (CPU/GPU 统一入口, strategy-step-only)
+    """向量化回测 (PyTorch 后端, strategy-step-only)
 
-    bars_1m: kernel.bars_to_arrays 输出 (numpy dict)
+    bars_1m: numpy dict (kernel.bars_to_arrays 输出)
     strategy: VectorizedStrategy 实例 (step 方法)
-    device: "cpu" -> numpy; "gpu" -> cupy
+    device: 接受但忽略 (PyTorch 后端无 device 路由; 保留向后兼容)
 
     返回: {"sig", "trades", "summary", "buckets"}
     """
-    xp = get_xp(device)
+    # device 参数保留, 但 PyTorch 后端暂不强制路由 (策略内部自行 to(device))
+    _ = get_xp(device)
 
-    # 1) 桶聚合 (向量化, GPU 加速; 复用 xp 算子)
-    buckets = _aggregate_buckets_xp(xp, bars_1m, period, warmup_until)
+    # 1) 桶聚合 (numpy 向量化)
+    buckets = _aggregate_buckets(bars_1m, period, warmup_until)
 
     # 2) 信号: 循环调 strategy.step(state, bar, params), state 由 engine 持有
-    sig_np = _compute_signals_xp(strategy, params, buckets)
+    sig_np = _compute_signals(strategy, params, buckets)
 
-    # 3) 成交 (host 顺序执行; 正确性优先)
-    close_np = _to_host(buckets["c"])
-    ts_np = _to_host(buckets["ts"])
-    mark_np = _to_host(buckets["mark"])
+    # 3) 成交 (顺序执行; 正确性优先)
+    close_np = buckets["c"]
+    ts_np = buckets["ts"]
+    mark_np = buckets["mark"]
 
-    # 首末策略期 ts (年化用)
     strat_mask = mark_np == 1
     first_ts = int(ts_np[strat_mask][0]) if strat_mask.any() else 0
     last_ts = int(ts_np[strat_mask][-1]) if strat_mask.any() else 0
@@ -314,8 +307,7 @@ def run_vectorized(bars_1m: dict, period: str, warmup_until: int,
     summary = _summarize(exec_state, init_cash, init_position,
                           first_ts, last_ts, bucket_seconds=bucket_seconds)
 
-    # sig 只保留 mark=1 的桶 (与 Engine.bucket_signals 同形: 预热段不进 sig)
     sig_live = sig_np[mark_np == 1]
 
     return {"sig": sig_live, "trades": exec_state["trades"],
-            "summary": summary, "buckets": {k: _to_host(v) for k, v in buckets.items()}}
+            "summary": summary, "buckets": buckets}

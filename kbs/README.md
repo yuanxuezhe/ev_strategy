@@ -38,6 +38,7 @@
 | [12-重构与性能内核.md](12-重构与性能内核.md) | evtrade 包结构、vectorized 引擎、xp 算子、CPU/GPU 统一路径、旧 numba/CUDA 退场记录 | 所有人（先读 01 再读这个） |
 | [13-绩效评估与鲁棒选参框架.md](13-绩效评估与鲁棒选参框架.md) | 超额曲线口径、metrics 16 字段、滚动 WFO、邻域衰减 S、复合 score、帕累托、蒙特卡洛置换检验 | 选参/实盘前必读 |
 | [14-统一策略契约.md](14-策略DSL与三端转译.md) | VectorizedStrategy 契约、`compute_signals(xp,bars,params)` 主入口、CPU/GPU 双端统一实现、新策略开发步骤（新写，旧 DSL→三端转译章节已废） | 新策略开发必读 |
+| [15-PyTorch统一策略.md](15-PyTorch统一策略.md) | PyTorch 后端 (pytorch-unified-strategy, 2026-09-10)：双形态算子 (xp 版 / torch 版 / step 增量版)、bars (B,T) 契约、批量 vs 实盘双模式同代码、变周期 EMA | 写新策略 + 调参 + 性能优化 |
 | [使用说明.md](使用说明.md) | **所有参数意思 + 完整命令行 + 网格扫参** + 输出解读 | 操作手册, 跑前/看结果前查这个 |
 
 ## 建议阅读路径

@@ -56,22 +56,29 @@ def test_entry_point_evtrade_registered():
 
 def test_core_dependencies_listed():
     text = _read_pyproject()
-    for pkg in ("numpy", "pandas", "sqlalchemy", "pymysql"):
+    for pkg in ("numpy", "pandas", "sqlalchemy", "pymysql", "torch"):
         assert f'"{pkg}>=' in text, f"缺少核心依赖: {pkg}"
 
 
 def test_numba_dependency_removed():
     """2026-09-09 统一 CPU/GPU 重构后, numba 依赖已下线 (DSL/numba 内核已删)"""
     text = _read_pyproject()
-    # 不再要求 numba (CPU/GPU 走 numpy/cupy 算子)
+    # 不再要求 numba (CPU/GPU 走 torch 算子)
     assert '"numba>=' not in text, "numba 已下线, 不应再列为核心依赖"
 
 
 def test_gpu_extra_listed():
+    """2026-09-10 pytorch-unified-strategy: gpu 段走 torch (不再 cupy)"""
     text = _read_pyproject()
     assert "[project.optional-dependencies]" in text
     assert "gpu" in text
-    assert "cupy" in text
+    assert "torch" in text
+
+
+def test_cupy_dependency_removed():
+    """2026-09-10 pytorch-unified-strategy: cupy 已下线"""
+    text = _read_pyproject()
+    assert "cupy" not in text, "cupy 已下线, 由 torch 统一接管 CPU/GPU"
 
 
 # ---------- dev 依赖用 [dependency-groups] (PEP 735, uv 推荐) ----------

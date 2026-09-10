@@ -1,31 +1,24 @@
 from __future__ import annotations
-"""EMA / EMAChannel 指标
+"""EMA / EMAChannel 指标 (PyTorch 后端, 2026-09-10)
 
-================================================================
-✅  可改层 (indicators 子包)  ✅
-================================================================
-三种形态:
-  1. 纯 xp 版 (xp_ema, xp_ema_channel): 一次性批量算整段序列,
-     接受 xp (numpy|cupy) 模块; engine fast-path 调。
-  2. step 增量版 (ema_step, ema_channel_step): 策略 step() 调;
-     state 用 @dataclass EMAState / EMAChannelState 承载, 返回 (new_state, ema)。
-  3. 纯函数版 (ema, ema_channel): numpy 返 ndarray, jupyter / 复盘用。
+四种形态:
+  1. xp 版 (xp_ema, xp_ema_channel): 兼容旧 xp 模块 (numpy|cupy);
+     xp_ema(xp, values, p) 调用时, 内部把所有运算转到 xp 模块 (numpy 或 cupy);
+     返回 numpy/cupy 数组。**保留向后兼容**。
+  2. torch 版 (xp_ema_torch, xp_ema_channel_torch): 输入输出都是 torch.Tensor;
+     新批量路径用 (PyTorch 后端, pytorch-unified-strategy)。
+  3. step 增量版 (ema_step, ema_channel_step): 策略 step() 调; state 用 dataclass。
+  4. 纯函数版 (ema, ema_channel): numpy 返 ndarray, jupyter 用。
 
-@njit / CUDA __device__ 渲染器已下线 (DSL 整体废弃); 本文件不依赖 numba。
-
-@step API (策略 step 调):
-  - ema_step(state: EMAState, value: float, p: int) -> (EMAState, float)
-  - ema_channel_step(state: EMAChannelState, h: float, l: float, p: int)
-      -> (EMAChannelState, float, float)
-
-EMA 公式 (与批量版逐位一致):
-  - count < p:   累加 sum; count += 1; ema 仍 0
+EMA 公式:
+  - count < p:   累加 sum; count += 1; ema 仍 NaN (批量版) / 0 (step 版)
   - count == p:  ema = sum / p  (SMA seed)
   - count >= p:  ema = value*k + ema*(1-k), k = 2/(p+1)
 """
 from dataclasses import dataclass, field
 
 import numpy as np
+import torch
 
 
 # ============ step state (dataclass) ============
@@ -40,80 +33,148 @@ class EMAState:
 
 @dataclass
 class EMAChannelState:
-    """EMA 通道增量 state; ema_channel_step in/out"""
+    """EMA 通道增量 state"""
     up: EMAState = field(default_factory=EMAState)
     dw: EMAState = field(default_factory=EMAState)
 
 
-# ============ 纯 xp 版 (engine fast-path 调用) ============
+# ============ torch 版 (新 PyTorch 后端) ============
+
+def _resolve_period_torch(p, B: int, device: torch.device) -> torch.Tensor:
+    if isinstance(p, int):
+        return torch.full((B,), int(p), dtype=torch.int64, device=device)
+    return torch.as_tensor(p, dtype=torch.int64, device=device).flatten()
+
+
+def xp_ema_torch(values: torch.Tensor, p) -> torch.Tensor:
+    """EMA 批量版 (torch Tensor); 形状 (B, T) -> (B, T)。
+
+    period 支持:
+      - int: 所有行用同一 period
+      - (B,) tensor / list: per-row period
+
+    算法: 前缀和 + per-row period 切片 + 递推。
+    返回: 前 p-1 根为 NaN, 之后为递推值 (B, T)。
+    """
+    if values.dim() == 1:
+        values = values.unsqueeze(0)
+        squeeze_back = True
+    else:
+        squeeze_back = False
+    B, T = values.shape
+    device = values.device
+    values_f = values.to(torch.float64)
+    p_t = _resolve_period_torch(p, B, device)
+    out = torch.full((B, T), float('nan'), dtype=torch.float64, device=device)
+
+    p_idx = (p_t - 1).clamp(min=0)
+    cumsum = torch.cumsum(values_f, dim=1)
+    safe_idx = torch.clamp(p_idx, min=0, max=T - 1)
+    seed_vals = cumsum.gather(1, safe_idx.unsqueeze(1)).squeeze(1) / p_t.to(torch.float64)
+
+    col_idx = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+    seed_mask = col_idx == p_idx.unsqueeze(1)
+    out = torch.where(seed_mask, seed_vals.unsqueeze(1).expand_as(out), out)
+
+    k = 2.0 / (p_t.to(torch.float64) + 1.0)
+    one_minus_k = 1.0 - k
+    for t in range(int(p_t.max().item()), T):
+        row_ready = t + 1 >= p_t
+        if not row_ready.any():
+            continue
+        prev = out[:, t - 1]
+        cur = values_f[:, t] * k + prev * one_minus_k
+        out[:, t] = torch.where(row_ready, cur, out[:, t])
+
+    if squeeze_back:
+        out = out.squeeze(0)
+    return out
+
+
+def xp_ema_channel_torch(highs: torch.Tensor, lows: torch.Tensor, p) -> tuple:
+    """EMA 通道 torch 版: (up, dw), 各 (B, T)。"""
+    return xp_ema_torch(highs, p), xp_ema_torch(lows, p)
+
+
+# ============ xp 版 (numpy|cupy, 保留向后兼容) ============
 
 def xp_ema(xp, values, p: int):
-    """EMA 批量版 (xp 兼容); 前 p-1 根 NaN, 之后递推。
+    """EMA 批量版 (xp 兼容: numpy 或 cupy)。
 
-    SMA seed = 前 p 个均值; EMA_t = value*k + EMA_{t-1}*(1-k), k=2/(p+1)。
+    接受旧签名 `xp_ema(xp, values, p)`; 内部用 xp 模块做前缀和 + 递推。
+    返回: xp.ndarray, 形状 (T,) (1D 输入) 或 (B, T) (2D 输入); 前 p-1 根 NaN。
     """
-    n = len(values)
-    out = xp.full(n, xp.nan, dtype=xp.float64)
-    if n < p:
+    import numpy as _np
+    # 把 numpy.ndarray 或 list 转 xp 数组
+    if not hasattr(values, 'dtype') or isinstance(values, list):
+        values = xp.asarray(values, dtype=_np.float64)
+
+    # 1D 输入 -> (T,)
+    if values.ndim == 1:
+        n = values.shape[0]
+        out = xp.full(n, _np.nan, dtype=_np.float64)
+        if n < p:
+            return out
+        k = 2.0 / (p + 1.0)
+        seed = xp.sum(values[:p]) / p
+        out_idx = xp.int64(p - 1)
+        out[out_idx] = seed
+        e = float(seed)
+        for i in range(p, n):
+            e = float(values[i]) * k + e * (1.0 - k)
+            out[xp.int64(i)] = e
+        return out
+
+    # 2D 输入 -> (B, T)
+    B, T = values.shape
+    out = xp.full((B, T), _np.nan, dtype=_np.float64)
+    if T < p:
         return out
     k = 2.0 / (p + 1.0)
-    seed = xp.sum(values[:p]) / p
-    out[p - 1] = seed
-    e = float(seed)
-    for i in range(p, n):
-        e = float(values[i]) * k + e * (1.0 - k)
-        out[i] = e
+    cumsum = xp.cumsum(values, axis=1)
+    p_idx = xp.arange(p - 1, T, dtype=_np.int64)  # (T-p+1,)
+    seed_vals = cumsum[:, p - 1] / p  # (B,)
+    out[:, p - 1] = seed_vals
+    for t in range(p, T):
+        e = values[:, t] * k + out[:, t - 1] * (1.0 - k)
+        out[:, t] = e
     return out
 
 
 def xp_ema_channel(xp, highs, lows, p: int):
-    """EMA 通道: 上轨 = EMA(H, p), 下轨 = EMA(L, p)"""
+    """EMA 通道 xp 版: (up, dw)"""
     return xp_ema(xp, highs, p), xp_ema(xp, lows, p)
 
 
-# ============ step 增量版 (策略 step 调用, strategy-step-only) ============
+# ============ step 增量版 (策略 step 调用) ============
 
-def ema_step(state: EMAState, value: float, p: int) -> tuple[EMAState, float]:
-    """EMA 单步: state + 1 标量 -> (new_state, ema_value)
-
-    规则 (与原 ema_push + ema_current 等价):
-      - count < p:   sum += value; count += 1; ema 仍 0
-      - count == p:  ema = sum / p (SMA seed, 凑齐 p 个)
-      - count >= p:  ema = value*k + ema*(1-k), k = 2/(p+1)
-    """
+def ema_step(state: EMAState, value: float, p: int) -> tuple:
+    """EMA 单步: state + 1 标量 -> (new_state, ema_value)"""
     if state.count < p:
         new_sum = state.sum + value
         new_count = state.count + 1
         if new_count < p:
             return EMAState(sum=new_sum, count=new_count, ema=0.0), 0.0
-        new_ema = new_sum / p  # SMA seed
+        new_ema = new_sum / p
         return EMAState(sum=new_sum, count=new_count, ema=new_ema), new_ema
-    # count >= p: EMA 递推
     k = 2.0 / (p + 1.0)
     new_ema = value * k + state.ema * (1.0 - k)
     return EMAState(sum=state.sum, count=state.count + 1, ema=new_ema), new_ema
 
 
 def ema_channel_step(state: EMAChannelState, h: float, l: float,
-                     p: int) -> tuple[EMAChannelState, float, float]:
-    """EMA 通道单步: state + (h, l) -> (new_state, up, dw)
-
-    内部调两次 ema_step, 分别推上轨 (h) 和下轨 (l)。
-    """
+                     p: int) -> tuple:
     new_up, up = ema_step(state.up, h, p)
     new_dw, dw = ema_step(state.dw, l, p)
     return EMAChannelState(up=new_up, dw=new_dw), up, dw
 
 
-# ============ 纯函数版 (jupyter / 复盘, 返 ndarray) ============
+# ============ numpy 纯函数版 (jupyter 用) ============
 
 def ema(values, p: int):
-    """EMA(values, p): 输入长度 >= p 时返回完整 ndarray (前 p-1 个为 NaN, 之后为递推值)
-
-    SMA seed = 前 p 个均值; 之后 EMA_t = value * k + EMA_{t-1} * (1-k), k = 2 / (p+1)
-
-    返回长度 == len(values); len(values) < p 时全部为 NaN。
-    """
+    """EMA(values, p): numpy ndarray 输入返 ndarray。前 p-1 个 NaN。"""
+    if isinstance(values, torch.Tensor):
+        values = values.detach().cpu().numpy()
     n = len(values)
     out = np.full(n, np.nan, dtype=np.float64)
     if n < p:
@@ -129,29 +190,24 @@ def ema(values, p: int):
 
 
 def ema_channel(highs, lows, p: int):
-    """EMA 通道 (numpy): 上轨 = EMA(H, p), 下轨 = EMA(L, p)"""
     return ema(highs, p), ema(lows, p)
 
 
-# ============ Deprecated shim (2026-09-10: 合并到 *_step, 后续删除) ============
+# ============ Deprecated shim ============
 
 def ema_push(s_sum, s_count, s_ema, value, p):
-    """DEPRECATED: 用 ema_step(state, value, p) -> (state, ema).
-    此函数仅作过渡期 shim, 后续 change 删除。"""
     state = EMAState(sum=s_sum, count=s_count, ema=s_ema)
     new_state, _ = ema_step(state, value, p)
     return new_state.sum, new_state.count, new_state.ema
 
 
 def ema_current(s_sum, s_count, s_ema, pending, p):
-    """DEPRECATED: 用 ema_step(state, pending, p) -> (state, ema)."""
     state = EMAState(sum=s_sum, count=s_count, ema=s_ema)
-    _, ema = ema_step(state, pending, p)
-    return ema
+    _, e = ema_step(state, pending, p)
+    return e
 
 
 def ema_channel_push(us, uc, ue, ds, dc, de, h, l, p):
-    """DEPRECATED: 用 ema_channel_step(state, h, l, p)."""
     state = EMAChannelState(
         up=EMAState(sum=us, count=uc, ema=ue),
         dw=EMAState(sum=ds, count=dc, ema=de),
@@ -162,7 +218,6 @@ def ema_channel_push(us, uc, ue, ds, dc, de, h, l, p):
 
 
 def ema_channel_current(us, uc, ue, ds, dc, de, h, l, p):
-    """DEPRECATED: 用 ema_channel_step(state, h, l, p)."""
     state = EMAChannelState(
         up=EMAState(sum=us, count=uc, ema=ue),
         dw=EMAState(sum=ds, count=dc, ema=de),

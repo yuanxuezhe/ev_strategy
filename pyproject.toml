@@ -1,28 +1,29 @@
 [project]
 name = "evtrade"
 version = "0.1.0"
-description = "evtrade: 策略回测 / 参数扫描 / 行情回放 (CPU + GPU 统一向量化路径, 基于 VectorizedStrategy + xp 算子)"
+description = "evtrade: 策略回测 / 参数扫描 / 行情回放 (PyTorch 统一 CPU/GPU 路径, 基于 VectorizedStrategy + torch 算子)"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "Proprietary" }
 authors = [{ name = "evtrade" }]
-keywords = ["backtest", "quant", "sweep", "vectorized", "cupy", "xp", "walk-forward"]
+keywords = ["backtest", "quant", "sweep", "vectorized", "torch", "pytorch", "walk-forward"]
 
-# 运行依赖 (cupy 列为可选 extra, GPU 机器才装)
+# 运行依赖 (PyTorch 作为统一 array 后端; CPU/CUDA 都在 torch 包内)
 dependencies = [
     "numpy>=1.20",
     "pandas>=1.3",
     "sqlalchemy>=1.4",
     "pymysql>=1.0",
+    "torch>=2.0",
 ]
 
 [project.optional-dependencies]
-# GPU 支持: pip install -e .[gpu] 或 uv sync --extra gpu
+# GPU 支持: torch 内置 CUDA, 仅在 NVIDIA + 装了 CUDA runtime 的机器才真正能跑 cuda
+# pip install -e . 即可 (CPU 默认); GPU 机器需额外装 nvidia-cuda-runtime / cudnn
 gpu = [
-    "cupy-cuda12x>=12.0; platform_system == 'Linux'",
-    "cupy-cuda11x>=11.0; platform_system != 'Linux'",
+    "torch>=2.0",
 ]
-# 兼容旧环境: 不强制 GPU
+# 兼容旧环境
 all = ["evtrade[gpu]"]
 
 [project.urls]
@@ -55,12 +56,12 @@ testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 # GPU 测试默认跳过 (需 --gpu 显式开启)
 markers = [
-    "gpu: 需要 cupy/CUDA 环境的测试",
+    "gpu: 需要 torch CUDA 环境的测试",
 ]
 
 # ============ uv 工具配置 ============
-# uv sync: 装核心依赖 (CPU 路径)
-# uv sync --extra gpu: 加 cupy (Linux CUDA 12 / Windows CUDA 11)
+# uv sync: 装核心依赖 (含 torch CPU)
+# uv sync --extra gpu: 装 torch (含 CUDA runtime 支持, NVIDIA 机器)
 # uv run pytest: 跑测试
 # uv run python -m evtrade sweep ...: 启动 CLI
 [tool.uv]
