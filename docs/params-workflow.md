@@ -30,7 +30,7 @@ python -m evtrade sweep \
 
 要点:
 
-- `--device auto`: GPU 可用且策略 ≤ 8 参数时走 CUDA, 否则 CPU 降级 + warn。
+- `--device auto`: GPU (torch CUDA) 可用则走 GPU, 否则 CPU 降级 + warn。
 - `--grid key=v1,v2,...` 可多次, 笛卡尔积展开。
 - `--splits ymd1 ymd2 ...`: 滚动 WFO, 列名带 `train_` / `test1_` / `test2_` 前缀。
 - `--fee-bp / --min-trades / --max-mdd / --score-lambda`: 评分
@@ -110,7 +110,7 @@ python -m evtrade backtest \
   --strategy channel_deviation \
   --code 159992.SZ \
   --start 20250101 --end 20260903 \
-  --engine kernel
+  --device auto
 
 # 显式覆盖某个参数 (其余仍读默认)
 python -m evtrade backtest \
@@ -127,7 +127,8 @@ python -m evtrade backtest \
   --params "low1:2.0;low2:1.5;high1:2.0;high2:1.0"
 ```
 
-`--engine ref` 走参考引擎 (慢但好调试), 默认 `--engine kernel` 走 numba。
+> 旧 `--engine kernel/ref/vectorized` 已删除（检测到时打 DeprecationWarning 后自动映射到
+> `--device`）。后端统一为 torch，CPU/GPU 由 `--device {cpu,gpu,auto}` 选择。
 
 ---
 
@@ -179,8 +180,7 @@ python -m evtrade params save channel_deviation \
 
 1. **`--params "k:v;..."`** 显式传入 (任何策略, 类型自动推导 int/float/bool/str)
 2. **`evtrade/strategies/_defaults/<strategy>.json`** 落盘默认 (任何策略)
-3. **旧 CLI `--low1/--low2/--high1/--high2`** 仅 `channel_deviation` 兼容
-4. **空 dict** (后续 StrategyBase 用 `params_spec` 的 default 值)
+3. **空 dict** (后续 `VectorizedStrategy` 用 `params_spec` 的 default 值)
 
 实盘/CI 机器用 `EVTRADE_DEFAULTS_DIR` 环境变量切换落盘目录, 不污染仓库。
 
@@ -206,7 +206,7 @@ python -m evtrade params save channel_deviation \
 # 4. 单次回测 (不传参数)
 python -m evtrade backtest \
   --strategy channel_deviation --code 159992.SZ \
-  --start 20260101 --end 20260903 --engine kernel
+  --start 20260101 --end 20260903 --device auto
 ```
 
 第四步会打印 "策略: channel_deviation  参数: {low1=1.5, low2=1.0, ...}",

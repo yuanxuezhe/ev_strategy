@@ -5,8 +5,8 @@
   - entry point evtrade -> evtrade.cli:main 已注册
   - dev-dependencies 走 [dependency-groups] dev (PEP 735, 替代已废弃的
     tool.uv.dev-dependencies)
-  - 核心依赖: numpy/pandas/sqlalchemy/pymysql (2026-09-09 已删 numba)
-  - GPU extra: cupy (Linux/Windows 区分)
+  - 核心依赖: numpy/pandas/sqlalchemy/pymysql/torch (2026-09-09 已删 numba)
+  - GPU extra: torch (torch 内置 CUDA, 无需 cupy)
   - 排除目录 (tests/docs/...) 不被打包
   - 若环境有 uv: uv lock --check 通过
 """

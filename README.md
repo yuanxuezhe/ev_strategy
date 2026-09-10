@@ -1,21 +1,21 @@
 # evtrade
 
-策略回测 / 参数扫描 / 行情回放 — DSL 三端转译 (Python + numba + CUDA)。
+策略回测 / 参数扫描 / 行情回放 — PyTorch 统一 CPU/GPU 后端 (VectorizedStrategy.step 契约)。
 
 ## 安装 (uv)
 
 ```bash
-# CPU 路径 (默认; 不需要 cupy)
+# CPU 路径 (默认; torch CPU wheel 即可)
 uv sync
 
-# GPU 路径 (Linux 装 cupy-cuda12x, Windows 装 cupy-cuda11x)
+# GPU 路径 (torch CUDA wheel, 需 NVIDIA + CUDA runtime)
 uv sync --extra gpu
 
 # 开发 (含 pytest)
 uv sync --extra dev
 ```
 
-`uv` 会自动建虚拟环境、装核心依赖。`pyproject.toml` 列出全部依赖 (numpy / numba / pandas / sqlalchemy / pymysql)。
+`uv` 会自动建虚拟环境、装核心依赖。`pyproject.toml` 列出全部依赖 (numpy / pandas / sqlalchemy / pymysql / torch)。
 
 ## 启动
 
@@ -31,7 +31,7 @@ uv run evtrade ...                      # pyproject.toml [project.scripts] 注�
 
 ```bash
 uv run python -m evtrade backtest --strategy channel_deviation --code 159992.SZ \
-  --start 20250101 --end 20260903 --engine kernel
+  --start 20250101 --end 20260903 --device auto
 
 uv run python -m evtrade sweep --strategy channel_deviation --code 159992.SZ \
   --start 20250101 --end 20260903 \
@@ -52,7 +52,7 @@ uv run python -m evtrade replay --log bars_log.csvz --against-ref
 ```bash
 uv run pytest                              # 全部 (GPU 测试默认 skip)
 uv run pytest -m "not gpu"                 # 仅 CPU
-uv run pytest -m gpu --gpu                 # GPU 路径 (需 cupy + CUDA)
+uv run pytest -m gpu --gpu                 # GPU 路径 (需 torch CUDA)
 ```
 
 ## 工作流：网格 → 选参 → 落盘 → 单次回测/实盘
@@ -71,7 +71,7 @@ uv run python -m evtrade sweep --strategy channel_deviation --code 159992.SZ \
 
 # 3. 单次回测 (不传参数, 自动读默认)
 uv run python -m evtrade backtest --strategy channel_deviation --code 159992.SZ \
-  --start 20260101 --end 20260903 --engine kernel
+  --start 20260101 --end 20260903 --device auto
 
 # 4. 实盘接入 (live 子命令未实现, 占位: 直接调 loader)
 uv run python -c "
@@ -86,8 +86,7 @@ print(load('channel_deviation'))
 
 1. CLI `--params "k:v;..."` 显式传入 (任意策略, 类型自动推导 int/float/bool/str)
 2. `evtrade/strategies/_defaults/<strategy>.json` 落盘默认
-3. 旧 CLI `--low1/--low2/--high1/--high2` (仅 `channel_deviation` 兼容)
-4. 空 dict → `StrategyBase.params_spec` 的 `default`
+3. 空 dict → `VectorizedStrategy.params_spec` 的 `default`
 
 实盘/CI 机器用 `EVTRADE_DEFAULTS_DIR` 环境变量切换落盘目录, 不污染仓库:
 
@@ -101,15 +100,16 @@ export EVTRADE_DEFAULTS_DIR=/etc/evtrade/defaults
 evtrade/
   __init__.py          顶层 re-export + sys.modules 兼容垫片
   __main__.py          python -m evtrade 入口
+  backends.py          get_xp(device) -> torch.device (CPU/GPU 统一后端)
   cli.py               argparse 子命令 (backtest/sweep/replay/params)
-  core/                kernel / kernel_dsl / engine / sweep / replay / gpu / data
-  strategies/          DSL + StrategyBase + 默认参数 (_defaults/)
+  core/                engine / vectorized_engine / sweep / replay / gpu / data / metrics
+  strategies/          VectorizedStrategy 唯一基类 + 注册表 + 默认参数 (_defaults/)
   feeds/               行情 feed 注册表
   execution/           Executor 抽象 (Simulated / Broker)
-  indicators/          纯函数技术指标
-tests/                 113+ pytest 用例
-tools/                 维护工具
+  indicators/          ema / atr / rsi / boll (*_step 增量 + xp 批量 + torch 批量)
+tests/                 147 pytest 用例
 docs/                  使用说明
+kbs/                   中文设计文档 (spec 投影)
 ```
 
 ## 详见

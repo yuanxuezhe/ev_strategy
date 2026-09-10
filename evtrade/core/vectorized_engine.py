@@ -140,10 +140,13 @@ def _execute_trades(sig_np, close_np, ts_np,
 
 # ============ 信号循环 (strategy-step-only) ============
 
-def _compute_signals(strategy, params: dict, buckets: dict) -> np.ndarray:
+def _compute_signals(strategy, params: dict, buckets: dict,
+                     verbose: bool = False) -> np.ndarray:
     """vectorized 路径: 循环调 strategy.step, state 由 engine 持有 (Python 对象)
 
     桶级 OHLCV 由 _aggregate_buckets 算好 (numpy 数组)。
+    verbose=True 时, sig!=0 调 strategy.format_signal_line 并 print (与 Engine 路径同语义)。
+
     返回: sig 序列 (numpy int8), 已 mark=0 清零。
     """
     state = strategy.init_state(params)
@@ -170,6 +173,10 @@ def _compute_signals(strategy, params: dict, buckets: dict) -> np.ndarray:
         }
         state, s = strategy.step(state, bar, params)
         sig[i] = s
+        if verbose and s != 0:
+            info = getattr(strategy, "_last_info", None)
+            print(strategy.format_signal_line(int(ts_np[i]), int(s), info),
+                  flush=True)
 
     sig = sig * mark_np.astype(np.int8)
     return sig
@@ -217,12 +224,14 @@ def run_vectorized(bars_1m: dict, period: str, warmup_until: int,
                    init_cash: float = 200000.0, init_position: float = 200000.0,
                    trade_qty: float = 10000.0, scale: float = 1.0,
                    buy_pct: float = 0.0, sell_pct: float = 0.0,
-                   device: str = "cpu") -> dict:
+                   device: str = "cpu",
+                   verbose: bool = False) -> dict:
     """向量化回测 (strategy-step-only)
 
     bars_1m: numpy dict (bars_to_arrays 输出)
     strategy: VectorizedStrategy 实例 (step 方法)
     device: 接受但忽略 (PyTorch 后端无 device 路由)
+    verbose: True 时, sig!=0 调 strategy.format_signal_line 并 print
 
     返回: {"sig", "trades", "summary", "buckets"}
     """
@@ -233,7 +242,7 @@ def run_vectorized(bars_1m: dict, period: str, warmup_until: int,
     buckets = _aggregate_buckets(bars_1m, period, warmup_until)
 
     # 2) 信号: 循环调 strategy.step, state 由引擎持有
-    sig_np = _compute_signals(strategy, params, buckets)
+    sig_np = _compute_signals(strategy, params, buckets, verbose=verbose)
 
     # 3) 成交 (顺序执行)
     close_np = buckets["c"]

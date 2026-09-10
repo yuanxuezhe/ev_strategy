@@ -105,7 +105,7 @@ def replay_vectorized(bars, period: str, warmup_until: int,
     }
 
 
-def replay_engine(bars, period: str, warmup_until: int, tf1: int,
+def replay_engine(bars, period: str, warmup_until: int,
                   strategy_name: str, strategy_params: dict,
                   init_cash: float = 200000.0, init_position: float = 200000.0,
                   trade_qty: float = 10000.0, scale: float = 1.0,
@@ -127,15 +127,15 @@ def replay_engine(bars, period: str, warmup_until: int, tf1: int,
 
     records: list[dict] = []
     account = Account(cash=init_cash, position=init_position)
-    executor = SimulatedExecutor(account, qty=trade_qty, verbose=False,
+    # verbose=True 让 Executor 在 trade 时打 >> 行, Engine 在 sig!=0 时调 format_signal_line 并 print
+    executor = SimulatedExecutor(account, qty=trade_qty, verbose=True,
                                  scale=scale, buy_pct=buy_pct,
                                  sell_pct=sell_pct, all_in=all_in,
                                  record_to=records)
     strategy = get_strategy(strategy_name, params=strategy_params or {})
     aggregator = BarAggregator(resolve_period_seconds(period), on_bars=None,
                                warmup_until=str(warmup_until) if warmup_until else None)
-    engine = Engine(feed, aggregator, strategy, executor, tf1=tf1,
-                    verbose=False)
+    engine = Engine(feed, aggregator, strategy, executor, verbose=True)
     engine.run()
 
     # bucket_signals 已是桶级信号列表, 直接返桶级数组
@@ -156,7 +156,7 @@ def diff_signals(sig_a: np.ndarray, sig_b: np.ndarray) -> dict:
             "n_b": int((sig_b != 0).sum())}
 
 
-def reconcile(bars, period: str, warmup_until: int, tf1: int,
+def reconcile(bars, period: str, warmup_until: int,
               strategy_name: str, strategy_params: dict,
               init_cash: float = 200000.0, init_position: float = 200000.0,
               trade_qty: float = 10000.0, scale: float = 1.0,
@@ -180,7 +180,7 @@ def reconcile(bars, period: str, warmup_until: int, tf1: int,
     k = replay_vectorized(bars, period, warmup_until, strategy_name, strategy_params,
                           init_cash, init_position, trade_qty, scale,
                           buy_pct=buy_pct, sell_pct=sell_pct, device=device)
-    r = replay_engine(bars, period, warmup_until, tf1, strategy_name, strategy_params,
+    r = replay_engine(bars, period, warmup_until, strategy_name, strategy_params,
                       init_cash, init_position, trade_qty, scale,
                       buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in)
     d_sig = diff_signals(k["sig"], r["sig"])

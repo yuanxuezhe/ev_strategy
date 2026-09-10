@@ -17,10 +17,10 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```bash
 # 仓库根目录
 
-# 1. CPU 路径 (默认; 不需要 cupy / CUDA)
+# 1. CPU 路径 (默认; 不需要 CUDA)
 uv sync
 
-# 2. GPU 路径 (Linux 装 cupy-cuda12x, Windows 装 cupy-cuda11x)
+# 2. GPU 路径 (torch CUDA wheel, 需 NVIDIA + CUDA runtime)
 uv sync --extra gpu
 
 # 3. 装开发工具 (pytest 等)
@@ -75,19 +75,21 @@ uv python install 3.11
 uv sync --python 3.11
 ```
 
-### `cupy` 报 CUDA driver 不匹配
+### torch 报 CUDA driver 不匹配
 
 ```text
-CUDA path could not be detected.
+Torch not compiled with CUDA enabled / CUDA path could not be detected.
 ```
 
-→ Windows 默认装 cupy-cuda11x (CUDA 11 runtime)。如果机器只有 CUDA 12:
+→ `uv sync` 默认装 torch CPU wheel，只跑 CPU。要跑 GPU 需装 CUDA 版 torch：
 
 ```bash
-uv pip install cupy-cuda12x
+uv sync --extra gpu            # 或
+pip install torch --index-url https://download.pytorch.org/whl/cu124   # CUDA 12.4 示例
 ```
 
-或反之。换运行时需要重装 cupy, 不能两个并存。
+> CPU / CUDA 是同一个 `torch` 包的两个 wheel，不能并存。换运行时需要重装 torch。
+> 装对后 `--device auto` 会自动路由到 CUDA，`--device gpu` 在 CUDA 不可用时打 warning 回退 cpu。
 
 ### `uv lock` 不一致 (团队协作时)
 

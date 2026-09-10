@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 # 引擎级 grid key (框架自带); 策略参数名由其 params_spec 自动允许
-GRID_KEYS = ("tf1", "period", "trade_qty", "scale",
+GRID_KEYS = ("period", "trade_qty", "scale",
              "buy_pct", "sell_pct", "all_in")
 
 
@@ -38,9 +38,7 @@ def parse_grid(specs: list, extra_keys: set[str] | None = None) -> list[dict]:
     for values in itertools.product(*[v for _, v in axes]):
         combo = {}
         for k, raw in zip(keys, values):
-            if k == "tf1":
-                combo[k] = int(raw)
-            elif k == "period":
+            if k == "period":
                 combo[k] = raw
             elif k == "all_in":
                 combo[k] = raw.strip().lower() in ("1", "true", "yes", "y", "t")
@@ -57,7 +55,7 @@ def run_one_from_dict(bars: dict, p: dict, warmup_until: int,
 
     strategy_name: 必填 (策略 key), 见 evtrade.strategies.available_strategies()
     p 必含键: period / init_cash / init_position / trade_qty / params
-    可选:    tf1 (默认 21) / scale / buy_pct / sell_pct / all_in
+    可选:    scale / buy_pct / sell_pct / all_in
     """
     if not strategy_name:
         raise ValueError("run_one_from_dict: strategy_name is required")
@@ -193,7 +191,7 @@ def sweep(bars: dict, base: dict, combos: list[dict],
     _log = logging.getLogger("evtrade.sweep")
     gpu_ok = gpu_available()
     if device == "gpu" and not gpu_ok:
-        raise ValueError("请求 device='gpu' 但环境无可用 cupy/CUDA")
+        raise ValueError("请求 device='gpu' 但环境无可用 torch/CUDA")
     resolved = select_device(strategy_name, device, gpu_ok)
     if device == "auto" and resolved != device:
         _log.warning("device=auto 降级: 请求 %s -> 实际 %s", device, resolved)

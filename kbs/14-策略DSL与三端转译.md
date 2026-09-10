@@ -3,10 +3,10 @@
 > **本文为 2026-09-10 重构版。** 唯一抽象方法 = `step(state, bar, params) -> (state, sig)`;
 > 状态由 engine 持有 (`@dataclass`), 策略**无 instance attr** (无 `self._fsm`)。
 >
-> 一份策略主逻辑 (Python), 两端统一执行: **CPU (numpy) / GPU (cupy)**。
+> 一份策略主逻辑 (Python), 两端统一执行: **CPU (torch) / GPU (torch CUDA)**。
 > 不再有 numba `@njit`、CUDA `__device__` 函数渲染器、AST 白名单、state_spec 三端投影。
-> 性能由 CuPy 高阶封装承担 (cupy.where / cupy.cumsum / cupy.searchsorted 等
-> 映射到 cuBLAS / cuDNN 预编译 kernel, 无需手写 CUDA C99)。
+> 性能由 PyTorch 高阶算子承担 (torch.where / cumsum / unfold / gather 等
+> 映射到 cuBLAS 预编译 kernel, 无需手写 CUDA C99)。
 >
 > 写新策略前必读 11 号文档第 3 节。
 
@@ -65,14 +65,14 @@ class VectorizedStrategy:
 - **state 由 engine 持有传入传出**, 策略无 instance attr (无 `self._fsm` 等)。
 - `mark == 0` 桶 (预热段) step MUST 直接返 `(state, 0)`, framework 不做兜底。
 - 框架层 MUST NOT 在 `bar` 里塞指标键 (无 `up` / `dw` / `low_dev` 等); 指标自维护。
-- 策略代码 MUST NOT `import numpy / cupy`; 必须通过 `xp` 抽象 (engine 传 `xp`)。
+- 策略代码 MUST NOT `import numba` / `import cupy`; CPU/GPU 由 `backends.get_xp(device)` 统一路由到 torch.device。
 
 ## 3. CPU/GPU 双端统一路径 (engine 循环调 step)
 
 ```
 run_vectorized(bars_1m, period, warmup_until,
                strategy=VectorizedStrategy, params, ..., device)
-├─ xp = evtrade.backends.get_xp(device)              # "cpu"→numpy / "gpu"→cupy
+├─ xp = evtrade.backends.get_xp(device)              # "cpu"→torch cpu / "gpu"→torch cuda
 ├─ buckets = _aggregate_buckets_xp(xp, bars_1m, ...) # 向量化桶聚合
 ├─ state = strategy.init_state(params)
 ├─ for i in range(n_buckets):                       # engine 循环调 step
@@ -157,7 +157,7 @@ class ChannelDeviationStrategy(VectorizedStrategy):
 | 策略写法 | docstring DSL body | Python class 覆写 `compute_signals` | Python class 覆写 `step` |
 | 持久状态 | `state_spec` AST 白名单 | instance 属性 (`self._up_st`) | **state 参数 + engine 持有** (dataclass) |
 | 渲染层 | Python exec + numba @njit + CUDA C99 | 无 (Python + xp) | 无 (Python + xp) |
-| 性能路径 | numba (CPU) / CUDA | numpy (CPU) / cupy (GPU) | numpy (CPU) / cupy (GPU) |
+| 性能路径 | numba (CPU) / CUDA | torch (CPU) / torch (CUDA) | torch (CPU) / torch (CUDA) |
 | 指标调用 | DSL 白名单 + 三端 stub | 普通 Python 函数 | 普通 Python 函数 |
 | 参数上限 | CUDA 通用 kernel 限 8 字段 | 无上限 | 无上限 |
 | 三端一致性 | bitwise (--fmad=false) | 浮点路径 | 浮点路径 |

@@ -2,7 +2,7 @@ from __future__ import annotations
 """EMA / EMAChannel 指标
 
 四种形态:
-  1. xp 版 (xp_ema, xp_ema_channel): 兼容 numpy/cupy, 接收 xp 模块
+  1. xp 版 (xp_ema, xp_ema_channel): 兼容 numpy/torch 模块, 接收 xp 模块
   2. torch 版 (xp_ema_torch, xp_ema_channel_torch): 输入输出均为 torch.Tensor
   3. step 增量版 (ema_step, ema_channel_step): 策略 step() 调, state 用 dataclass
   4. 纯函数版 (ema, ema_channel): numpy 数组输入, ndarray 输出 (jupyter 用)
@@ -90,7 +90,7 @@ def xp_ema_channel_torch(highs: torch.Tensor, lows: torch.Tensor, p) -> tuple:
 
 
 def xp_ema(xp, values, p: int):
-    """EMA 批量版 (xp 兼容: numpy 或 cupy)
+    """EMA 批量版 (xp 兼容: numpy 或 torch 模块)
 
     接受旧签名 `xp_ema(xp, values, p)`; 内部用 xp 模块做前缀和 + 递推。
     返回: xp.ndarray, 形状 (T,) (1D 输入) 或 (B, T) (2D 输入); 前 p-1 根 NaN。

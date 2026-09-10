@@ -9,13 +9,13 @@ Device = Literal["cpu", "gpu"]
 
 
 TARGET_CAPS: dict[str, dict] = {
-    "cpu": {"label": "CPU/numpy (xp=numpy)"},
-    "gpu": {"label": "GPU/CuPy (xp=cupy)"},
+    "cpu": {"label": "CPU/torch (device=cpu)"},
+    "gpu": {"label": "GPU/torch (device=cuda)"},
 }
 
 
 def can_run(strategy_name: str, target: Device) -> tuple[bool, str]:
-    """该策略是否能在 target 上执行 (唯一限制 = gpu_available)
+    """该策略是否能在 target 上执行 (唯一限制 = gpu_available/torch CUDA)
 
     返回 (ok, reason): ok=False 时 reason 是给用户看的诊断 (>= 1 句);
     ok=True 时 reason 为空字符串。
@@ -29,7 +29,7 @@ def select_device(strategy_name: str,
     """按 requested + gpu_available 选 device
 
     requested:
-      - "gpu": 必须有 cupy; 否则抛 ValueError
+      - "gpu": 必须有 torch CUDA; 否则抛 ValueError
       - "cpu": 直接返回 cpu
       - "auto": 优先 gpu (需可用), 否则降级 cpu
     """
@@ -38,7 +38,7 @@ def select_device(strategy_name: str,
 
     if requested == "gpu":
         if not gpu_available:
-            raise ValueError("请求 gpu 但环境无可用 cupy/CUDA")
+            raise ValueError("请求 gpu 但环境无可用 torch/CUDA")
         return "gpu"
 
     if gpu_available:
@@ -47,5 +47,5 @@ def select_device(strategy_name: str,
 
 
 def gpu_available() -> bool:
-    """环境探测: cupy 是否能 import 且有 CUDA 设备 (委托 backends 单一真源)"""
+    """环境探测: torch CUDA 是否可用 (委托 backends 单一真源)"""
     return _gpu_available()

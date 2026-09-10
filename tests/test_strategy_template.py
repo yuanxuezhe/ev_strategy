@@ -1,13 +1,14 @@
 """新策略开发模板测试 (DSL/numba/CUDA 已下线; 唯一契约 VectorizedStrategy)
 
-抄一份, 改 key 与类名即可。compute_signals 是策略与 framework 的唯一接口;
-指标 (EMA/RSI/...) 在 compute_signals 内调用 evtrade.indicators.*。
+抄一份, 改 key 与类名即可。step(state, bar, params) -> (state, int) 是策略与
+framework 的唯一接口; 指标 (EMA/RSI/...) 在 step 内调用 evtrade.indicators.*;
+state 由 engine 持有 (dataclass), 策略无 instance attr。
 """
 from __future__ import annotations
 
-import numpy as np
-import pytest
+from dataclasses import dataclass, field
 
+from evtrade.indicators import EMAState, ema_step
 from evtrade.strategies import (
     VectorizedStrategy,
     available_strategies,
@@ -15,16 +16,24 @@ from evtrade.strategies import (
     get_strategy_param_spec,
     register_strategy,
 )
+import pytest
 
 
 # ============ 1. 模板策略定义 (改这部分) ============
 
+@dataclass
+class TemplateDemoState:
+    """策略持久状态: fast EMA + slow EMA (由 engine 跨调用持有)"""
+    fast: EMAState = field(default_factory=EMAState)
+    slow: EMAState = field(default_factory=EMAState)
+
+
 @register_strategy("template_demo")
 class TemplateDemoStrategy(VectorizedStrategy):
-    """模板示例: 双均线交叉 (金叉 BUY / 死叉 SELL) 的向量化实现
+    """模板示例: 双均线偏离 (fast>slow+thr → BUY / fast<slow-thr → SELL)
 
-    compute_signals(xp, bars, params) -> xp.ndarray[int8] (1=BUY / -1=SELL / 0=hold)
-    框架在 Engine.on_bars 里会包单 bar -> compute_signals_for_one_bar -> 单值。
+    step(state, bar, params) -> (new_state, sig); sig ∈ {1, -1, 0} (BUY/SELL/hold)
+    引擎 (Engine.on_bars / vectorized) 循环调 step, state 跨调用持续。
     """
 
     params_spec = {
@@ -33,20 +42,22 @@ class TemplateDemoStrategy(VectorizedStrategy):
         "threshold": {"default": 0.0, "type": float, "min": -1.0, "max": 1.0},
     }
 
-    def compute_signals(self, xp, bars, params):
-        from evtrade.indicators import xp_ema
-        c = bars["c"]
-        fast = int(params["fast"])
-        slow = int(params["slow"])
+    def init_state(self, params):
+        return TemplateDemoState()
+
+    def step(self, state, bar, params):
+        if bar["mark"] == 0:                      # 预热段不产信号
+            return state, 0
+        fast_p, slow_p = int(params["fast"]), int(params["slow"])
         thr = float(params["threshold"])
-        ema_fast = xp_ema(xp, c, fast)
-        ema_slow = xp_ema(xp, c, slow)
-        diff = (ema_fast - ema_slow) / xp.maximum(ema_slow, 1e-9)
-        sig = xp.zeros(len(c), dtype=xp.int8)
-        sig = xp.where(diff > thr, xp.int8(1), sig)
-        sig = xp.where(diff < -thr, xp.int8(-1), sig)
-        # 简单锁存: 同号相邻去重, 与实盘 on_bars 行为对齐 (此模板不演示 FSM)
-        return sig
+        state.fast, fast = ema_step(state.fast, float(bar["c"]), fast_p)
+        state.slow, slow = ema_step(state.slow, float(bar["c"]), slow_p)
+        # fast / slow 未就绪: 不产信号
+        if state.fast.count < fast_p or state.slow.count < slow_p:
+            return state, 0
+        diff = (fast - slow) / max(slow, 1e-9)
+        sig = 1 if diff > thr else (-1 if diff < -thr else 0)
+        return state, sig
 
 
 # ============ 2. 验证清单 ============
@@ -99,7 +110,8 @@ def test_06_unknown_rejected():
 
 
 def test_07_one_run():
-    """7. 跑一次合成数据: compute_signals 形态正确, 不报错"""
+    """7. 跑一次合成数据: step 循环产出合法 sig, 不报错"""
+    import numpy as np
     from evtrade.data import synthetic_bars
     from evtrade.core.vectorized_engine import _aggregate_buckets
 
@@ -113,9 +125,18 @@ def test_07_one_run():
             "close":  np.array([b.close for b in raw], dtype=np.float64),
             "volume": np.array([b.volume for b in raw], dtype=np.float64)}
     buckets = _aggregate_buckets(bars, "5m", warmup_until=0)
-    sig = s.compute_signals(np, buckets, s.params)
-    assert sig.dtype == np.int8
-    assert len(sig) == len(buckets["ts"])
+    # engine 循环调 step (state 跨调用持续)
+    state = s.init_state(s.params)
+    sigs = []
+    for i in range(len(buckets["ts"])):
+        bar = {"ts": int(buckets["ts"][i]), "o": float(buckets["o"][i]),
+               "h": float(buckets["h"][i]), "l": float(buckets["l"][i]),
+               "c": float(buckets["c"][i]), "v": float(buckets["v"][i]),
+               "mark": int(buckets["mark"][i])}
+        state, sig = s.step(state, bar, s.params)
+        sigs.append(sig)
+    assert len(sigs) == len(buckets["ts"])
+    assert set(sigs).issubset({-1, 0, 1})
     # 极端参数下可能全 0, 不强断
 
 
@@ -126,7 +147,7 @@ def test_08_replay_engine():
 
     bars = synthetic_bars(days=15, start_ymd="20241101", seed=42)
     warm = int("20241110") * 1_000_000
-    rep = reconcile(bars, "5m", warm, 21,
+    rep = reconcile(bars, "5m", warm,
                     strategy_name="channel_deviation",
                     strategy_params={"low1": 1.5, "low2": 1.0,
                                      "high1": 1.5, "high2": 0.5},

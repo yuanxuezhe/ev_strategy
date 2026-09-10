@@ -3,8 +3,9 @@
 > 给 Claude Code / 协作者的工作约定。改本文件时请同步告知团队。
 >
 > 本项目为 2026-09-09 重构后版本：DSL 渲染层 / numba 流式内核 / NVRTC CUDA 编译
-> **已下线**；策略唯一入口 = `VectorizedStrategy.compute_signals(xp, bars, params)`；
-> CPU (numpy) / GPU (cupy) 双端统一由 cupy 高阶封装提供。
+> **已下线**；策略唯一入口 = `VectorizedStrategy.step(state, bar, params) -> (state, sig)`
+> + `init_state(params)`，state 由引擎持有；CPU (torch cpu) / GPU (torch cuda)
+> 双端统一由 PyTorch 后端提供。
 
 ## 0. 核心工作流（最重要）
 
@@ -49,13 +50,13 @@
 
 ## 3. 源码地图（核心要点）
 
-- 包结构：`evtrade/{cli,primitives}.py` + `core/{config,timeutils,aggregator,engine,vectorized_engine,data,metrics,sweep,replay,gpu,permutation,capability}.py` + `indicators/{ema,atr,boll,rsi}.py` + `strategies/{vectorized_base,channel_deviation,ma_crossover}.py` + `execution/{account,base}.py` + `feeds/{base,mysql_history,chained,_registry}.py`。
+- 包结构：`evtrade/{cli,primitives,backends}.py` + `core/{config,timeutils,aggregator,engine,vectorized_engine,data,metrics,sweep,replay,gpu,permutation,capability}.py` + `indicators/{ema,atr,boll,rsi}.py` + `strategies/{vectorized_base,channel_deviation,ma_crossover}.py` + `execution/{account,base}.py` + `feeds/{base,mysql_history,chained,_registry}.py`。
 - 策略唯一基类：`VectorizedStrategy` (`evtrade/strategies/vectorized_base.py`)。
-  - 唯一抽象方法：`compute_signals(self, xp, bars, params) -> xp.ndarray[int8]`。
-  - framework 单 bar 包装：`compute_signals_for_one_bar(self, xp, bar, params) -> int`（子类可覆写维护 instance 状态）。
-  - 持久状态：Python 实例属性（`self._up_st / self._dw_st / self._fsm` 等），**不再**用 `state_spec` AST 白名单投影。
-- 框架契约：桶级数组 = `{"ts","o","h","l","c","v","mark","n_bars"}` 1D 数组 dict（`compute_signals` 接收）；
-  per-bar dict = `{"ts","o","h","l","c","v","mark"}`（`compute_signals_for_one_bar` 接收单 bar）。
+  - 唯一抽象方法：`step(self, state, bar, params) -> (state, int)`；`state` 由引擎持有、跨调用持续，策略**无 instance 持久状态**。
+  - state 初值：`init_state(self, params) -> state`（无状态策略默认返回 `None`；stateful 策略覆写返 `@dataclass`）。
+  - 持久状态：`@dataclass` state（策略自定字段，如 EMA 增量 + FSM），**不再**用 `state_spec` AST 白名单或 instance attr。
+- 框架契约：单桶 bar dict = `{"ts","o","h","l","c","v","mark"}`（标量，`step` 接收，`mark=0` 为预热段）；
+  引擎侧另有桶级数组 dict `{"ts","o","h","l","c","v","mark","n_bars"}`（`vectorized_engine._aggregate_buckets` 产出，逐桶喂给 step）。
 - CLI 入口：`python -m evtrade {backtest,sweep,replay,params}`。
   设备参数：`--device {cpu, gpu, auto}`（统一，替代旧 `--engine {kernel, ref, vectorized}`）。
   策略参数：`--params "k1:v1;k2:v2"`（按 `params_spec` 校验）。
@@ -73,19 +74,23 @@
 ## 5. 关键约定（写代码时不要破坏）
 
 - 框架层不假定任何指标字段名（up/dw/low_dev 等均不出现于 framework CLI / vectorized API 的关键字参数）。
-- 策略唯一抽象入口是 `compute_signals(xp, bars, params)`；持久状态用 Python 实例属性，**不要**重新引入 `state_spec` AST 白名单或 `KernelState` jitclass。
-- 策略展示由一个 hook 完成：`format_signal_line(ts, sig, info) -> str`（`VectorizedStrategy` 默认仅打 OHLCV + 信号）；
+- 策略唯一抽象入口是 `step(state, bar, params) -> (state, sig)`；持久状态用 `@dataclass` state（引擎持有跨调用），
+  **不要**重新引入 `state_spec` AST 白名单 / `KernelState` jitclass / `self._xxx` instance 持久状态。
+- 策略展示由一个 hook 完成：`format_signal_line(ts, sig, info) -> str`（`VectorizedStrategy` 默认仅打 `ts/sig/side`）；
   不再使用 `get_extra_bucket_columns` / `get_extra_signal_columns`（旧 bucket_table / per-bar bundle 已删除）。
-- 指标计算在策略 `compute_signals` / `compute_signals_for_one_bar` 内部通过 `evtrade.indicators.{xp_ema,ema_push,...}` 自维护；
+- 指标计算在策略 `step` 内部通过 `evtrade.indicators.{ema_step,ema_channel_step,atr_step,rsi_step,...}` 自维护；
   framework 不再持有任何 EMA 公式或指标字段。
 - 信号行打印由策略 `format_signal_line` hook 完成，Engine 只 `print` 不假设 `info` 键集。
 - Engine.on_bars 是**桶 CLOSE 语义**：桶切换时 (`cur.ts != last_cur.ts`) 用上一桶 finalized OHLCV 驱动策略一次；
   vectorized 路径在桶级 finalized OHLCV 上计算指标。两条路径通过 `reconcile` 对账，默认 `bucket_diff_cap=8` 容忍 EMA 累积漂移。
-- `--device {cpu,gpu,auto}` 是唯一后端选择参数；旧 `--engine {kernel,ref,vectorized}` 已删除（仅 `--engine` 兼容层打印 DeprecationWarning 后自动映射）。
+- `--device {cpu,gpu,auto}` 是唯一后端选择参数（torch CPU / torch CUDA 统一后端，`backends.get_xp` 路由）；
+  旧 `--engine {kernel,ref,vectorized}` 已删除（仅 `--engine` 兼容层打印 DeprecationWarning 后自动映射）。
 
 ## 6. 验证命令
 
-- KB ↔ 代码一致性：`grep -r compute_signals kbs/` 应在 02、05、06、09、11、13、14 出现；`grep -rn "numba\|@njit\|state_spec\|CUDA_DEVICE_\|kernel_dsl\|cuda_sweep_window_generic\|strategies\.dsl" kbs/ evtrade/` 应为 0 命中（tests/ 内可有注释）。
+- KB ↔ 代码一致性：`grep -rn "def step" evtrade/strategies/` 每个已注册策略应 ≥1 命中；
+  `grep -rn "compute_signals\|get_extra_bucket_columns\|get_extra_signal_columns\|state_spec\|bundle_per_bar\|bucket_table" kbs/ CLAUDE.md openspec/specs/` 应为 0 命中；
+  `grep -rn "import cupy\|cupy-cuda\|xp = cupy\|xp=cupy" evtrade/ kbs/ CLAUDE.md` 应为 0 命中（tests/ 内"cupy 已删除"类断言除外）。
 - spec 校验：`openspec validate --specs` 应通过。
 - 测试：`uv run pytest -q`（应 110+ passed；含 CPU/GPU 容差、vectorized-vs-Engine 对账、metrics 字段集）。
 - 对账：`python -m evtrade replay --log <log.csv> --strategy channel_deviation --device cpu --against-ref` 应输出 PASS（`bucket_diff_cap=8` 默认 lenient；`EVT_RECONCILE_STRICT=1` 时 cap=0）。

@@ -51,7 +51,7 @@ on_bars(bars):
 - **信息流**：`step(state, bar, params)` 内部维护 state（增量 EMA、FSM）;
   state 字段累积在 dataclass 里, engine 持有 (`Engine._state`)。
   vectorized 路径同样循环调 step, state 跨调用在循环内持续。
-  两种入口（`VectorizedEngine._compute_signals_xp` 与 `Engine.on_bars`）走同一份 `step` 算法, 信号 bitwise 一致。
+  两种入口（`VectorizedEngine._compute_signals` 与 `Engine.on_bars`）走同一份 `step` 算法, 信号 bitwise 一致。
 - `info` dict 字段集由策略自由控制，framework 不命名也不假设。
 
 ## 3. `run()` 与收尾
@@ -90,13 +90,12 @@ def run(self):
 输出项：期末价、交易次数、期初/期末资金与持仓、持仓市值、策略总资产、基线、盈亏差额与比例。
 该口径消除了标的本身涨跌的影响，衡量的是**择时的贡献**；未含手续费/滑点。
 
-> **2026-09-09 变化**: `vectorized_engine` 路径下, 盈亏汇总由 `metrics.summarize(equity_curve, baseline_curve, ...)` 给出 16 字段
-> (`final_cash / final_position / final_equity / turnover / n_trades / n_buy / n_sell / cagr / sharpe / sharpe_excess / sortino / sortino_excess / calmar / max_dd_days / max_dd_recovered / x_mdd / max_drawdown`)。
+> **2026-09-10 变化**: `vectorized_engine` 路径下, 盈亏汇总由 `metrics.summarize(equity_curve, baseline_curve, ...)` 给出 30 字段（含 `x_mdd` / `cagr_excess`；`ann_excess_pct` 已重命名 `cagr_excess`，完整清单见 kbs/13 §1）。
 > Engine 路径仅给 6 项基础汇总 (`final_cash / final_position / final_equity / n_trades / baseline / diff / pct`),
 > 因为其逐 bar 路径不累积 `equity_curve`（仅 `account` 记账）。对账路径 (`reconcile`) 只比信号 + 成交, 不比 summary。
 
 > **字段单位约定**（详见 kbs/13 §1，2026-09-09 钉死）：
-> - 百分数（`cagr` / `max_drawdown` / `excess_pct` / `ann_excess_pct`）CLI 用 `:.2%`；
+> - 百分数（`cagr` / `max_drawdown` / `excess_pct` / `cagr_excess`）CLI 用 `:.2%`；
 > - 金额元（`final_equity` / `baseline` / `excess` / `final_cash` / `turnover`）CLI 用 `:.2f`；
 > - 无量纲比率（`calmar` / `sharpe_excess` / `sortino_excess`）CLI 用 `:.3f`；
 > - 自然日（`max_dd_days`）CLI 用 `:.1f 天`。

@@ -38,7 +38,7 @@ PyTorch 单库同时提供：
 
 | 形态 | 函数签名 | 适用场景 |
 |---|---|---|
-| **xp 版**（保留兼容） | `xp_ema(xp, values, p)` | 旧 numpy/cupy 路径；策略 body 内 `xp_ema(np, c, p)` 直接用 |
+| **xp 版**（保留兼容） | `xp_ema(xp, values, p)` | 兼容旧 numpy 模块签名；策略 body 内 `xp_ema(np, c, p)` 直接用 |
 | **torch 版**（新 PyTorch 后端） | `xp_ema_torch(values, p)` | PyTorch 路径；输入输出都是 `torch.Tensor`；支持 (B, T) + per-row period |
 | **step 增量版** | `ema_step(state, value, p)` | 策略 step() 用，标量 in/out |
 
@@ -93,7 +93,8 @@ for v in values:
 
 ## 3. bars 契约（B 维 + T 维）
 
-`compute_signals(xp, bars, params)` 输入 bars dict：
+引擎在 `_compute_signals` 内逐桶调 `strategy.step(state, bar, params)`；
+桶级 bars dict（`_aggregate_buckets` 产出）：
 
 ```python
 bars = {
@@ -106,7 +107,7 @@ bars = {
     "mark":  tensor (B, T) int8,       # 1=策略期, 0=预热段
     "n_bars": tensor (B,) int64,       # 每行桶数
 }
-返回: tensor (B, T) int8 ∈ {-1, 0, 1}
+返回: 每桶一次 step → sig ∈ {-1, 0, 1} (引擎聚合成 (B, T) int8)
 ```
 
 ### 3.1 B 维语义
@@ -145,8 +146,8 @@ tf1_grid = torch.randint(5, 60, (B,), dtype=torch.int64)
 # 一次算整段 EMA
 ema = xp_ema_torch(batch_close, p=tf1_grid)   # (B, T)
 
-# 批量撮合（_execute_trades 后续会支持 (B,)）
-# sig = compute_signals(torch.device("cuda"), bars, {"tf1": tf1_grid})
+# 批量撮合（_execute_trades 支持 (B,)）
+# 引擎逐桶循环: state, sig = strategy.step(state, bar_i, {"tf1": tf1_grid[i]})
 ```
 
 ### 4.2 实盘 / 单线回测（逐棒）
@@ -196,47 +197,51 @@ if torch.cuda.is_available():
     values = values.cuda()
 
 # 对 (框架层处理)
-sig = strategy.compute_signals(xp, bars, params)
+state, sig = strategy.step(state, bar, params)   # 引擎循环调用, 不感知 device
 ```
 
 ---
 
-## 6. 双形态示例
+## 6. 策略契约示例（step 唯一入口 + torch 批量算子）
 
 ```python
 import torch
-from evtrade.indicators import xp_ema_torch, ema_step, EMAState
+from dataclasses import dataclass, field
+from evtrade.indicators import EMAState, ema_step
+from evtrade.strategies import VectorizedStrategy, register_strategy
 
-class DualMAStrategy:
-    """双均线交叉策略: 单线 + 批量同代码"""
+
+@dataclass
+class DualMAStrategyState:
+    fast: EMAState = field(default_factory=EMAState)
+    slow: EMAState = field(default_factory=EMAState)
+
+
+@register_strategy("dual_ma")
+class DualMAStrategy(VectorizedStrategy):
+    """双均线交叉策略: 唯一入口 step, CPU/GPU 同代码"""
     params_spec = {
         "fast": {"default": 10, "type": int},
         "slow": {"default": 30, "type": int},
     }
 
     def init_state(self, params):
-        return {"fast": EMAState(), "slow": EMAState()}
+        return DualMAStrategyState()
 
     def step(self, state, bar, params):
         if bar["mark"] == 0:
             return state, 0
-        state["fast"], fast = ema_step(state["fast"], bar["c"], params["fast"])
-        state["slow"], slow = ema_step(state["slow"], bar["c"], params["slow"])
-        sig = 1 if fast > slow and slow > 0 else (-1 if fast < slow else 0)
+        state.fast, fast = ema_step(state.fast, bar["c"], params["fast"])
+        state.slow, slow = ema_step(state.slow, bar["c"], params["slow"])
+        if state.fast.count < params["fast"]:
+            return state, 0
+        sig = 1 if fast > slow else (-1 if fast < slow else 0)
         return state, sig
-
-    def compute_signals(self, xp, bars, params):
-        """批量路径 (B, T) -> (B, T)"""
-        fast_ema = xp_ema_torch(bars["c"], params["fast"])  # (B, T)
-        slow_ema = xp_ema_torch(bars["c"], params["slow"])  # (B, T)
-        sig = torch.where(
-            fast_ema > slow_ema,
-            torch.tensor(1, dtype=torch.int8),
-            torch.tensor(-1, dtype=torch.int8),
-        )
-        sig = torch.where(slow_ema == 0, torch.tensor(0, dtype=torch.int8), sig)
-        return sig
 ```
+
+> 批量路径（大网格扫描）不写第二个方法：引擎在 `_compute_signals` 里对每个桶循环调
+> 同一个 `step`。若需要纯 torch 批量算子做离群分析/加速，直接调 `xp_ema_torch(values, p)`
+> （`(B,T)` tensor in/out），与 `step` 的 `ema_step` 逐桶累积在信号轨迹上保持一致。
 
 ---
 
@@ -272,7 +277,7 @@ GPU 内存足够时摊销；CPU batched 仍较慢。
 
 | 主题 | 文档 |
 |---|---|
-| 策略唯一入口 `step / compute_signals` | [14-统一策略契约.md](14-策略DSL与三端转译.md) |
+| 策略唯一入口 `step` / `init_state` | [14-统一策略契约.md](14-策略DSL与三端转译.md) |
 | CPU/GPU 数据流 + 架构图 | [02-系统架构.md](02-系统架构.md) |
 | 通道偏离策略实现 | [06-交易策略详解.md](06-交易策略详解.md) |
 | 指标公式 | [05-指标计算-EMA通道.md](05-指标计算-EMA通道.md) |
@@ -303,5 +308,5 @@ openspec validate --specs
 
 - `tests/test_torch_backend.py` — get_xp / gpu_available / xp_ema_torch batch 维 / per-row period
 - `tests/test_pyproject.py` — torch 依赖 + cupy 已删除
-- `tests/test_metrics_v3.py` / `test_metrics_units.py` — 26 字段 metrics + 单位约定
+- `tests/test_metrics_v3.py` / `test_metrics_units.py` — 30 字段 metrics + 单位约定
 - 既有 `test_strategy_unified.py` / `test_vectorized.py` — vectorized vs Engine.on_bars reconcile

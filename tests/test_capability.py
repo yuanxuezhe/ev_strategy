@@ -4,7 +4,7 @@ DSL/numba/CUDA 已下线. CPU 和 GPU 走同一条 vectorized 路径,
 能力探测只剩两件事:
   - can_run: DSL 删除后策略永远能跑 (返回 True, "")
   - select_device: 按 requested + gpu_available 决定 cpu/gpu
-  - gpu_available: 环境探测 (cupy 是否能 import)
+  - gpu_available: 环境探测 (torch CUDA 是否可用)
 
 策略参数上限不再按设备分化 (DSL 三端投影不存在了)。
 """
@@ -67,6 +67,6 @@ def test_select_device_auto_with_gpu_returns_gpu():
 
 
 def test_gpu_available_returns_bool():
-    """环境探测返回 bool (即使 cupy 不可用也不抛错)"""
+    """环境探测返回 bool (即使 torch CUDA 不可用也不抛错)"""
     result = gpu_available()
     assert isinstance(result, bool)

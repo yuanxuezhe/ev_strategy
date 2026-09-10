@@ -7,9 +7,9 @@ from __future__ import annotations
   - replay:   replay.replay_vectorized (--against-ref 加 replay.reconcile)
 
 设备选择: --device {cpu, gpu, auto} (默认 auto)
-  - auto: 优先 gpu (cupy 可用), 否则 cpu
-  - cpu:  xp = numpy
-  - gpu:  xp = cupy (需 cupy + CUDA)
+  - auto: 优先 gpu (torch CUDA 可用), 否则 cpu
+  - cpu:  torch.device("cpu")
+  - gpu:  torch.device("cuda") (需 torch + CUDA, 不可用时自动回退 cpu)
 
 常见修改:
   1. 加新参数: 在 build_*_parser 加 add_argument; 在对应的 _run_* 中读取并透传。
@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import time
 
-from .core.config import INIT_CASH, INIT_POSITION, INTERVAL, TF1, TRADE_QTY
+from .core.config import INIT_CASH, INIT_POSITION, INTERVAL, TRADE_QTY
 from .core.timeutils import resolve_period_seconds
 
 
@@ -116,7 +116,7 @@ def _coalesce_legacy_engine(argv: list[str]) -> tuple[list[str], str]:
 
 def build_backtest_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        description="策略回测 (vectorized; CPU=xp=numpy / GPU=xp=cupy)")
+        description="策略回测 (vectorized; CPU/GPU 统一走 PyTorch, --device 路由)")
     ap.add_argument("--period", default="5m", type=_period_type,
                     help="K线周期, 任意数字+m/h/d: 5m/7m/15m/30m/90m/2h/4h/6h/1d/3d ...")
     ap.add_argument("--strategy", default="channel_deviation",
@@ -125,7 +125,6 @@ def build_backtest_parser() -> argparse.ArgumentParser:
                     help="策略参数 (通用 dict 形式): 'k1:v1;k2:v2'")
     ap.add_argument("--start", default="20250101", help="策略起始日期 YYYYMMDD")
     ap.add_argument("--end", default="20260903", help="策略结束日期 YYYYMMDD")
-    ap.add_argument("--tf1", type=int, default=TF1, help="EMA 周期 (策略/指标层)")
     ap.add_argument("--trade-qty", type=float, default=TRADE_QTY, help="每次信号交易股数")
     ap.add_argument("--scale", type=float, default=1.0,
                     help="倍投系数: 连续同向信号数量=上次×scale (反向重置); 1.0=关闭")
@@ -137,7 +136,9 @@ def build_backtest_parser() -> argparse.ArgumentParser:
                     help="SELL 时按当前持仓的该比例卖 (0=关闭走 --trade-qty)")
     ap.add_argument("--code", default="159992.SZ", help="证券代码")
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"],
-                    help="xp 后端: cpu=numpy / gpu=cupy / auto=优先 gpu (默认)")
+                    help="xp 后端: cpu=torch.device('cpu') / gpu=torch.device('cuda') / auto=优先 gpu (默认)")
+    ap.add_argument("--verbose", "-v", action="store_true",
+                    help="逐根打印 strategy.format_signal_line 输出 (sig!=0 时)")
     ap.add_argument("--warmup-days", type=int, default=365,
                     help="预热天数 (拉取 start 之前的行情供指标就绪)")
     ap.add_argument("--data-cache", default=None,
@@ -190,7 +191,7 @@ def _run_backtest(args):
                      warmup_days=args.warmup_days, cache_dir=args.data_cache)
     n = len(bars["stime"])
     print(f"证券: {args.code}  周期: {args.period}  策略日期: {args.start}~{args.end}  "
-          f"预热: {args.warmup_days}天  TF1={args.tf1}  "
+          f"预热: {args.warmup_days}天  "
           f"策略: {args.strategy}  "
           f"scale={args.scale}  "
           f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}  "
@@ -205,7 +206,7 @@ def _run_backtest(args):
         init_cash=args.init_cash, init_position=args.init_position,
         trade_qty=args.trade_qty, scale=args.scale,
         buy_pct=buy_pct, sell_pct=sell_pct,
-        device=args.device)
+        device=args.device, verbose=args.verbose)
     dt = time.perf_counter() - t0
 
     s = result["summary"]
@@ -285,7 +286,6 @@ def build_sweep_parser() -> argparse.ArgumentParser:
     ap.add_argument("--start", default="20250101")
     ap.add_argument("--end", default="20260903")
     ap.add_argument("--period", default="5m", type=_period_type)
-    ap.add_argument("--tf1", type=int, default=TF1)
     ap.add_argument("--trade-qty", type=float, default=TRADE_QTY)
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--all-in", action="store_true")
@@ -338,7 +338,7 @@ def sweep_main(argv=None):
                          warmup_days=args.warmup_days, cache_dir=args.data_cache)
 
     base_params = _resolve_strategy_params(args.strategy, args.params)
-    base = {"start": args.start, "period": args.period, "tf1": args.tf1,
+    base = {"start": args.start, "period": args.period,
             "trade_qty": args.trade_qty, "scale": args.scale,
             "buy_pct": args.buy_pct, "sell_pct": args.sell_pct,
             "all_in": args.all_in,
@@ -404,7 +404,6 @@ def build_replay_parser() -> argparse.ArgumentParser:
                     help="bar 日志 (CSV: stime,code,open,high,low,close,volume)")
     ap.add_argument("--strategy", default="channel_deviation")
     ap.add_argument("--period", default="5m", type=_period_type)
-    ap.add_argument("--tf1", type=int, default=TF1)
     ap.add_argument("--params", default="",
                     help="策略参数 (通用 dict 形式)")
     ap.add_argument("--scale", type=float, default=1.0)
@@ -424,7 +423,6 @@ def replay_main(argv=None):
     from .core.replay import (
         read_bars_log, reconcile, replay_vectorized,
     )
-    from .strategies import get_strategy
 
     strategy_name = args.strategy
     sp = _resolve_strategy_params(strategy_name, args.params)
@@ -434,7 +432,7 @@ def replay_main(argv=None):
         raise SystemExit("日志为空")
     warm = int(args.warmup_until) * 1_000_000 if args.warmup_until else 0
     print(f"回放: {len(bars)} 根 bar [{bars[0].stime} ~ {bars[-1].stime}]  "
-          f"period={args.period} tf1={args.tf1} 策略={strategy_name} "
+          f"period={args.period} 策略={strategy_name} "
           f"params={sp or '(默认)'}  scale={args.scale}  device={args.device}\n",
           flush=True)
 
@@ -450,23 +448,15 @@ def replay_main(argv=None):
           f"(基线 {s['baseline']:,.2f}, 超额 {s['excess_pct']:+.2f}%)")
 
     if args.signals_out:
-        strategy = get_strategy(strategy_name, params=sp or {})
-        extra_cols = strategy.get_extra_signal_columns(sig=k["sig"])
         with open(args.signals_out, "w", encoding="utf-8-sig") as f:
-            cols = ["stime", "signal"] + list(extra_cols.keys())
-            f.write(",".join(cols) + "\n")
-            extras = [v.tolist() if hasattr(v, "tolist") else list(v)
-                      for v in extra_cols.values()]
+            f.write("stime,signal\n")
             for i, b in enumerate(bars):
-                row = f"{b.stime},{int(k['sig'][i])}"
-                for arr in extras:
-                    row += f",{arr[i]}"
-                f.write(row + "\n")
-        print(f"信号轨迹已保存: {args.signals_out}")
+                f.write(f"{b.stime},{int(k['sig'][i])}\n")
+        print(f"信号轨迹已保存: {args.signals_out} ({len(bars)} 行)")
 
     if args.against_ref:
         print()
-        reconcile(bars, args.period, warm, args.tf1,
+        reconcile(bars, args.period, warm,
                   strategy_name=strategy_name, strategy_params=sp,
                   scale=args.scale,
                   buy_pct=args.buy_pct, sell_pct=args.sell_pct,

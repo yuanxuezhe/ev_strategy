@@ -1,10 +1,10 @@
 from __future__ import annotations
-"""向量化引擎测试 (CuPy 统一 CPU/GPU 路径)
+"""向量化引擎测试 (PyTorch 统一 CPU/GPU 路径)
 
 - test_ma_crossover_cpu_smoke: CPU 路径跑通, 信号/成交/汇总结构正确
 - test_vectorized_sig_shape: 信号数组长度 = 桶数, dtype int8
 - test_vectorized_warmup_no_signal: 预热段 (mark=0) 不产信号
-- test_ma_crossover_cpu_vs_gpu: CPU vs GPU 结果容差 1e-9 (cupy 不可用则 skip)
+- test_ma_crossover_cpu_vs_gpu: CPU vs GPU 结果容差 1e-9 (torch CUDA 不可用则 skip)
 - test_vectorized_matches_ref: MA 交叉策略用 ref 引擎 (逐 bar) 与 vectorized 引擎
   对比信号/成交/终态 (验证向量化语义正确)
 """
@@ -32,17 +32,17 @@ def _run(device="cpu", fast=5, slow=20):
         trade_qty=10000.0, scale=1.0, device=device)
 
 
-# ---------- cupy 可用性 (复用 test_gpu.py 的 skipif 模式) ----------
+# ---------- GPU 可用性 (torch CUDA) ----------
 
-cupy_ready = True
+gpu_ready = True
 _reason = ""
 try:
     from evtrade.backends import gpu_available
-    cupy_ready = gpu_available()
-    if not cupy_ready:
-        _reason = "cupy/GPU 不可用"
+    gpu_ready = gpu_available()
+    if not gpu_ready:
+        _reason = "torch/CUDA 不可用"
 except Exception as e:
-    cupy_ready = False
+    gpu_ready = False
     _reason = str(e)[:80]
 
 
@@ -86,11 +86,11 @@ def test_vectorized_warmup_no_signal():
     assert len(sig) == n_mark1
 
 
-# ---------- CPU vs GPU (容差; cupy 不可用 skip) ----------
+# ---------- CPU vs GPU (容差; torch CUDA 不可用 skip) ----------
 
-@pytest.mark.skipif(not cupy_ready, reason=f"cupy/GPU 不可用: {_reason}")
+@pytest.mark.skipif(not gpu_ready, reason=f"torch/CUDA 不可用: {_reason}")
 def test_ma_crossover_cpu_vs_gpu():
-    """同参数同数据, CPU (numpy) vs GPU (cupy) 结果容差 1e-9
+    """同参数同数据, CPU (torch cpu) vs GPU (torch cuda) 结果容差 1e-9
 
     CuPy 高阶封装的 GPU 算子舍入与 CPU 不同, 不保证 bitwise; 但策略逻辑
     确定性 + 同输入, 结果应在 ULP 级容差内。

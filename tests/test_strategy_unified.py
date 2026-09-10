@@ -2,10 +2,10 @@
 
 核心断言:
   1. channel_deviation / ma_crossover 都是 VectorizedStrategy 子类
-  2. compute_signals 返回 xp.ndarray[int8]
-  3. cpu vs gpu 信号 bitwise 一致 (cupy 不可用时跳过 gpu)
+  2. step(state, bar, params) -> (state, int) 契约 + init_state dataclass
+  3. cpu vs gpu 信号 bitwise 一致 (torch CUDA 不可用时跳过 gpu)
   4. vectorized 路径 vs Engine.on_bars 路径逐笔一致 (reconcile)
-  5. metrics summary 16 字段齐全 (cagr/sharpe/sortino/calmar/max_dd_days/...)
+  5. metrics summary 字段集齐全 (含 x_mdd; cagr/sharpe/calmar/max_dd_days/...)
 """
 from __future__ import annotations
 
@@ -74,7 +74,7 @@ def test_step_returns_int():
 
 
 def test_ma_crossover_cpu_vs_gpu_bitwise_equal():
-    """CPU vs GPU 信号 bitwise 一致 (cupy 不可用时 skip)
+    """CPU vs GPU 信号 bitwise 一致 (torch CUDA 不可用时 skip)
 
     strategy-step-only: 跑两次 run_vectorized (cpu + gpu), 比较 sig_live 序列
     """
@@ -82,7 +82,7 @@ def test_ma_crossover_cpu_vs_gpu_bitwise_equal():
         cp = get_xp("gpu")
         _ = cp.zeros(2)
     except Exception:
-        pytest.skip("cupy/CUDA 不可用")
+        pytest.skip("torch/CUDA 不可用")
 
     bars = _make_bars()
     s_cpu = evtrade.get_strategy("ma_crossover", fast=5, slow=20)
@@ -197,7 +197,7 @@ def test_init_state_returns_dataclass():
     # cd_state 含 EMA 通道 + FSM
     from evtrade.indicators import EMAChannelState
     assert isinstance(cd_state.ema, EMAChannelState)
-    assert "low_hit" in cd_state.fsm and "lock_ts" in cd_state.fsm
+    assert hasattr(cd_state.fsm, "low_hit") and hasattr(cd_state.fsm, "lock_ts")
 
     # mc_state 含 fast/slow EMA
     from evtrade.indicators import EMAState
@@ -253,9 +253,10 @@ def test_step_state_persists_across_calls():
         f"再调 1 次, EMA count 应递增, 实际 new={new_state.ema.up.count} old={old_count}"
 
 
-def test_compute_signals_for_one_bar_default_wrapper():
-    """DEPRECATED 2026-09-10 (strategy-step-only): wrapper 已删;
-    此测试改验 init_state 返回 None 时 step 仍能工作"""
+def test_stateless_step_with_none_state():
+    """无状态策略: init_state 返 None 时, step 仍以 (None, sig) 正常工作
+    (2026-09-10 strategy-step-only: 旧 compute_signals_for_one_bar wrapper 已删,
+    无状态策略直接走 step, state 恒为 None)"""
 
     class TestStrat(VectorizedStrategy):
         params_spec = {}

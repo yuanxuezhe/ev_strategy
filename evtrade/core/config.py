@@ -3,7 +3,6 @@ from __future__ import annotations
 
 可改默认值 (改动安全):
   - INIT_CASH / INIT_POSITION / TRADE_QTY: 默认资金/持仓/单笔数量
-  - TF1: 通道轨 EMA 默认周期 (CLI --tf1 可覆盖)
   - DB_URL: 环境变量 EVTRADE_DB_URL 可覆盖, 避免凭据入仓
   - PERIODS: 7 个预定义周期; --period 支持任意 m/h/d, PERIODS 仅做默认
 
@@ -32,8 +31,6 @@ PERIODS = {
     "4h":  ("h", 4,  8,  timedelta(hours=4)),
     "1d":  ("d", 1,  6,  timedelta(days=1)),
 }
-
-TF1 = 21  # 通道轨 EMA 周期
 
 INIT_CASH = 200000.0       # 期初资金 20万
 INIT_POSITION = 200000.0   # 期初持仓 20万股

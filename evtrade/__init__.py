@@ -16,7 +16,7 @@
   python -m pytest tests -q
 
 切换实盘/回测: 换 Feed + 换 Executor, 其余不变。
-依赖: pip install pymysql sqlalchemy numpy (cupy 可选 GPU)
+依赖: pip install pymysql sqlalchemy numpy torch (torch CPU/CUDA 统一后端)
 """
 
 # ---- 核心数据模型 / 时间桶 / 桶合并 / 记账 ----
@@ -77,7 +77,7 @@ from .core.permutation import permutation_test
 from .core.metrics import (
     bars_to_arrays, summarize, trades_to_list,
 )
-from .core.config import DB_URL, TABLE, TF1, INIT_CASH, INIT_POSITION, TRADE_QTY
+from .core.config import DB_URL, TABLE, INIT_CASH, INIT_POSITION, TRADE_QTY
 
 # ---- execution ----
 from .execution.base import Executor, SimulatedExecutor
@@ -139,5 +139,5 @@ __all__ = [
     "replay_vectorized", "replay_engine", "reconcile",
     "append_bar", "read_bars_log", "write_bars_log",
     "permutation_test",
-    "DB_URL", "TABLE", "TF1", "INIT_CASH", "INIT_POSITION", "TRADE_QTY",
+    "DB_URL", "TABLE", "INIT_CASH", "INIT_POSITION", "TRADE_QTY",
 ]

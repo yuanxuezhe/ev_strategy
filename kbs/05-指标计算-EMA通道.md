@@ -137,7 +137,7 @@ low_dev   = (dw - bar["l"]) / dw * 100.0      # 通道未就绪时 dw==0 -> dev=
 high_dev  = (bar["h"] - up) / up * 100.0
 ```
 
-batched 路径（`VectorizedEngine._compute_signals_xp`）也调同一份 step, 引擎循环维护 state。
+batched 路径（`VectorizedEngine._compute_signals`）也调同一份 step, 引擎循环维护 state。
 
 ## 7. 复杂度对比
 

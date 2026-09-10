@@ -1,85 +1,105 @@
-from __future__ import annotations
 """ChannelDeviationStrategy: 通道偏离回撤策略
 
-混合策略: EMA 通道 (stateful, step) + 偏离 (stateless, 算) + 锁存 FSM (stateful, step)。
-
-step(state, bar, params) -> (state, sig):
-  - state 由 engine 持有传入, 策略无 instance attr
-  - bar 是单桶 OHLCV + mark; mark=0 (预热) 直接返 (state, 0)
-  - 算法: ema_channel_step 算 up/dw + 4 偏离 + _fsm_step 锁存
+EMA 通道 (stateful) + 偏离 (stateless) + 桶级锁存 FSM (stateful)。
 
 参数:
-  low1:  下轨极端偏离阈值 (%)  (p0)
-  low2:  下轨回撤确认阈值 (%)  (p1)
-  high1: 上轨极端偏离阈值 (%)  (p2)
-  high2: 上轨回撤确认阈值 (%)  (p3)
-  tf1:   EMA 通道周期           (p4)
+  low1/high1  下/上轨极端偏离阈值 (%)  触发锁存
+  low2/high2  下/上轨回撤确认阈值 (%)  触发下单
+  tf1         EMA 通道周期
 """
 from dataclasses import dataclass, field
 
 from ..indicators import EMAChannelState, ema_channel_step
+from ..primitives import fmt, sig_to_side
 from .vectorized_base import VectorizedStrategy, register_strategy
 
 
+# ============ 偏离量 (单桶 OHLCV vs 通道上/下轨) ============
+
+@dataclass
+class Deviations:
+    """单桶 4 个偏离量 (单位 %); 通道未就绪时全 0"""
+    low: float = 0.0      # (DW - L) / DW * 100  桶低 vs 下轨
+    high: float = 0.0     # (H - UP) / UP * 100  桶高 vs 上轨
+    low_h: float = 0.0    # (DW - H) / DW * 100  桶高回测下轨
+    high_l: float = 0.0   # (L - UP) / UP * 100  桶低回测上轨
+
+    @property
+    def ready(self) -> bool:
+        """通道已就绪 (up/dw 非零)"""
+        return self.low != 0.0 or self.high != 0.0  # 仅作 bool 判定
+
+
+def _compute_devs(up: float, dw: float, h: float, l: float) -> Deviations:
+    """通道上/下轨 + 单桶 OHLCV -> 4 个偏离"""
+    if up == 0.0 or dw == 0.0:
+        return Deviations()
+    return Deviations(
+        low=(dw - l) / dw * 100.0,
+        high=(h - up) / up * 100.0,
+        low_h=(dw - h) / dw * 100.0,
+        high_l=(l - up) / up * 100.0,
+    )
+
+
+# ============ FSM 桶级锁存 ============
+
+@dataclass
+class DeviationFSM:
+    """桶级锁存: 同一桶至多一次 BUY + 一次 SELL"""
+    lock_ts: int = 0
+    low_hit: bool = False
+    high_hit: bool = False
+    low_acted: bool = False
+    high_acted: bool = False
+
+
+def _fsm_step(fsm: DeviationFSM, cur_ts: int, devs: Deviations,
+              low1: float, low2: float, high1: float, high2: float) -> int:
+    """FSM 单步: 桶切换清锁 -> 触发检测/确认下单
+
+    返回: signal ∈ {-1, 0, 1}
+    """
+    # 桶切换清锁
+    if cur_ts != fsm.lock_ts:
+        fsm.lock_ts = cur_ts
+        fsm.low_acted = False
+        fsm.high_acted = False
+
+    signal = 0
+    if fsm.low_hit and devs.low_h < low2 and not fsm.low_acted:
+        signal = 1
+        fsm.low_hit = False
+        fsm.low_acted = True
+    elif fsm.high_hit and devs.high_l < high2 and not fsm.high_acted:
+        signal = -1
+        fsm.high_hit = False
+        fsm.high_acted = True
+
+    if devs.low > low1 and not fsm.low_acted:
+        fsm.low_hit = True
+        fsm.low_acted = True
+    if devs.high > high1 and not fsm.high_acted:
+        fsm.high_hit = True
+        fsm.high_acted = True
+
+    return signal
+
+
+# ============ 策略持久状态 ============
+
 @dataclass
 class ChannelDeviationState:
-    """策略持久状态: EMA 通道 + FSM 锁存"""
+    """策略持久状态: EMA 通道 + FSM + 桶切换检测"""
     ema: EMAChannelState = field(default_factory=EMAChannelState)
-    fsm: dict = field(default_factory=lambda: {
-        "low_hit": False, "high_hit": False, "lock_ts": 0,
-        "low_acted": False, "high_acted": False})
+    fsm: DeviationFSM = field(default_factory=DeviationFSM)
     prev_ts: int = 0
     cur_high: float = 0.0
     cur_low: float = 0.0
     has_prev: bool = False
 
 
-def _fsm_step(state_fsm: dict, cur_ts: int, low_dev_h, low_dev,
-              high_dev_l, high_dev, low1, low2, high1, high2) -> int:
-    """FSM 单步: 原地改 state_fsm, 返回 signal (0/1/-1)
-
-    语义:
-      - 桶切换 (cur_ts != lock_ts) -> 清 low_acted/high_acted
-      - low_dev_h < low2 且 low_hit 且未 acted -> BUY, 清 low_hit, 置 low_acted
-      - high_dev_l < high2 且 high_hit 且未 acted -> SELL, 清 high_hit, 置 high_acted
-      - low_dev > low1 且未 low_acted -> 置 low_hit, 置 low_acted
-      - high_dev > high1 且未 high_acted -> 置 high_hit, 置 high_acted
-    """
-    # 桶切换清锁
-    if cur_ts != state_fsm["lock_ts"]:
-        state_fsm["lock_ts"] = cur_ts
-        state_fsm["low_acted"] = False
-        state_fsm["high_acted"] = False
-
-    signal = 0
-    if state_fsm["low_hit"] and low_dev_h < low2 and not state_fsm["low_acted"]:
-        signal = 1
-        state_fsm["low_hit"] = False
-        state_fsm["low_acted"] = True
-    elif state_fsm["high_hit"] and high_dev_l < high2 and not state_fsm["high_acted"]:
-        signal = -1
-        state_fsm["high_hit"] = False
-        state_fsm["high_acted"] = True
-
-    if low_dev > low1 and not state_fsm["low_acted"]:
-        state_fsm["low_hit"] = True
-        state_fsm["low_acted"] = True
-    if high_dev > high1 and not state_fsm["high_acted"]:
-        state_fsm["high_hit"] = True
-        state_fsm["high_acted"] = True
-
-    return signal
-
-
-def _compute_devs(up: float, dw: float, h: float, l: float):
-    """4 个偏离 (low_dev, high_dev, low_dev_h, high_dev_l); 通道未就绪返 0"""
-    if up == 0.0 or dw == 0.0:
-        return 0.0, 0.0, 0.0, 0.0
-    return ((dw - l) / dw * 100.0,
-            (h - up) / up * 100.0,
-            (dw - h) / dw * 100.0,
-            (l - up) / up * 100.0)
-
+# ============ 策略类 ============
 
 @register_strategy("channel_deviation")
 class ChannelDeviationStrategy(VectorizedStrategy):
@@ -94,27 +114,19 @@ class ChannelDeviationStrategy(VectorizedStrategy):
     }
 
     def init_state(self, params: dict) -> ChannelDeviationState:
-        """engine 调一次, 返回 state 初值"""
         return ChannelDeviationState()
 
     def step(self, state: ChannelDeviationState, bar: dict, params: dict
              ) -> tuple[ChannelDeviationState, int]:
-        """单步: state + 单桶 bar -> (new_state, sig)
-
-        bar = {"ts","o","h","l","c","v","mark"}
-        预热段 (mark==0) 直接返 (state, 0)。
-        """
         if bar["mark"] == 0:
             return state, 0
 
         tf1 = int(params["tf1"])
-        low1, low2, high1, high2 = (float(params[k]) for k in
-                                    ("low1", "low2", "high1", "high2"))
         cur_ts = int(bar["ts"])
         cur_high = float(bar["h"])
         cur_low = float(bar["l"])
 
-        # 桶切换 push (旧桶 high/low 闭锁入 EMA)
+        # 桶切换: 旧桶 high/low 闭锁入 EMA
         if state.has_prev and state.prev_ts != cur_ts:
             state.ema, _, _ = ema_channel_step(
                 state.ema, state.cur_high, state.cur_low, tf1)
@@ -124,21 +136,22 @@ class ChannelDeviationStrategy(VectorizedStrategy):
         state.cur_low = cur_low
         state.has_prev = True
 
-        # 当前通道值 (含 pending); 通道未就绪返 0 由 _compute_devs 内部短路
+        # 当前通道值 (含 pending)
         state.ema, up, dw = ema_channel_step(state.ema, cur_high, cur_low, tf1)
-        low_dev, high_dev, low_dev_h, high_dev_l = _compute_devs(
-            up, dw, cur_high, cur_low)
-        sig = _fsm_step(state.fsm, cur_ts,
-                        low_dev_h, low_dev, high_dev_l, high_dev,
-                        low1, low2, high1, high2)
+        devs = _compute_devs(up, dw, cur_high, cur_low)
+        sig = _fsm_step(state.fsm, cur_ts, devs,
+                        float(params["low1"]), float(params["low2"]),
+                        float(params["high1"]), float(params["high2"]))
+        # 暴露给 format_signal_line 的可选元数据 (engine 读 self._last_info)
+        self._last_info = {"up": up, "dw": dw,
+                           "low_dev": devs.low, "high_dev": devs.high}
+        print(cur_ts, cur_high, cur_low)
         return state, sig
 
     def format_signal_line(self, ts: int, sig: int, info: dict | None = None) -> str:
-        """自定义信号行打印; info 来自 Engine.on_bars 累积 (up/dw/dev)"""
-        from ..primitives import fmt, sig_to_side
         info = info or {}
         side = sig_to_side(sig)
-        prefix = f"{side} >>> " if side else "             "
+        prefix = f"{side} >>xxx> " if side else "             "
         return (f"{prefix}[{ts}] | UP={fmt(info.get('up'))} DW={fmt(info.get('dw'))} | "
                 f"low_dev(L/DW)={fmt(info.get('low_dev'))}% "
                 f"high_dev(H/UP)={fmt(info.get('high_dev'))}%")
