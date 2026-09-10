@@ -1,9 +1,10 @@
 # 05 指标计算：EMA 与通道轨
 
 > 相关源码：`indicators/ema.py`（`evtrade/indicators/ema.py`）。
-> 本文档为 2026-09-10 重构版（strategy-step-only）—— 删 `ema_push / ema_current` 双轨标量 API,
-> 改用 `ema_step(state, value, p) -> (state, ema)` 单函数 + `@dataclass EMAState`。
-> xp 批量版 `xp_ema / xp_ema_channel` 保留供 engine fast-path 调用。
+> 本文档为 2026-09-10 重构版（strategy-step-only）—— 删旧双轨标量 API,
+> 改用 `ema_step(state, value, p) -> (state, ema)` 单函数 + `@dataclass EMAState`；
+> 旧 xp 批量版已删除 —— 引擎 vectorized 路径 = 逐桶调同一份
+> 策略 `step`，无独立批量 EMA 算子。
 
 ## 1. 指标定义：通达信蓝色通道轨
 
@@ -21,20 +22,22 @@ TF1 = 21（默认，由策略 params_spec 自定义）
 - **种子（seed）**：前 p 个值做简单平均 `SMA = sum(前p个)/p`，作为第一个 EMA
 - 之后递推：`EMA_t = price_t * k + EMA_{t-1} * (1-k)`
 
-`evtrade/indicators/ema.py` 提供**三类形态**，口径一致：
+`evtrade/indicators/ema.py` 提供**两类形态**，口径一致：
 
 | 形态 | 函数 | 用途 | 复杂度 |
 |---|---|---|---|
-| 批量 (xp) | `xp_ema(xp, values, p)` | engine fast-path 算全序列 | O(n)，xp 算子 |
-| 批量 (xp) | `xp_ema_channel(xp, h, l, p)` | 通道策略批量版 | O(n) |
 | step 增量 | `ema_step(EMAState, value, p) -> (EMAState, ema)` | 策略 `step(state, bar)` 调 | O(1) |
 | step 增量 | `ema_channel_step(EMAChannelState, h, l, p) -> (EMAChannelState, up, dw)` | 通道策略 step 调 | O(1) |
+| numpy 批量参考 | `ema(values, p)` | ndarray 输入输出，reconcile 参考 / 测试用 | O(n) |
+| numpy 批量参考 | `ema_channel(highs, lows, p)` | 上轨 + 下轨，reconcile 参考 / 测试用 | O(n) |
 
 > **2026-09-10 变化 (strategy-step-only)**：
-> - 删旧 `ema_push(s_sum, s_count, s_ema, value, p)` / `ema_current(...)` 6/3 标量 API
+> - 删旧双轨标量 API（6/3 元组形式）
 > - 新 `ema_step(state, value, p) -> (state, ema)`: state 是 `@dataclass EMAState(sum, count, ema)`, in/out 单 dataclass
 > - 公式与浮点路径与旧版逐位一致（同 k=2/(p+1) SMA seed + 递推）
-> - 旧 push/current 改作 deprecated shim, 后续 change 删除
+> - 旧双轨 API 已删除（deprecated shim 一并清除）
+> - 旧 xp 批量版 (engine fast-path) 已删除: 引擎 vectorized 路径
+>   (`VectorizedEngine._compute_signals`) 逐桶调同一份策略 `step`，无独立批量 EMA 算子
 
 ## 3. step 版：`ema_step`
 
@@ -70,6 +73,8 @@ count >= p :  ema = value*k + ema*(1-k); count++
 > 与旧版 (`inf` 表示未就绪) 不同的选择: 用 `0.0` 表示未就绪 (state.ema = 0.0);
 > 策略代码用 `if up == 0.0 or dw == 0.0: return 0` 守卫即可。
 > 数值口径 (count==p-1 → SMA seed) 与旧版完全一致。
+> 注意 numpy 批量参考版 `ema(values, p)` 用 `NaN` 表示未就绪（前 p-1 个），仅用于
+> 离线 reconcile 对比，不参与回测路径。
 
 ## 4. 双 rail：`ema_channel_step`
 
@@ -132,35 +137,32 @@ def step(self, state, bar, params):
 # 1) EMA 通道 (step 增量; state 由 engine 持有)
 state.ema, up, dw = ema_channel_step(state.ema, bar["h"], bar["l"], tf1)
 
-# 2) NaN -> 0 (引擎 batched 路径下, _compute_devs_xp 内部安全 mask; step 路径无需)
+# 2) 偏离 (stateless 算)
 low_dev   = (dw - bar["l"]) / dw * 100.0      # 通道未就绪时 dw==0 -> dev==0, FSM 不触发
 high_dev  = (bar["h"] - up) / up * 100.0
 ```
 
-batched 路径（`VectorizedEngine._compute_signals`）也调同一份 step, 引擎循环维护 state。
+批量(vectorized)路径（`VectorizedEngine._compute_signals`）= 引擎在循环里**逐桶调同一份 `step`**，
+引擎维护 state；**无独立批量 EMA 算子**（旧 xp 批量快路径已删除）。
 
 ## 7. 复杂度对比
 
 朴素做法：每次回调对全部闭合桶重算 EMA → O(n)/根, n 为桶数, 全程 O(n²)。
 step 增量：`ema_step` O(1)/次 + state 跨调用持续 → 全程 O(总调用数)。
 单文件回测（百万级 1m bar）与实盘逐根推送都因此可行。
-**批量路径**用 `xp_ema_channel` 一次性算全序列（O(n) 总）, GPU 路径下走 cuBLAS 预编译 kernel。
+**批量(vectorized)路径** = 引擎在 `_compute_signals` 里逐桶调同一份 `step`（无独立批量 EMA 算子），
+总复杂度仍是 O(总桶数)，CPU/GPU 共用同一份策略代码。
 
 ## 8. 顶层 API
 
 ```python
 from evtrade.indicators import (
-    # 批量 xp 版 (engine fast-path)
-    xp_ema, xp_ema_channel,
-
-    # step 增量版 (strategy-step-only, 2026-09-10)
+    # step 增量版 (strategy-step-only, 策略 step 内调)
     EMAState, EMAChannelState,
     ema_step, ema_channel_step,
 
-    # Deprecated shim (过渡期; 后续删除)
-    ema_push, ema_current, ema_channel_push, ema_channel_current,
-
-    # 同形态还有 xp_atr / xp_rsi / xp_bollinger / atr_step / rsi_step / sma_step / boll_step
+    # numpy 批量参考版 (reconcile 参考实现 / 测试用, 非引擎路径)
+    ema, ema_channel,
 )
 ```
 

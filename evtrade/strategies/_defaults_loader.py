@@ -104,20 +104,20 @@ def params_from_csv_row(row: dict, param_keys: list[str]) -> dict:
     用于 'params save --from-csv <csv> --rank N': 取第 N 行 (1-based, 1=score 最高),
     抽出 param_keys 里的字段作为 params dict。
 
-    类型: CSV 全字符串读入, 这里用 _auto_cast 把数字 / bool 转回 Python 原生类型,
-    与 CLI --params 的 _auto_cast 保持一致。
+    类型: CSV 全字符串读入, 这里用 auto_cast 把数字 / bool 转回 Python 原生类型,
+    与 CLI --params 的 auto_cast 保持一致。
     """
     out: dict = {}
     for k in param_keys:
         if k not in row:
             continue
         v = row[k]
-        out[k] = _auto_cast(v) if isinstance(v, str) else v
+        out[k] = auto_cast(v) if isinstance(v, str) else v
     return out
 
 
-def _auto_cast(s: str):
-    """字符串 -> int / float / bool / str (与 cli._auto_cast 行为一致)"""
+def auto_cast(s: str):
+    """字符串 -> int / float / bool / str (CLI --params 与 CSV 落盘共用)"""
     if s.lower() in ("true", "false"):
         return s.lower() == "true"
     try:
@@ -167,17 +167,14 @@ def pick_best_row(df, strategy_name: str):
         sort_key = "无 filter_pass 列, 按 score 最高"
 
     chosen = work.iloc[chosen_idx]
-    # 与次优对比
+    # 与次优 (真 rank-2, 非 chosen 中 score 最高者) 对比
     runner_up = None
     runner_up_gap = None
-    if len(work) > 1 and chosen_idx + 1 < len(work):
-        # 找次优 (排名 != chosen_idx 的最高 score)
-        for i, s in work.iterrows():
-            if i == chosen_idx:
-                continue
-            runner_up = s
-            runner_up_gap = float(chosen["score"]) - float(s["score"])
-            break
+    if len(work) > 1:
+        other = work.drop(index=chosen_idx)
+        runner_up_idx = int(other["score"].astype(float).idxmax())
+        runner_up = work.iloc[runner_up_idx]
+        runner_up_gap = float(chosen["score"]) - float(runner_up["score"])
 
     reason = {
         "sort_key": sort_key,

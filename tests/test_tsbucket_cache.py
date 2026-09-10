@@ -1,4 +1,4 @@
-"""evtrade.gpu.precompute_ts_mark LRU 缓存行为
+"""evtrade.core.tsbucket.precompute_ts_mark LRU 缓存行为
 
 覆盖:
   - 同 (id(bars), len(stime), period, warmup) 第二次返回同一数组对象
@@ -11,8 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from evtrade.core import gpu as gpu_mod
-from evtrade.core.gpu import (
+from evtrade.core.tsbucket import (
     _PRECOMPUTE_TS_MARK_CACHE,
     _PRECOMPUTE_TS_MARK_MAXSIZE,
     _precompute_cache_key,

@@ -10,13 +10,11 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 import evtrade
 from evtrade import (
     VectorizedStrategy, get_strategy, run_vectorized,
 )
-from evtrade.backends import get_xp
 
 
 def _make_bars(n: int = 200, seed: int = 42):
@@ -73,27 +71,6 @@ def test_step_returns_int():
     assert set(sigs.tolist()).issubset({-1, 0, 1})
 
 
-def test_ma_crossover_cpu_vs_gpu_bitwise_equal():
-    """CPU vs GPU 信号 bitwise 一致 (torch CUDA 不可用时 skip)
-
-    strategy-step-only: 跑两次 run_vectorized (cpu + gpu), 比较 sig_live 序列
-    """
-    try:
-        cp = get_xp("gpu")
-        _ = cp.zeros(2)
-    except Exception:
-        pytest.skip("torch/CUDA 不可用")
-
-    bars = _make_bars()
-    s_cpu = evtrade.get_strategy("ma_crossover", fast=5, slow=20)
-    s_gpu = evtrade.get_strategy("ma_crossover", fast=5, slow=20)
-    out_cpu = run_vectorized(bars, "5m", warmup_until=0,
-                             strategy=s_cpu, params=s_cpu.params, device="cpu")
-    out_gpu = run_vectorized(bars, "5m", warmup_until=0,
-                             strategy=s_gpu, params=s_gpu.params, device="gpu")
-    np.testing.assert_array_equal(out_cpu["sig"], out_gpu["sig"])
-
-
 def test_vectorized_vs_engine_on_bars_reconcile():
     """vectorized 路径 vs Engine.on_bars 路径逐笔一致 (channel_deviation)"""
     from evtrade.account import Account
@@ -110,7 +87,7 @@ def test_vectorized_vs_engine_on_bars_reconcile():
     # vectorized 路径 (桶级信号)
     strat = evtrade.get_strategy("channel_deviation", tf1=5)
     out_v = run_vectorized(bars_arr, "5m", warmup_until=0,
-                           strategy=strat, params=strat.params, device="cpu")
+                           strategy=strat, params=strat.params)
     sig_v = out_v["sig"]      # 桶级
     trades_v = out_v["summary"]["trades"]
 
@@ -151,7 +128,7 @@ def test_metrics_summary_has_26_fields():
     """run_vectorized.summary 必须含 26 字段 (25 + x_mdd)"""
     strat = evtrade.get_strategy("ma_crossover", fast=5, slow=20)
     out = run_vectorized(_make_bars(n=300), "5m", warmup_until=0,
-                         strategy=strat, params=strat.params, device="cpu")
+                         strategy=strat, params=strat.params)
     s = out["summary"]
     required = {
         # 终态 (5)

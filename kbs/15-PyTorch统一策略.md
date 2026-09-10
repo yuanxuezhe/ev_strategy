@@ -1,166 +1,129 @@
-# 15 PyTorch 统一策略（pytorch-unified-strategy, 2026-09-10）
+# 15 PyTorch 统一策略 (pytorch-unified-strategy, 2026-09-10)
 
 > 回答的问题：**CPU/GPU/批量回测/实盘逐棒** 如何用**同一套策略代码**统一表达。
-> 本文档覆盖 PyTorch 后端的双形态算子、bars 契约（B/T 维）、批量 vs 实盘的策略接口。
+> 本文档覆盖 PyTorch 单一后端 (`evtrade/backends.py`)、bars 契约 (桶级 numpy 数组)、
+> 批量 vs 实盘的策略接口 (同一条 `step` 路径)。
 
 ---
 
 ## 1. 背景
 
-### 1.1 重构前的问题（cupy 时代）
+### 1.1 重构前的问题（cupy 时代, 已下线）
 
 | 痛点 | 表现 |
 |---|---|
-| 双份算子维护 | 每个指标（ema/atr/rsi/boll）既要 numpy 版又要 cupy 版 |
-| 变周期 batched EMA 笨拙 | `xp_ema_channel` 用 `searchsorted+reduceat`，B 维 + per-row period 表达困难 |
-| 实盘/批量代码双轨 | `step(state, bar, params)` 与 `compute_signals(xp, bars, params)` 算法相同但循环结构不同 |
+| 双份算子维护 | 每个指标（ema 等）既要 numpy 版又要 cupy 版 |
+| 变周期 batched EMA 笨拙 | 旧 `xp_ema_channel` 用 `searchsorted+reduceat`，B 维 + per-row period 表达困难 |
+| 实盘/批量代码双轨 | 批量路径与逐 bar 路径循环结构不同，同一算法要写两遍 |
 
-### 1.2 目标
+### 1.2 目标与现状
 
-用 **PyTorch 作为唯一 array 后端**，统一：
+用 **PyTorch 作为唯一 array 后端**（CPU + GPU 同一库同一 wheel），统一：
 
-- **CPU 回测**：`tensor.to("cpu")`
-- **GPU 回测**：`tensor.to("cuda")`
-- **批量扫描**：B 维扩展（同时跑 N 组参数网格）
-- **实盘逐棒**：B=1 滑动窗口
+- **CPU 回测**：`torch.device("cpu")`
+- **GPU 回测**：`torch.device("cuda")`
+- **批量扫描**：sweep 层按参数组合循环，每组走同一条 vectorized 路径
+- **实盘逐棒**：`Engine.on_bars` 逐桶 CLOSE 调 `step`
 
-PyTorch 单库同时提供：
+**现状要点（2026-09-10）**：
 
-- CPU/GPU 透明
-- `unfold + gather` 支持每行变长卷积核 → 变周期 batched EMA
-- `torch.where / cumsum / conv1d / clamp` 已是矢量化一等公民
+- 后端唯一旋钮是 `evtrade.backends.get_xp(device) -> torch.device`
+  （cpu/cuda 路由 + CUDA 不可用时 fallback）。
+- 策略代码**只写一份** numpy/Python 标量运算，cpu/cuda 上行为一致；
+  **没有** `xp_ema_torch` 之类的 torch 批量指标算子 —— vectorized 批量路径
+  (`core/vectorized_engine` 内部逐桶信号循环) 与实盘路径
+  (`Engine.on_bars`) 调用**同一个标量 `step(state, bar, params)`**，
+  指标由 `ema_step` / `ema_channel_step` 增量维护。
+- 不存在 `xp` 别名要传给策略：策略直接 `from evtrade.indicators import ema_step`，
+  用 numpy / Python 标量即可。
 
 ---
 
-## 2. 双形态算子
+## 2. 指标算子（evtrade/indicators/ema.py）
 
-`evtrade/indicators/` 提供三类算子，按调用方选择：
+当前 `evtrade/indicators/` 只有 `ema.py`，提供两类形态：
 
 | 形态 | 函数签名 | 适用场景 |
 |---|---|---|
-| **xp 版**（保留兼容） | `xp_ema(xp, values, p)` | 兼容旧 numpy 模块签名；策略 body 内 `xp_ema(np, c, p)` 直接用 |
-| **torch 版**（新 PyTorch 后端） | `xp_ema_torch(values, p)` | PyTorch 路径；输入输出都是 `torch.Tensor`；支持 (B, T) + per-row period |
-| **step 增量版** | `ema_step(state, value, p)` | 策略 step() 用，标量 in/out |
-
-### 2.1 xp 版
+| **step 增量版** | `ema_step(state, value, p)` / `ema_channel_step(state, h, l, p)` | 策略 `step` 用；state 为 `@dataclass`（`EMAState` / `EMAChannelState`），标量 in/out |
+| **numpy 批量版** | `ema(values, p)` / `ema_channel(highs, lows, p)` | 返回 ndarray；jupyter / 复盘 / 测试对拍用 |
 
 ```python
-import numpy as np
-from evtrade.indicators import xp_ema
-
-values = np.random.randn(100)
-ema = xp_ema(np, values, p=21)
-# ema 形状 (100,), 前 20 根 NaN, 之后递推
-```
-
-兼容：
-
-- `xp = numpy` — CPU
-- `xp = cupy` — 已下线（cupy 已从依赖中删除）
-- `xp = torch` — PyTorch 模块名（不推荐；用 `xp_ema_torch` 更直接）
-
-### 2.2 torch 版
-
-```python
-import torch
-from evtrade.indicators import xp_ema_torch
-
-# 单线 (T,)
-v1d = torch.randn(100, dtype=torch.float64)
-ema1 = xp_ema_torch(v1d, p=21)   # 形状 (100,)
-
-# 批量 (B, T)
-v2d = torch.randn(10, 100, dtype=torch.float64)
-ema_batch = xp_ema_torch(v2d, p=21)   # 形状 (10, 100)
-
-# 变周期 (B,) per-row period
-periods = torch.tensor([5, 21, 50, 60, 10, 8, 13, 100, 30, 7])  # 10 行不同 period
-ema_var = xp_ema_torch(v2d, p=periods)   # 形状 (10, 100); 每行按各自 period
-```
-
-### 2.3 step 增量版
-
-```python
-from evtrade.indicators.ema import EMAState, ema_step
+# step 增量版 (策略内用; state 由 engine 持有, 跨调用持续)
+from evtrade.indicators import EMAState, ema_step
 
 state = EMAState()
-for v in values:
-    state, ema = ema_step(state, v, p=21)
-# state 由 engine 持有, 跨调用持续
+state, ema = ema_step(state, 1.234, p=21)
+
+# numpy 批量版 (复盘/测试对拍)
+import numpy as np
+from evtrade.indicators import ema, ema_channel
+
+highs = np.random.rand(100) + 1.0
+lows = np.random.rand(100) + 0.5
+up, dw = ema_channel(highs, lows, 21)
 ```
+
+旧 `xp_ema` / `xp_ema_channel` / `xp_ema_torch` 批量 xp 算子已随 cupy 一并删除；
+旧 `ema_push` / `ema_current` 也已删除，统一为 `ema_step` 增量入口。
 
 ---
 
-## 3. bars 契约（B 维 + T 维）
+## 3. bars 契约（桶级数组）
 
-引擎在 `_compute_signals` 内逐桶调 `strategy.step(state, bar, params)`；
-桶级 bars dict（`_aggregate_buckets` 产出）：
+vectorized 路径在**桶级 finalized OHLCV**（numpy 数组）上跑策略：
 
 ```python
-bars = {
-    "ts":    tensor (B, T) int64,     # 桶时间戳 (14 位整数)
-    "o":     tensor (B, T) float32,    # 每桶 open (首根 1m bar)
-    "h":     tensor (B, T) float32,
-    "l":     tensor (B, T) float32,
-    "c":     tensor (B, T) float32,
-    "v":     tensor (B, T) float32,
-    "mark":  tensor (B, T) int8,       # 1=策略期, 0=预热段
-    "n_bars": tensor (B,) int64,       # 每行桶数
+# _aggregate_buckets 产出 (numpy 数组, 每行 = 一个闭合桶)
+buckets = {
+    "ts":     np int64   (T,),   # 桶时间戳 (14 位整数)
+    "o":      np float64 (T,),   # 每桶 open (首根 1m bar)
+    "h":      np float64 (T,),
+    "l":      np float64 (T,),
+    "c":      np float64 (T,),
+    "v":      np float64 (T,),
+    "mark":   np int     (T,),   # 1=策略期, 0=预热段
+    "n_bars": np int64   (T,),   # 每桶含 1m 根数
 }
-返回: 每桶一次 step → sig ∈ {-1, 0, 1} (引擎聚合成 (B, T) int8)
+# 引擎逐桶取标量喂给 step:
+#   bar = {"ts","o","h","l","c","v","mark"}  ->  strategy.step(state, bar, params)
+# 返回 sig ∈ {-1, 0, 1}, 引擎聚合成 (T,) int8 数组
 ```
 
-### 3.1 B 维语义
-
-| B | 场景 | engine |
-|---|---|---|
-| **1** | 单线回测 / 实盘逐棒 | Engine.on_bars 每桶调一次 |
-| **N** | 网格扫描（N 组参数） | VectorizedEngine 一次性传 (N, T) bars，撮合也矢量化 |
-
-策略代码**只写一份**，不需要 `if B == 1`。
-
-### 3.2 T 维
-
-时间序列长度。Engine.on_bars 维护 `(1, T_lookback)` 滑动 buffer；VectorizedEngine 一次性传 `(1, T)` 全部历史。
+- **批量扫描的 "B 维"** 不在单次 vectorized 调用内部：sweep 层
+  (`core/sweep.py`, ThreadPoolExecutor) 对每个参数组合各跑一次
+  `run_vectorized`，策略代码无需感知 B 维、不需要 `if B == 1`。
+- **实盘/对账路径** `Engine.on_bars` 在桶 CLOSE 时（桶切换时）用上一桶
+  finalized OHLCV 调同一次 `step`，语义与 vectorized 路径逐桶一致。
 
 ---
 
-## 4. 批量 vs 实盘：同代码
+## 4. 批量 vs 实盘：同一条 step 路径
 
-### 4.1 批量 GPU 网格回测
+### 4.1 批量回测 / 网格扫描
 
 ```python
-import torch
-from evtrade.indicators import xp_ema_torch
+from evtrade.core.vectorized_engine import run_vectorized
+from evtrade.strategies import get_strategy
 
-T = 100_000  # 10 万根 5m 桶
-B = 5_000    # 5000 组参数
+strat = get_strategy("channel_deviation", params={"low1": 1.5, "low2": 1.0})
+res = run_vectorized(bars_1m=bars, period="5m", warmup_until=warmup_until,
+                     strategy=strat, params=strat.params)
+# res["summary"]: metrics 全套字段; res["trades"]: 逐笔
 
-# (1, T) 桶 close; (B, T) 广播
-close_1m = torch.randn(1, T, dtype=torch.float64)
-batch_close = close_1m.expand(B, -1)
-
-# 网格参数 (B,) per-row period
-tf1_grid = torch.randint(5, 60, (B,), dtype=torch.int64)
-
-# 一次算整段 EMA
-ema = xp_ema_torch(batch_close, p=tf1_grid)   # (B, T)
-
-# 批量撮合（_execute_trades 支持 (B,)）
-# 引擎逐桶循环: state, sig = strategy.step(state, bar_i, {"tf1": tf1_grid[i]})
+# 网格扫描: python -m evtrade sweep --strategy channel_deviation --device auto ...
+# sweep 内部: ThreadPoolExecutor 并发, 每组参数各跑一次 run_vectorized
 ```
 
 ### 4.2 实盘 / 单线回测（逐棒）
 
 ```python
-import torch
-from evtrade.indicators import EMAState, ema_step
 from evtrade.strategies import get_strategy
 
 strat = get_strategy("channel_deviation", low1=1.5, low2=1.0)
-state = strat.init_state(strat.params)  # 引擎持有
+state = strat.init_state(strat.params)  # engine 持有, 跨调用持续
 
-# 每根 5m 桶 CLOSE 时调一次
+# 每根 5m 桶 CLOSE 时调一次 (Engine.on_bars 内部语义)
 def on_bucket_close(bar: dict):
     global state
     state, sig = strat.step(state, bar, strat.params)
@@ -170,24 +133,30 @@ def on_bucket_close(bar: dict):
         broker.sell(...)
 ```
 
-`step` 内调用 `ema_step` 维护 EMA 增量；信号轨迹与批量路径 bitwise 一致。
+`step` 内调用 `ema_step` / `ema_channel_step` 维护 EMA 增量；批量路径
+（vectorized 内部逐桶信号循环）与逐 bar 路径调的是**同一个 `step`**，信号轨迹一致
+（`replay --against-ref` reconcile 锁定，`bucket_diff_cap=8` 容忍 EMA 累积漂移）。
 
 ---
 
-## 5. CPU/GPU 透明路由
+## 5. CPU/GPU 透明路由（evtrade/backends.py）
 
-### 5.1 `get_xp(device)`
+### 5.1 唯一后端旋钮
 
 ```python
-from evtrade.backends import get_xp
+from evtrade.backends import get_xp, gpu_available, resolve_device
 
-xp_cpu = get_xp("cpu")          # torch.device("cpu")
-xp_cuda = get_xp("cuda")        # torch.device("cuda") if available, else cpu + warning
-xp_auto = get_xp("auto")        # cuda 可用则 cuda, 否则 cpu
-xp_gpu = get_xp("gpu")          # 别名 = cuda
+get_xp("cpu")        # torch.device("cpu")
+get_xp("gpu")        # torch.device("cuda"); CUDA 不可用 fallback cpu + warning
+get_xp("auto")       # cuda 可用则 cuda, 否则 cpu
+gpu_available()      # == torch.cuda.is_available()
+resolve_device("auto", gpu_ok=False)   # "cpu"
 ```
 
 CUDA 不可用时 fallback 到 cpu + `RuntimeWarning`。
+（旧 `core/capability.py::select_device` 已删除，能力探测收敛到
+`backends.resolve_device` + `gpu_available`；旧 `core/gpu.py` 删除，
+桶 ts/mark 预计算迁至 `core/tsbucket.py`。）
 
 ### 5.2 策略代码不应直接判断 device
 
@@ -200,12 +169,14 @@ if torch.cuda.is_available():
 state, sig = strategy.step(state, bar, params)   # 引擎循环调用, 不感知 device
 ```
 
+策略里既不需要 `xp` 变量，也不需要 `import torch`；`to_tensor` / `to_host`
+仅供框架层 (数据进出 torch 设备) 使用。
+
 ---
 
-## 6. 策略契约示例（step 唯一入口 + torch 批量算子）
+## 6. 策略契约示例（step 唯一入口）
 
 ```python
-import torch
 from dataclasses import dataclass, field
 from evtrade.indicators import EMAState, ema_step
 from evtrade.strategies import VectorizedStrategy, register_strategy
@@ -239,37 +210,40 @@ class DualMAStrategy(VectorizedStrategy):
         return state, sig
 ```
 
-> 批量路径（大网格扫描）不写第二个方法：引擎在 `_compute_signals` 里对每个桶循环调
-> 同一个 `step`。若需要纯 torch 批量算子做离群分析/加速，直接调 `xp_ema_torch(values, p)`
-> （`(B,T)` tensor in/out），与 `step` 的 `ema_step` 逐桶累积在信号轨迹上保持一致。
+> 批量路径（回测 / 大网格扫描）不写第二个方法：vectorized 引擎在内部
+> 逐桶信号循环里对每个桶调同一个 `step`
+> （state 为 Python dataclass 对象, 逐桶增量递推 EMA）。
 
 ---
 
 ## 7. 性能与边界
 
-### 7.1 变周期 batched EMA
+### 7.1 信号循环
 
-`xp_ema_torch` 实现：`torch.cumsum` + per-row period 切片 + 递推；B 维并行，T 维串行（递推依赖前一根）。
-
-复杂度：O(B·T·P_max)，B=10000, T=100000, P_max=60 时 ~6e10 浮点运算。
-GPU 内存足够时摊销；CPU batched 仍较慢。
+vectorized 内部逐桶信号循环 = Python 逐桶循环 + 标量 EMA 递推（`ema_step`），
+**没有** numba JIT 也没有 torch 批量指标算子；单组回测吞吐比旧内核慢，
+大网格扫描建议 `--workers 16` + `--device auto` 保证吞吐。
+GPU 的价值在数据量大的 tensor 侧操作与未来扩展，当前策略信号路径 CPU/GPU
+数值行为一致。
 
 ### 7.2 实盘滑动窗口
 
-`Engine.on_bars` 维护 `(1, T_lookback)` buffer；每桶 CLOSE 重算整段 EMA。
+`Engine.on_bars` 在桶 CLOSE 时用 finalized 桶 OHLCV 调一次 `step`；
+state 增量接口（`ema_step`）已跳过窗口重算，每桶 O(1) 递推。
 
-短期：T_lookback ≤ 500 时 O(T) 重算 < 1ms（CPU）。  
-长期：state 增量接口 `step_incremental(state, bar)` 跳过窗口重算（未来 work）。
+### 7.3 与 cupy 时代对比 (2026-09-10 历史存档)
 
-### 7.3 与 cupy 时代对比
-
-| 指标 | cupy (旧) | PyTorch (新) |
+| 指标 | cupy (旧, 已删) | PyTorch (现行) |
 |---|---|---|
-| CPU 单测 | numpy 1.x | torch 2.x |
+| CPU 单测 | numpy 1.x | torch 2.x (CPU) |
 | GPU 单测 | cupy 11.x/12.x | torch 2.x + CUDA runtime |
-| 变周期 EMA | searchsorted + reduceat 笨拙 | cumsum + per-row slice 直观 |
+| 后端选择 | numpy / cupy 双算子 | `get_xp` 单旋钮 (torch CPU/CUDA) |
+| 策略算子 | 旧 `xp_ema_channel` 批量 (已删) | 无批量指标算子; 两路径同一条标量 `step` |
 | 包大小 | cupy ~1GB (CUDA 12) | torch ~2GB (CUDA) / ~200MB (CPU) |
 | 依赖管理 | cupy-cuda11x / cupy-cuda12x 双 wheel | torch 单一 wheel (CPU + CUDA 二选一) |
+
+> 注：本表为历史对比；当前 `pyproject.toml` 只声明 `torch>=2.0`，
+> 无 cupy、无 numba。
 
 ---
 
@@ -277,7 +251,7 @@ GPU 内存足够时摊销；CPU batched 仍较慢。
 
 | 主题 | 文档 |
 |---|---|
-| 策略唯一入口 `step` / `init_state` | [14-统一策略契约.md](14-策略DSL与三端转译.md) |
+| 旧 DSL / 三端转译 (已下线存档) | [14-策略DSL与三端转译.md](14-策略DSL与三端转译.md) |
 | CPU/GPU 数据流 + 架构图 | [02-系统架构.md](02-系统架构.md) |
 | 通道偏离策略实现 | [06-交易策略详解.md](06-交易策略详解.md) |
 | 指标公式 | [05-指标计算-EMA通道.md](05-指标计算-EMA通道.md) |
@@ -294,11 +268,13 @@ pip install torch
 
 # 跑全部测试
 pytest tests -q
-# 预期: 147 passed, 2 skipped (GPU 测试)
 
 # CLI 跑通
-python -m evtrade backtest --device cpu --strategy channel_deviation --synthetic-days 30 --no-sleep
-python -m evtrade backtest --device auto --strategy channel_deviation --synthetic-days 30 --no-sleep
+python -m evtrade backtest --device cpu --strategy channel_deviation --synthetic-days 30
+python -m evtrade backtest --device auto --strategy channel_deviation --synthetic-days 30
+
+# 对账 (vectorized vs Engine.on_bars)
+python -m evtrade replay --log <log.csv> --strategy channel_deviation --device cpu --against-ref
 
 # spec 校验
 openspec validate --specs
@@ -306,7 +282,11 @@ openspec validate --specs
 
 测试覆盖：
 
-- `tests/test_torch_backend.py` — get_xp / gpu_available / xp_ema_torch batch 维 / per-row period
-- `tests/test_pyproject.py` — torch 依赖 + cupy 已删除
-- `tests/test_metrics_v3.py` / `test_metrics_units.py` — 30 字段 metrics + 单位约定
-- 既有 `test_strategy_unified.py` / `test_vectorized.py` — vectorized vs Engine.on_bars reconcile
+- `tests/test_torch_backend.py` — get_xp (cpu/gpu/auto + fallback) / gpu_available /
+  to_tensor / to_host / cupy import 已删断言
+- `tests/test_pyproject.py` — torch 依赖 + numba/cupy 已删除断言
+- `tests/test_metrics_v3.py` / `test_metrics_units.py` — metrics 字段集 + 单位约定
+- `tests/test_device_resolution.py` — device 解析 (resolve_device / gpu_available)
+- `tests/test_tsbucket_cache.py` — tsbucket 预计算缓存
+- 既有 `test_strategy_unified.py` / `test_vectorized.py` — step 状态跨调用持续 +
+  vectorized vs Engine.on_bars reconcile

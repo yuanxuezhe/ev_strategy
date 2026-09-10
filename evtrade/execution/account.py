@@ -2,7 +2,7 @@
 
 Account.apply() 的 BUY/SELL 记账逻辑是模拟/实盘的下单基础。
 
-如果需要改手续费/滑点模型, 在外层 (Executor/BrokerExecutor) 扣费后再调 apply。
+如果需要改手续费/滑点模型, 在外层 (Executor) 扣费后再调 apply。
 """
 
 

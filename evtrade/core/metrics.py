@@ -4,7 +4,6 @@ from __future__ import annotations
 公开 API:
   bars_to_arrays       list[Bar] -> numpy dict (vectorized 引擎输入)
   summarize            终态 + equity 序列 -> 25 字段绩效字典
-  trades_to_list       成交记录 -> list[dict] (规范化)
 
 summarize 字段集 (25):
   终态 (5):     final_price / final_cash / final_position / final_equity / baseline
@@ -299,18 +298,3 @@ def summarize(final_state: dict, init_cash: float, init_position: float,
         "baseline_max_dd": baseline_max_dd,
         "dd_excess": dd_excess,
     }
-
-
-def trades_to_list(trades: list) -> list[dict]:
-    """成交记录 list -> list[dict] (规范化; 已是 list[dict] 时直通)"""
-    if not trades:
-        return []
-    if isinstance(trades[0], dict):
-        return trades
-    # 兼容 tuple 形式 (ts, side_int, qty, price)
-    out = []
-    for t in trades:
-        ts, side_int, qty, price = t
-        out.append({"ts": int(ts), "side": "BUY" if side_int == 1 else "SELL",
-                    "qty": float(qty), "price": float(price)})
-    return out

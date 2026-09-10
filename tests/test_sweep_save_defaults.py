@@ -70,6 +70,23 @@ def test_pick_best_row_runner_up_gap(fake_sweep_df):
     assert reason["runner_up_gap"] == pytest.approx(0.10 - 0.15, abs=1e-9)
 
 
+def test_pick_best_row_runner_up_is_true_rank2():
+    """次优 = 真 rank-2 (非 chosen 中 score 最高者), 而非迭代序里第一行
+
+    chosen 在 idx1 (score 0.10 最高); 其余两行 score 0.05(idx0) / 0.08(idx2)。
+    旧实现会取迭代序首行 idx0 (0.05); 正确应为 idx2 (0.08, 真 rank-2)。
+    """
+    df = pd.DataFrame([
+        {"low1": 1.0, "score": 0.05, "ann_net_min": 0.04, "S": 0.3},
+        {"low1": 2.0, "score": 0.10, "ann_net_min": 0.09, "S": 0.4},
+        {"low1": 3.0, "score": 0.08, "ann_net_min": 0.07, "S": 0.35},
+    ])
+    chosen, reason = pick_best_row(df, "channel_deviation")
+    assert float(chosen["score"]) == 0.10
+    assert reason["runner_up_score"] == 0.08
+    assert reason["runner_up_gap"] == pytest.approx(0.10 - 0.08, abs=1e-9)
+
+
 def test_pick_best_row_no_filter_pass_column():
     """没有 filter_pass 列时, 退化为纯 score 排序"""
     df = pd.DataFrame([

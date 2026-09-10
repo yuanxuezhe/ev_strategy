@@ -117,11 +117,11 @@ def test_params_from_csv_row_passes_through_non_string():
 
 
 def test_auto_cast_string_variants():
-    assert dl._auto_cast("true") is True
-    assert dl._auto_cast("false") is False
-    assert dl._auto_cast("42") == 42
-    assert dl._auto_cast("1.5") == 1.5
-    assert dl._auto_cast("hello") == "hello"
+    assert dl.auto_cast("true") is True
+    assert dl.auto_cast("false") is False
+    assert dl.auto_cast("42") == 42
+    assert dl.auto_cast("1.5") == 1.5
+    assert dl.auto_cast("hello") == "hello"
 
 
 # ---------- _defaults_dir 环境变量切换 ----------

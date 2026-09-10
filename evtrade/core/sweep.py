@@ -49,8 +49,7 @@ def parse_grid(specs: list, extra_keys: set[str] | None = None) -> list[dict]:
 
 
 def run_one_from_dict(bars: dict, p: dict, warmup_until: int,
-                      strategy_name: str | None = None,
-                      device: str = "cpu") -> dict:
+                      strategy_name: str | None = None) -> dict:
     """单组参数单窗回测 (统一入口, dict 形式; 走 vectorized 引擎)
 
     strategy_name: 必填 (策略 key), 见 evtrade.strategies.available_strategies()
@@ -75,7 +74,6 @@ def run_one_from_dict(bars: dict, p: dict, warmup_until: int,
         scale=p.get("scale", 1.0),
         buy_pct=p.get("buy_pct", 0.0),
         sell_pct=p.get("sell_pct", 0.0),
-        device=device,
     )["summary"]
 
 
@@ -87,8 +85,7 @@ def run_one_vectorized(bars: dict, period: str, warmup_until: int,
                        trade_qty: float = 10000.0,
                        scale: float = 1.0,
                        buy_pct: float = 0.0,
-                       sell_pct: float = 0.0,
-                       device: str = "cpu") -> dict:
+                       sell_pct: float = 0.0) -> dict:
     """单组参数单窗回测 (vectorized 入口; 内部走 run_vectorized)
 
     strategy_params: 策略参数 dict (会被 _resolve_params 校验)
@@ -101,7 +98,7 @@ def run_one_vectorized(bars: dict, period: str, warmup_until: int,
         strategy=strategy, params=strategy.params,
         init_cash=init_cash, init_position=init_position,
         trade_qty=trade_qty, scale=scale,
-        buy_pct=buy_pct, sell_pct=sell_pct, device=device,
+        buy_pct=buy_pct, sell_pct=sell_pct,
     )["summary"]
 
 
@@ -185,14 +182,12 @@ def sweep(bars: dict, base: dict, combos: list[dict],
         raise ValueError("sweep: strategy_name is required")
     import pandas as pd
 
-    # 能力探测: requested device + gpu_available; auto 模式下 gpu 不可用时降级 cpu
-    from .capability import gpu_available, select_device
+    # 设备解析: requested device + gpu_available; auto 模式下 gpu 不可用时降级 cpu
+    from ..backends import gpu_available, resolve_device
     import logging
     _log = logging.getLogger("evtrade.sweep")
     gpu_ok = gpu_available()
-    if device == "gpu" and not gpu_ok:
-        raise ValueError("请求 device='gpu' 但环境无可用 torch/CUDA")
-    resolved = select_device(strategy_name, device, gpu_ok)
+    resolved = resolve_device(device, gpu_ok)
     if device == "auto" and resolved != device:
         _log.warning("device=auto 降级: 请求 %s -> 实际 %s", device, resolved)
     device = resolved
@@ -249,7 +244,6 @@ def sweep(bars: dict, base: dict, combos: list[dict],
             scale=p.get("scale", 1.0),
             buy_pct=p.get("buy_pct", 0.0),
             sell_pct=p.get("sell_pct", 0.0),
-            device=device,
         )
 
     t0 = time.perf_counter()

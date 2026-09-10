@@ -24,11 +24,6 @@ class Deviations:
     low_h: float = 0.0    # (DW - H) / DW * 100  桶高回测下轨
     high_l: float = 0.0   # (L - UP) / UP * 100  桶低回测上轨
 
-    @property
-    def ready(self) -> bool:
-        """通道已就绪 (up/dw 非零)"""
-        return self.low != 0.0 or self.high != 0.0  # 仅作 bool 判定
-
 
 def _compute_devs(up: float, dw: float, h: float, l: float) -> Deviations:
     """通道上/下轨 + 单桶 OHLCV -> 4 个偏离"""
@@ -145,7 +140,6 @@ class ChannelDeviationStrategy(VectorizedStrategy):
         # 暴露给 format_signal_line 的可选元数据 (engine 读 self._last_info)
         self._last_info = {"up": up, "dw": dw,
                            "low_dev": devs.low, "high_dev": devs.high}
-        print(cur_ts, cur_high, cur_low)
         return state, sig
 
     def format_signal_line(self, ts: int, sig: int, info: dict | None = None) -> str:

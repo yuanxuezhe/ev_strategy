@@ -1,7 +1,7 @@
 """死代码清理与 .gitignore 覆盖
 
 覆盖:
-  - evtrade/feeds/registry.py 已删 (与 _registry.py 重复且无引用)
+  - evtrade/feeds/ 整个子包已删 (CLI 走 core/data.py 内联 SQL, feeds 重复且无生产调用方)
   - evtrade/core/runner.py 已删 (仅 core/__init__.py 跳板用, 已重写 __init__)
   - .gitignore 覆盖 root 散落的 results*.csv 与 champion_bars.csv
 """
@@ -12,10 +12,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_feeds_registry_removed():
-    p = REPO_ROOT / "evtrade" / "feeds" / "registry.py"
-    assert not p.exists(), (
-        f"feeds/registry.py 仍存在, 应当删除 (与 _registry.py 重复且无引用): {p}")
+def test_feeds_subpackage_removed():
+    p = REPO_ROOT / "evtrade" / "feeds"
+    assert not p.is_dir(), (
+        f"evtrade/feeds/ 子包仍存在, 应当整体删除 "
+        f"(CLI 数据加载走 core/data.py, feeds 重复且无生产调用方): {p}")
 
 
 def test_core_runner_removed():

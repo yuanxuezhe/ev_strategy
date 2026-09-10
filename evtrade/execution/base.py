@@ -1,15 +1,17 @@
 """下单抽象: 模拟 / 真实
 
-本文件定义下单撮合逻辑, 是实盘对接的入口点:
+本文件定义下单撮合逻辑:
 
-  - SimulatedExecutor.trade (回测模拟)
+  - trade_decision (单一成交决策实现)
+      取量 (buy_pct/sell_pct/fixed-qty) + 资金/持仓约束 + 现金持仓更新。
+      SimulatedExecutor.trade 与 vectorized_engine._execute_trades 共用,
+      保证两条引擎路径逐笔 bitwise 一致 (replay --against-ref 对账依赖)。
+
+  - SimulatedExecutor.trade (回测模拟, 调 trade_decision)
       scale: 同方向连续信号时, 数量按 scale 倍投; 翻转时重置为基础数量。
-      buy_pct/sell_pct/all_in: 按现金/持仓比例下注 (三者均 0 时走 fixed-qty)
+      (scale/last_side 是调用方状态, 留在 executor 侧)
 
-  - BrokerExecutor.trade (实盘占位)
-      这里是接券商 API 的入口: 调 broker.place_order,
-      收到成交回报后调 self.account.apply(side, qty, price, ts)。
-      当前的占位实现 print [LIVE] 后返回 False, 不改账户。
+  - Account.apply (记账)
 
 要加的常见功能:
   - 手续费/滑点: 在 apply 前扣 cash
@@ -18,7 +20,35 @@
 """
 from __future__ import annotations
 
-from .account import Account
+
+def trade_decision(side: int, price: float, cash: float, position: float,
+                   cur_qty: float, buy_pct: float, sell_pct: float
+                   ) -> tuple[float, float, float, bool]:
+    """单一成交决策实现 (SimulatedExecutor / vectorized 引擎共用)
+
+    side: 1=BUY, -1=SELL (调用方保证非 0)
+    cur_qty: 本轮基础数量 (scale 倍投后的量, 由调用方维护)
+    返回 (new_cash, new_position, qty, filled); filled=False 时现金/持仓原样返回。
+    """
+    if side > 0:
+        if price > 0:
+            max_by_cash = cash / price
+            if buy_pct > 0:
+                q = min(buy_pct * max_by_cash, max_by_cash)
+            else:
+                q = min(cur_qty, max_by_cash)
+        else:
+            q = 0.0
+        if q <= 0:
+            return cash, position, 0.0, False
+        return cash - q * price, position + q, q, True
+    if sell_pct > 0:
+        q = min(sell_pct * position, position)
+    else:
+        q = min(cur_qty, position)
+    if q <= 0:
+        return cash, position, 0.0, False
+    return cash + q * price, position - q, q, True
 
 
 class Executor:
@@ -74,39 +104,20 @@ class SimulatedExecutor(Executor):
         else:
             self.cur_qty = self.qty
             self.last_side = side
-        if signal == "BUY":
-            if price > 0:
-                max_by_cash = acc.cash / price
-                if self.buy_pct > 0:
-                    target = self.buy_pct * max_by_cash
-                    qty = target if target < max_by_cash else max_by_cash
-                else:
-                    qty = self.cur_qty if self.cur_qty < max_by_cash else max_by_cash
-            else:
-                qty = 0
-            if qty <= 0:
-                return False
-            acc.apply("BUY", qty, price, ts)
-            self._record(side="BUY", qty=qty, price=price, ts=ts)
-            if self.verbose:
-                print(f"        >> BUY  {qty:.0f}股 @ {price:.4f}  花费 {qty*price:.2f}  "
-                      f"剩余资金 {acc.cash:.2f} 持仓 {acc.position:.0f}", flush=True)
-            return True
-        elif signal == "SELL":
-            if self.sell_pct > 0:
-                target = self.sell_pct * acc.position
-                qty = target if target < acc.position else acc.position
-            else:
-                qty = self.cur_qty if self.cur_qty < acc.position else acc.position
-            if qty <= 0:
-                return False
-            acc.apply("SELL", qty, price, ts)
-            self._record(side="SELL", qty=qty, price=price, ts=ts)
-            if self.verbose:
-                print(f"        >> SELL {qty:.0f}股 @ {price:.4f}  收入 {qty*price:.2f}  "
-                      f"剩余资金 {acc.cash:.2f} 持仓 {acc.position:.0f}", flush=True)
-            return True
-        return False
+        cash, position, qty, filled = trade_decision(
+            side, price, acc.cash, acc.position, self.cur_qty,
+            self.buy_pct, self.sell_pct)
+        if not filled:
+            return False
+        side_str = signal
+        acc.apply(side_str, qty, price, ts)
+        self._record(side=side_str, qty=qty, price=price, ts=ts)
+        if self.verbose:
+            verb = "BUY " if side > 0 else "SELL"
+            cash_word = "花费" if side > 0 else "收入"
+            print(f"        >> {verb}{qty:.0f}股 @ {price:.4f}  {cash_word} {qty*price:.2f}  "
+                  f"剩余资金 {cash:.2f} 持仓 {position:.0f}", flush=True)
+        return True
 
     def _record(self, side: str, qty: float, price: float, ts: str):
         """成功 trade 后: 同步追加副本到 record_to (供对账/回放对比成交)"""
@@ -114,20 +125,3 @@ class SimulatedExecutor(Executor):
             return
         self.record_to.append({"ts": int(ts), "side": side,
                                "qty": float(qty), "price": float(price)})
-
-
-class BrokerExecutor(Executor):
-    """实盘下单: 调券商 API (占位, 接入时实现)"""
-
-    def __init__(self, account: Account, qty: float, broker=None):
-        self.account = account
-        self.qty = qty
-        self.broker = broker  # 券商 API 客户端
-
-    def trade(self, signal: str, price: float, ts: str) -> bool:
-        # TODO: 接入真实券商下单 API
-        # order_id = self.broker.place_order(signal, self.qty, ...)
-        # 成交回报后调 self.account.apply(...) 记账
-        print(f"        >> [LIVE] {signal} {self.qty:.0f}股 @ {price:.4f} (未接入券商)",
-              flush=True)
-        return False

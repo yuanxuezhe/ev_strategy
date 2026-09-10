@@ -77,8 +77,7 @@ def replay_vectorized(bars, period: str, warmup_until: int,
                       strategy_name: str, strategy_params: dict,
                       init_cash: float = 200000.0, init_position: float = 200000.0,
                       trade_qty: float = 10000.0, scale: float = 1.0,
-                      buy_pct: float = 0.0, sell_pct: float = 0.0,
-                      device: str = "cpu") -> dict:
+                      buy_pct: float = 0.0, sell_pct: float = 0.0) -> dict:
     """vectorized 引擎回放: 返回逐 bar 信号轨迹 (桶级对齐) + 成交流 + 绩效
 
     返回 dict:
@@ -96,7 +95,7 @@ def replay_vectorized(bars, period: str, warmup_until: int,
         strategy=strategy, params=strategy.params,
         init_cash=init_cash, init_position=init_position,
         trade_qty=trade_qty, scale=scale,
-        buy_pct=buy_pct, sell_pct=sell_pct, device=device,
+        buy_pct=buy_pct, sell_pct=sell_pct,
     )
     return {
         "sig": out["sig"],
@@ -119,7 +118,7 @@ def replay_engine(bars, period: str, warmup_until: int,
     from ..strategies import get_strategy
     from ..account import Account
     from ..aggregator import BarAggregator
-    from ..engine import Engine
+    from .engine import Engine
     from ..execution import SimulatedExecutor
     from ._harness import ListBarFeed
 
@@ -161,7 +160,6 @@ def reconcile(bars, period: str, warmup_until: int,
               init_cash: float = 200000.0, init_position: float = 200000.0,
               trade_qty: float = 10000.0, scale: float = 1.0,
               buy_pct: float = 0.0, sell_pct: float = 0.0, all_in: bool = False,
-              device: str = "cpu",
               verbose: bool = True,
               strict: bool | None = None,
               bucket_diff_cap: int | None = None) -> dict:
@@ -179,7 +177,7 @@ def reconcile(bars, period: str, warmup_until: int,
         bucket_diff_cap = 0 if strict else 8
     k = replay_vectorized(bars, period, warmup_until, strategy_name, strategy_params,
                           init_cash, init_position, trade_qty, scale,
-                          buy_pct=buy_pct, sell_pct=sell_pct, device=device)
+                          buy_pct=buy_pct, sell_pct=sell_pct)
     r = replay_engine(bars, period, warmup_until, strategy_name, strategy_params,
                       init_cash, init_position, trade_qty, scale,
                       buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in)
@@ -194,7 +192,7 @@ def reconcile(bars, period: str, warmup_until: int,
               "summary": k["summary"], "pass": sig_pass and trades_ok,
               "cap": bucket_diff_cap, "strict": strict}
     if verbose:
-        status = "PASS ✓" if report["pass"] else "FAIL ✗"
+        status = "PASS" if report["pass"] else "FAIL"
         print(f"对账 [{status}] bars={report['n_bars']} 信号={d_sig['n_a']} "
               f"分歧={d_sig['n_diff']} (cap={bucket_diff_cap} 首处 idx={d_sig['first_idx']}) "
               f"成交={report['n_trades']} 笔逐笔一致={trades_ok}")

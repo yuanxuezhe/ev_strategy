@@ -5,6 +5,14 @@
 策略唯一入口 = `VectorizedStrategy.step(state, bar, params)` + `init_state`；CPU/GPU 统一由 PyTorch 后端承担，
 2026-09-10 pytorch-unified-strategy），详见 12、14、15 号文档。
 
+> **2026-09-10 同步** (change `consolidate-simplify-core`):
+> - 删 `evtrade/feeds/` 子包（数据加载内联 `core/data.py::load_bars`/`synthetic_bars`；bar 流 = 自定义 `.stream()` 对象，参考 `core/_harness.ListBarFeed`）；
+> - 指标库只留 EMA（删 `atr/boll/rsi` 模块；`indicators/ema.py` = 增量版 `ema_step`/`ema_channel_step` + numpy 批量参考 `ema`/`ema_channel`）；
+> - 删 `core/capability.py`（并入 `backends.resolve_device`）、`core/gpu.py`（更名 `core/tsbucket.py`，去 `gpu_info`）；
+> - 删 `BrokerExecutor`（成交决策收口 `execution/base.py::trade_decision`，SimulatedExecutor + vectorized 共用）；
+> - 删 CLI 死 flag `--engine`/`--no-sleep`/`--step-days`/`--show-bars`/`--bars-out` + 各指标单列 flag（改 `--params`）；共享选项进单一父 parser（argparse `parents=`）；
+> - `config.py` 删 `PERIODS`/`INTERVAL`；`timeutils.py` 删 `compute_bucket`(bare)/`daterange`（留 `compute_bucket_general`/`resolve_period_seconds`）；`metrics.py` 删 `trades_to_list`、`engine.py` 删 `build_engine`/`print_summary`。
+>
 > **2026-09-09 同步**:
 > - 删 `evtrade/strategies/{base,dsl,example_*.py}` 共 4 文件；策略基类合并为 `VectorizedStrategy` (`vectorized_base.py`)；
 > - 删 `evtrade/core/{kernel,kernel_dsl}.py`、`core/gpu.cuda_sweep_window_generic`、`core/incremental_indicators.py`；
@@ -12,13 +20,13 @@
 > - CLI 收口 `--device {cpu, gpu, auto}`（替代旧 `--engine {kernel, ref, vectorized}`）；
 > - `kbs/14` 重写为"统一策略契约"，原"DSL 三端转译"章节整体废弃；
 > - 引擎语义改为**桶 CLOSE**（桶切换时用上一桶 finalized OHLCV 驱动策略一次），与 vectorized 路径完全对齐。
-> - `evtrade/indicators/` 改写为纯 Python 增量版 + xp 算子批量版；无 numba，无 CUDA_DEVICE_*。
+> - `evtrade/indicators/` 为纯 Python 增量版 + numpy 批量参考版；无 numba，无 CUDA_DEVICE_*。
 
 ## 一句话简介
 
-从 MySQL `minute_bars` 表读取 1 分钟行情，增量合并为多周期 K 线（任意 m/h/d 周期），
+从 MySQL `minute_bars` 表读取 1 分钟行情（`core/data.py::load_bars`），增量合并为多周期 K 线（任意 m/h/d 周期），
 用 EMA 通道轨（通达信蓝轨）的"极端偏离 → 回撤确认"逻辑产生 BUY/SELL 信号，
-回测与实盘共用同一套 Engine，仅通过替换 Feed（行情源）与 Executor（下单器）切换。
+回测与实盘共用同一套 Engine，仅通过替换 bar 流（行情源）与 Executor（下单器）切换。
 
 ## 文档索引
 
@@ -26,19 +34,19 @@
 |---|---|---|
 | [01-项目总览.md](01-项目总览.md) | 项目定位、核心特性、技术栈、快速上手 | 所有人（先读这个） |
 | [02-系统架构.md](02-系统架构.md) | 分层架构、数据流、回测/实盘切换原则（CPU/GPU 统一向量化） | 所有人 |
-| [03-核心数据结构.md](03-核心数据结构.md) | Bar、周期桶 dict、PERIODS 配置、stime 格式 | 开发者 |
-| [04-周期合并机制.md](04-周期合并机制.md) | compute_bucket 算法、桶生命周期、warmup 机制 | 开发者（本项目最核心的机制之一） |
-| [05-指标计算-EMA通道.md](05-指标计算-EMA通道.md) | EMA 定义、xp 算子批量版 + 纯 Python 增量版 | 开发者 |
+| [03-核心数据结构.md](03-核心数据结构.md) | Bar、周期桶 dict、`resolve_period_seconds` 周期秒数、stime 格式 | 开发者 |
+| [04-周期合并机制.md](04-周期合并机制.md) | `compute_bucket_general` 桶算法、桶生命周期、warmup 机制 | 开发者（本项目最核心的机制之一） |
+| [05-指标计算-EMA通道.md](05-指标计算-EMA通道.md) | EMA 定义、增量版 `ema_step`/`ema_channel_step` + numpy 批量参考 `ema`/`ema_channel` | 开发者 |
 | [06-交易策略详解.md](06-交易策略详解.md) | 通道偏离回撤策略、锁存逻辑、单桶单操作、`step` 主逻辑 | 策略研究 / 开发者 |
-| [07-账户与执行器.md](07-账户与执行器.md) | Account 记账、Simulated/Broker Executor | 开发者 |
-| [08-行情源Feed.md](08-行情源Feed.md) | Feed 抽象、分段查询、预热窗口、ChainedFeed | 开发者 |
-| [09-引擎Engine与主流程.md](09-引擎Engine与主流程.md) | Engine 装配、`on_bars` 桶 CLOSE 语义、盈亏汇总 | 开发者 |
+| [07-账户与执行器.md](07-账户与执行器.md) | Account 记账、`trade_decision` 单一成交决策、Simulated Executor + 自定义实盘 Executor | 开发者 |
+| [08-行情源Feed.md](08-行情源Feed.md) | 行情数据加载（`load_bars`/`synthetic_bars`）、bar 流契约、预热窗口 | 开发者 |
+| [09-引擎Engine与主流程.md](09-引擎Engine与主流程.md) | Engine 装配、`on_bars` 桶 CLOSE 语义、`metrics.summarize` 盈亏汇总 | 开发者 |
 | [10-配置参数与运行指南.md](10-配置参数与运行指南.md) | CLI 参数全表（含 `--device {cpu,gpu,auto}`）、典型命令、输出解读、FAQ | 使用者 |
-| [11-扩展指南.md](11-扩展指南.md) | 新增行情源 / 执行器 / 策略 / 周期的做法（含 `VectorizedStrategy` 模板） | 二次开发者 |
-| [12-重构与性能内核.md](12-重构与性能内核.md) | evtrade 包结构、vectorized 引擎、xp 算子、CPU/GPU 统一路径、旧 numba/CUDA 退场记录 | 所有人（先读 01 再读这个） |
+| [11-扩展指南.md](11-扩展指南.md) | 新增 bar 流 / 执行器 / 策略 / 周期的做法（含 `VectorizedStrategy` 模板） | 二次开发者 |
+| [12-重构与性能内核.md](12-重构与性能内核.md) | evtrade 包结构、vectorized 引擎、CPU/GPU 统一路径、旧 numba/CUDA/DSL 退场记录 | 所有人（先读 01 再读这个） |
 | [13-绩效评估与鲁棒选参框架.md](13-绩效评估与鲁棒选参框架.md) | 超额曲线口径、metrics 30 字段（含 x_mdd）、滚动 WFO、邻域衰减 S、复合 score、帕累托、蒙特卡洛置换检验 | 选参/实盘前必读 |
-| [14-统一策略契约.md](14-策略DSL与三端转译.md) | VectorizedStrategy 契约、`step(state,bar,params)` + `init_state` 主入口、CPU/GPU 双端统一实现、新策略开发步骤（新写，旧 DSL→三端转译章节已废） | 新策略开发必读 |
-| [15-PyTorch统一策略.md](15-PyTorch统一策略.md) | PyTorch 后端 (pytorch-unified-strategy, 2026-09-10)：双形态算子 (xp 版 / torch 版 / step 增量版)、bars (B,T) 契约、批量 vs 实盘双模式同代码、变周期 EMA | 写新策略 + 调参 + 性能优化 |
+| [14-策略DSL与三端转译.md](14-策略DSL与三端转译.md) | 旧 DSL→三端转译（numba/CUDA/`state_spec` 三端投影）**已下线**（2026-09）；现为单一 `step` 契约 + `@dataclass` state | 想了解历史 / 归档 |
+| [15-PyTorch统一策略.md](15-PyTorch统一策略.md) | PyTorch 后端 (pytorch-unified-strategy, 2026-09-10)：`backends.get_xp` 统一 CPU/GPU、策略代码一份双端跑、`ema_step` 增量 + 逐桶 step 批量 | 写新策略 + 调参 + 性能优化 |
 | [使用说明.md](使用说明.md) | **所有参数意思 + 完整命令行 + 网格扫参** + 输出解读 | 操作手册, 跑前/看结果前查这个 |
 
 ## 建议阅读路径
@@ -55,20 +63,19 @@
 | 模块 | 内容 | 相关文档 |
 |---|---|---|
 | `evtrade/primitives.py` | `Bar`、`fmt` | 03 |
-| `evtrade/core/config.py` | DB_URL / PERIODS / 默认资金 | 01、10 |
-| `evtrade/core/timeutils.py` | `compute_bucket`、`bucket_ts_encoded`、`daterange` | 04 |
-| `evtrade/core/aggregator.py` | `BarAggregator` | 04 |
-| `evtrade/indicators/{ema,atr,boll,rsi}.py` | 纯 Python 增量版 + xp 算子批量版（无 numba / 无 CUDA_DEVICE_*） | 05 |
+| `evtrade/core/config.py` | DB_URL（`EVTRADE_DB_URL` 可覆盖）/ 默认资金（`INIT_CASH`/`INIT_POSITION`/`TRADE_QTY`） | 01、10 |
+| `evtrade/core/timeutils.py` | `compute_bucket_general`、`bucket_ts_encoded`、`resolve_period_seconds`、历法（标量/向量） | 04 |
+| `evtrade/core/aggregator.py` | `BarAggregator`（INT period_seconds） | 04 |
+| `evtrade/indicators/ema.py` | 增量版 `ema_step`/`ema_channel_step` + numpy 批量参考 `ema`/`ema_channel`（无 numba / 无 CUDA） | 05 |
 | `evtrade/strategies/vectorized_base.py` | ★ **唯一策略基类** `VectorizedStrategy` + 注册表 + `params_spec` + `format_signal_line` hook | 06、11、14 |
-| `evtrade/strategies/channel_deviation.py` | `ChannelDeviationStrategy`（xp 算子 + Python FSM 共享） | 06 |
-| `evtrade/strategies/ma_crossover.py` | `MACrossoverStrategy`（纯数组算子示例） | 14 |
-| `evtrade/execution/account.py`、`evtrade/execution/base.py` | `Account`、`Executor` 两实现 | 07 |
-| `evtrade/feeds/` | `Feed` 抽象 + `mysql_history` / `chained` / `_registry` | 08 |
+| `evtrade/strategies/channel_deviation.py` | `ChannelDeviationStrategy`（`ema_channel_step` 增量 + Python FSM） | 06 |
+| `evtrade/strategies/ma_crossover.py` | `MACrossoverStrategy`（EMA 双均线示例） | 14 |
+| `evtrade/execution/account.py`、`evtrade/execution/base.py` | `Account`、`Executor`/`SimulatedExecutor` + `trade_decision` 单一成交决策 | 07 |
+| `evtrade/core/data.py` | MySQL 拉取（`load_bars`）+ npz 缓存 + 合成数据（`synthetic_bars`） | 08、12 |
 | `evtrade/core/engine.py` | ★ `Engine`（逐 bar 路径，桶 CLOSE 语义，供实盘/对账） | 09 |
 | `evtrade/core/vectorized_engine.py` | ★ `run_vectorized`（批量向量化路径，CPU/GPU 统一） | 12、13 |
-| `evtrade/core/metrics.py` | `bars_to_arrays` / `trades_to_list` / `summarize`（30 字段，含 x_mdd） | 12、13 |
-| `evtrade/core/data.py` | MySQL 拉取 + npz 缓存 + 合成数据 | 12 |
-| `evtrade/core/sweep.py` / `evtrade/cli.py` / `evtrade/core/gpu.py` | 扫描 / CLI / GPU 基础设施（torch.cuda 探测 + 预计算缓存；无 NVRTC 编译） | 10、12、13 |
+| `evtrade/core/metrics.py` | `bars_to_arrays` / `summarize`（30 字段，含 x_mdd / cagr_excess） | 12、13 |
+| `evtrade/core/sweep.py` / `evtrade/cli.py` / `evtrade/core/tsbucket.py` | 扫描 / CLI / 桶预计算缓存（`precompute_ts_mark` + LRU）；`backends.py` 统一 CPU/GPU 后端 | 10、12、13 |
 | `evtrade/core/replay.py` | 行情回放 + 对账（vectorized vs Engine.on_bars） | 10、13 |
 | `tests/` | 26 个测试文件（CPU/GPU 容差 + vectorized-vs-Engine 对账 + metrics 字段集 + reconcile） | 12 |
 
@@ -107,11 +114,11 @@ pip install pymysql sqlalchemy pandas numpy torch  # 核心依赖 (torch 统一 
 
 # 单次回测 (CPU)
 python -m evtrade backtest --strategy channel_deviation --device cpu \
-    --period 5m --start 20250101 --end 20260903 --no-sleep
+    --period 5m --start 20250101 --end 20260903
 
-# 单次回测 (GPU, torch CUDA 不可用时自动回退 cpu)
-python -m evtrade backtest --strategy channel_deviation --device gpu \
-    --period 5m --start 20250101 --end 20260903 --no-sleep
+# 单次回测 (GPU; 无 CUDA 时 --device gpu 会抛 ValueError, 用 --device auto 自动探测)
+python -m evtrade backtest --strategy channel_deviation --device auto \
+    --period 5m --start 20250101 --end 20260903
 
 # 参数扫描: 滚动 WFO 多窗 + 费率 + 邻域衰减评分 + 蒙特卡洛 (选参标准流程, 见 13)
 python -m evtrade sweep --strategy channel_deviation --device auto \

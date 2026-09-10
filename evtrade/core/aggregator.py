@@ -8,7 +8,7 @@ from __future__ import annotations
 warmup_until 是 stime 字符串阈值, 字典序 == 时间序。
 """
 
-from typing import Optional, Union
+from typing import Optional
 
 from ..primitives import Bar
 from .timeutils import compute_bucket_general
@@ -17,20 +17,15 @@ from .timeutils import compute_bucket_general
 class BarAggregator:
     """增量周期合并 (独立于指标)
 
-    period_cfg: 兼容两种写法
-      * 传统元组 PERIODS[period] = (单位, 数值, stime起始位, timedelta) —— 取其 timedelta
-      * 直接给周期秒数 int (如 resolve_period_seconds("90m"))
+    period_seconds: 周期秒数 int (如 resolve_period_seconds("90m"));
       统一走 compute_bucket_general (支持任意 m/h/d 周期)。
 
     warmup_until: stime 字符串阈值; stime < 该值标记 mark=0 (预热, 仅聚合+指标累积),
                   stime >= 该值标记 mark=1 (驱动策略)。同一桶内 mark 取最新一根的值。
     """
 
-    def __init__(self, period_cfg: Union[tuple, int], on_bars, warmup_until=None):
-        if isinstance(period_cfg, (int, float)):
-            self.period_seconds = int(period_cfg)
-        else:
-            self.period_seconds = int(period_cfg[3].total_seconds())
+    def __init__(self, period_seconds: int, on_bars, warmup_until=None):
+        self.period_seconds = int(period_seconds)
         self.on_bars = on_bars
         self.warmup_until = warmup_until
         self.bars: list[dict] = []          # 已闭合桶

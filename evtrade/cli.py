@@ -8,24 +8,26 @@ from __future__ import annotations
 
 设备选择: --device {cpu, gpu, auto} (默认 auto)
   - auto: 优先 gpu (torch CUDA 可用), 否则 cpu
-  - cpu:  torch.device("cpu")
-  - gpu:  torch.device("cuda") (需 torch + CUDA, 不可用时自动回退 cpu)
+  - cpu:  cpu
+  - gpu:  gpu (需 torch + CUDA, 无 CUDA 时直接报错)
 
 常见修改:
-  1. 加新参数: 在 build_*_parser 加 add_argument; 在对应的 _run_* 中读取并透传。
+  1. 加新参数: 共享选项进 _common_parent / _data_parent; 子命令专属进 build_*_parser;
+     在对应的 _run_* 中读取并透传。
   2. 改输出格式: _run_backtest() 末尾的 print 段。
-  3. 加新子命令: 在 main() 的 handlers 字典加一项。
+  3. 加新子命令: 在 build_root_parser 的 builders 列表加一项, main() 的 handlers 字典加一项。
 """
 
 import argparse
 import time
 
-from .core.config import INIT_CASH, INIT_POSITION, INTERVAL, TRADE_QTY
+from .core.config import INIT_CASH, INIT_POSITION, TRADE_QTY
 from .core.timeutils import resolve_period_seconds
 
 
 def _parse_params(spec: str) -> dict:
     """'k1:v1;k2:v2' -> dict (类型自动推导: int / float / bool / str)"""
+    from .strategies._defaults_loader import auto_cast
     out: dict = {}
     if not spec:
         return out
@@ -36,25 +38,8 @@ def _parse_params(spec: str) -> dict:
         if ":" not in kv:
             raise ValueError(f"参数格式错误 {kv!r}; 应为 'key:value'")
         k, _, v = kv.partition(":")
-        k = k.strip()
-        v = v.strip()
-        out[k] = _auto_cast(v)
+        out[k.strip()] = auto_cast(v.strip())
     return out
-
-
-def _auto_cast(s: str):
-    """字符串 -> int / float / bool / str"""
-    if s.lower() in ("true", "false"):
-        return s.lower() == "true"
-    try:
-        return int(s)
-    except ValueError:
-        pass
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    return s
 
 
 def _period_type(s: str) -> str:
@@ -77,55 +62,17 @@ def _resolve_strategy_params(strategy_name: str, params_arg: str) -> dict:
     return {}
 
 
-# 旧 --engine -> --device 映射 (kernel/ref/vectorized -> auto/cpu/cpu)
-_LEGACY_ENGINE_MAP = {"kernel": "auto", "ref": "cpu", "vectorized": "cpu"}
+# ============ 共享选项父 parser (argparse parents= 单点声明) ============
 
-
-def _emit_legacy_engine_warning():
-    """旧 --engine 触发的 DeprecationWarning"""
-    import warnings
-    warnings.warn(
-        f"--engine 已弃用, 请改用 --device "
-        f"{{{', '.join(sorted(_LEGACY_ENGINE_MAP))}}}; 当前按映射自动转换。",
-        DeprecationWarning,
-        stacklevel=3,
-    )
-
-
-def _coalesce_legacy_engine(argv: list[str]) -> tuple[list[str], str]:
-    """检测旧 --engine 值并转换为 --device; 返回 (new_argv, device)"""
-    new_argv = []
-    device = "auto"
-    skip_next = False
-    for i, a in enumerate(argv):
-        if skip_next:
-            skip_next = False
-            continue
-        if a == "--engine" and i + 1 < len(argv):
-            v = argv[i + 1].lower()
-            if v in _LEGACY_ENGINE_MAP:
-                device = _LEGACY_ENGINE_MAP[v]
-                _emit_legacy_engine_warning()
-                skip_next = True
-                continue
-        new_argv.append(a)
-    return new_argv, device
-
-
-# ============ backtest 子命令 ============
-
-def build_backtest_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(
-        description="策略回测 (vectorized; CPU/GPU 统一走 PyTorch, --device 路由)")
-    ap.add_argument("--period", default="5m", type=_period_type,
-                    help="K线周期, 任意数字+m/h/d: 5m/7m/15m/30m/90m/2h/4h/6h/1d/3d ...")
+def _common_parent() -> argparse.ArgumentParser:
+    """backtest / sweep / replay 共享选项 (声明一次, 三处 parents= 引用)"""
+    ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--strategy", default="channel_deviation",
                     help="策略 key (来自 evtrade.strategies.available_strategies())")
     ap.add_argument("--params", default="",
                     help="策略参数 (通用 dict 形式): 'k1:v1;k2:v2'")
-    ap.add_argument("--start", default="20250101", help="策略起始日期 YYYYMMDD")
-    ap.add_argument("--end", default="20260903", help="策略结束日期 YYYYMMDD")
-    ap.add_argument("--trade-qty", type=float, default=TRADE_QTY, help="每次信号交易股数")
+    ap.add_argument("--period", default="5m", type=_period_type,
+                    help="K线周期, 任意数字+m/h/d: 5m/7m/15m/30m/90m/2h/4h/6h/1d/3d ...")
     ap.add_argument("--scale", type=float, default=1.0,
                     help="倍投系数: 连续同向信号数量=上次×scale (反向重置); 1.0=关闭")
     ap.add_argument("--all-in", action="store_true",
@@ -134,30 +81,41 @@ def build_backtest_parser() -> argparse.ArgumentParser:
                     help="BUY 时按当前现金的该比例下注 (0=关闭走 --trade-qty)")
     ap.add_argument("--sell-pct", type=float, default=0.0,
                     help="SELL 时按当前持仓的该比例卖 (0=关闭走 --trade-qty)")
-    ap.add_argument("--code", default="159992.SZ", help="证券代码")
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"],
-                    help="xp 后端: cpu=torch.device('cpu') / gpu=torch.device('cuda') / auto=优先 gpu (默认)")
-    ap.add_argument("--verbose", "-v", action="store_true",
-                    help="逐根打印 strategy.format_signal_line 输出 (sig!=0 时)")
+                    help="计算后端: cpu / gpu / auto=优先 gpu (默认)")
+    ap.add_argument("--signals-out", default=None, help="信号轨迹 CSV (ts,sig)")
+    return ap
+
+
+def _data_parent() -> argparse.ArgumentParser:
+    """backtest / sweep 共享的行情拉取选项 (声明一次, 两处 parents= 引用)"""
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--code", default="159992.SZ", help="证券代码")
+    ap.add_argument("--start", default="20250101", help="开始日期 YYYYMMDD")
+    ap.add_argument("--end", default="20260903", help="结束日期 YYYYMMDD")
+    ap.add_argument("--trade-qty", type=float, default=TRADE_QTY,
+                    help="每次信号交易股数")
     ap.add_argument("--warmup-days", type=int, default=365,
                     help="预热天数 (拉取 start 之前的行情供指标就绪)")
-    ap.add_argument("--data-cache", default=None,
-                    help="行情 npz 缓存目录")
-    ap.add_argument("--show-bars", action="store_true",
-                    help="打印每根周期K线的 OHLCV 与策略额外列")
-    ap.add_argument("--bars-out", default=None,
-                    help="同 --show-bars 内容输出 CSV")
-    ap.add_argument("--signals-out", default=None,
-                    help="信号轨迹 CSV (ts,sig,策略额外列)")
+    ap.add_argument("--data-cache", default=None, help="行情 npz 缓存目录")
+    return ap
+
+
+# ============ backtest 子命令 ============
+
+def build_backtest_parser(ap: argparse.ArgumentParser | None = None
+                          ) -> argparse.ArgumentParser:
+    """backtest 选项; ap 为 None 时自建 (独立调用), 否则注册到给定 parser (root 嵌套)"""
+    if ap is None:
+        ap = argparse.ArgumentParser(
+            prog="evtrade backtest",
+            description="策略回测 (vectorized; CPU/GPU 统一走 PyTorch, --device 路由)")
+    ap.add_argument("--verbose", "-v", action="store_true",
+                    help="逐根打印 strategy.format_signal_line 输出 (sig!=0 时)")
     ap.add_argument("--init-cash", type=float, default=INIT_CASH,
                     help="期初资金 (默认 20万); 传 0 忽略, 走零起点")
     ap.add_argument("--init-position", type=float, default=INIT_POSITION,
                     help="期初持仓股数 (默认 20万); 传 0 忽略, 走零起点")
-    # 兼容旧 --engine / --no-sleep / --step-days (旧 ref 引擎参数)
-    ap.add_argument("--engine", default=None, choices=["kernel", "ref", "vectorized"],
-                    help=argparse.SUPPRESS)
-    ap.add_argument("--no-sleep", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--step-days", type=int, default=7, help=argparse.SUPPRESS)
     return ap
 
 
@@ -173,12 +131,9 @@ def _f4(v) -> str:
 
 def _run_backtest(args):
     """backtest 入口 (vectorized 引擎)"""
-    # 兼容旧 --engine: 自动映射到 --device
-    if getattr(args, "engine", None):
-        mapped = _LEGACY_ENGINE_MAP[args.engine]
-        if args.device == "auto" or args.device != mapped:
-            _emit_legacy_engine_warning()
-            args.device = mapped
+    # 设备解析: --device gpu 无 CUDA 抛错; auto 降级 (三子命令统一)
+    from .backends import gpu_available, resolve_device
+    args.device = resolve_device(args.device, gpu_available())
 
     strategy_params = _resolve_strategy_params(args.strategy, args.params)
 
@@ -206,7 +161,7 @@ def _run_backtest(args):
         init_cash=args.init_cash, init_position=args.init_position,
         trade_qty=args.trade_qty, scale=args.scale,
         buy_pct=buy_pct, sell_pct=sell_pct,
-        device=args.device, verbose=args.verbose)
+        verbose=args.verbose)
     dt = time.perf_counter() - t0
 
     s = result["summary"]
@@ -220,7 +175,7 @@ def _run_backtest(args):
     print("=" * 60)
     print(f"期末价 (最后一根close) : {s['final_price']:.4f}")
     print(f"交易次数              : {s['n_trades']} (BUY {s['n_buy']} / SELL {s['n_sell']})")
-    print(f"期初资金 / 期初持仓    : {INIT_CASH:.0f} / {INIT_POSITION:.0f}股")
+    print(f"期初资金 / 期初持仓    : {args.init_cash:.0f} / {args.init_position:.0f}股")
     print(f"期末资金 / 期末持仓    : {s['final_cash']:.2f} / {s['final_position']:.0f}股")
     print(f"期末持仓市值           : {s['final_position'] * s['final_price']:.2f}")
     print(f"策略总资产 (资金+市值) : {s['final_equity']:.2f}")
@@ -265,36 +220,26 @@ def _run_backtest(args):
 
 def backtest_main(argv=None):
     """backtest 主入口"""
-    raw = list(argv) if argv is not None else None
-    if raw is not None:
-        raw, device = _coalesce_legacy_engine(raw)
-        if device != "auto" and "--device" not in raw:
-            raw = ["--device", device] + raw
-    args = build_backtest_parser().parse_args(raw)
+    ap = argparse.ArgumentParser(
+        prog="evtrade backtest",
+        description="策略回测 (vectorized; CPU/GPU 统一走 PyTorch, --device 路由)",
+        parents=[_common_parent(), _data_parent()])
+    args = build_backtest_parser(ap).parse_args(argv)
     _run_backtest(args)
 
 
 # ============ sweep 子命令 ============
 
-def build_sweep_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(
-        description="参数并发扫描 (vectorized; CPU/GPU 统一)")
-    ap.add_argument("--strategy", default="channel_deviation")
-    ap.add_argument("--params", default="",
-                    help="基础策略参数: 'k1:v1;k2:v2' (与 --grid 笛卡尔积叠加)")
-    ap.add_argument("--code", default="159992.SZ")
-    ap.add_argument("--start", default="20250101")
-    ap.add_argument("--end", default="20260903")
-    ap.add_argument("--period", default="5m", type=_period_type)
-    ap.add_argument("--trade-qty", type=float, default=TRADE_QTY)
-    ap.add_argument("--scale", type=float, default=1.0)
-    ap.add_argument("--all-in", action="store_true")
-    ap.add_argument("--buy-pct", type=float, default=0.0)
-    ap.add_argument("--sell-pct", type=float, default=0.0)
+def build_sweep_parser(ap: argparse.ArgumentParser | None = None
+                       ) -> argparse.ArgumentParser:
+    """sweep 选项; ap 为 None 时自建 (独立调用), 否则注册到给定 parser (root 嵌套)"""
+    if ap is None:
+        ap = argparse.ArgumentParser(
+            prog="evtrade sweep",
+            description="参数并发扫描 (vectorized; CPU/GPU 统一)")
     ap.add_argument("--grid", action="append", default=[],
                     help="参数网格, 可多次: --grid key=v1,v2,v3")
-    ap.add_argument("--split", default=None,
-                    help="单分割日 YYYYMMDD")
+    ap.add_argument("--split", default=None, help="单分割日 YYYYMMDD")
     ap.add_argument("--splits", default=None,
                     help="滚动 WFO 分割日, 逗号分隔")
     ap.add_argument("--fee-bp", type=float, default=5.0)
@@ -303,12 +248,7 @@ def build_sweep_parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-mdd", type=float, default=1.0)
     ap.add_argument("--mc", type=int, default=0)
     ap.add_argument("--mc-top", type=int, default=5)
-    ap.add_argument("--warmup-days", type=int, default=365)
     ap.add_argument("--workers", type=int, default=None)
-    ap.add_argument("--device", default="auto",
-                    choices=["auto", "cpu", "gpu"],
-                    help="xp 后端: cpu / gpu / auto (默认)")
-    ap.add_argument("--data-cache", default=None)
     ap.add_argument("--synthetic-days", type=int, default=0,
                     help=">0 时用合成数据 (不连库)")
     ap.add_argument("--out", default="sweep_results.csv")
@@ -319,7 +259,11 @@ def build_sweep_parser() -> argparse.ArgumentParser:
 
 
 def sweep_main(argv=None):
-    args = build_sweep_parser().parse_args(argv)
+    ap = argparse.ArgumentParser(
+        prog="evtrade sweep",
+        description="参数并发扫描 (vectorized; CPU/GPU 统一)",
+        parents=[_common_parent(), _data_parent()])
+    args = build_sweep_parser(ap).parse_args(argv)
     from .core.data import load_bars, synthetic_bars
     from .core.metrics import bars_to_arrays
     from .core.sweep import GRID_KEYS, parse_grid, sweep as run_sweep
@@ -389,7 +333,8 @@ def sweep_main(argv=None):
             combo = {k: row[k] for k in GRID_KEYS if k in row}
             params = {**base, **combo}
             r = permutation_test(bars, params, warm, n=args.mc,
-                                 fee_bp=args.fee_bp)
+                                 fee_bp=args.fee_bp,
+                                 strategy_name=args.strategy)
             print(f"  {' '.join(f'{k}={row[k]}' for k in combo)}  "
                   f"真实年化超额 {r['real_ann_net']:+.2f}%/年  "
                   f"p={r['p_value']:.3f}", flush=True)
@@ -397,35 +342,37 @@ def sweep_main(argv=None):
 
 # ============ replay 子命令 ============
 
-def build_replay_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(
-        description="录制回放对账 (vectorized 引擎; --against-ref 走 Engine.on_bars 对账)")
+def build_replay_parser(ap: argparse.ArgumentParser | None = None
+                        ) -> argparse.ArgumentParser:
+    """replay 选项; ap 为 None 时自建 (独立调用), 否则注册到给定 parser (root 嵌套)"""
+    if ap is None:
+        ap = argparse.ArgumentParser(
+            prog="evtrade replay",
+            description="录制回放对账 (vectorized 引擎; --against-ref 走 Engine.on_bars 对账)")
     ap.add_argument("--log", required=True,
                     help="bar 日志 (CSV: stime,code,open,high,low,close,volume)")
-    ap.add_argument("--strategy", default="channel_deviation")
-    ap.add_argument("--period", default="5m", type=_period_type)
-    ap.add_argument("--params", default="",
-                    help="策略参数 (通用 dict 形式)")
-    ap.add_argument("--scale", type=float, default=1.0)
-    ap.add_argument("--all-in", action="store_true")
-    ap.add_argument("--buy-pct", type=float, default=0.0)
-    ap.add_argument("--sell-pct", type=float, default=0.0)
     ap.add_argument("--warmup-until", default=None)
     ap.add_argument("--against-ref", action="store_true",
                     help="同时用 Engine.on_bars 回放并逐 bar 对账")
-    ap.add_argument("--signals-out", default=None, help="信号轨迹 CSV")
-    ap.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"])
     return ap
 
 
 def replay_main(argv=None):
-    args = build_replay_parser().parse_args(argv)
+    ap = argparse.ArgumentParser(
+        prog="evtrade replay",
+        description="录制回放对账 (vectorized 引擎; --against-ref 走 Engine.on_bars 对账)",
+        parents=[_common_parent()])
+    args = build_replay_parser(ap).parse_args(argv)
     from .core.replay import (
         read_bars_log, reconcile, replay_vectorized,
     )
 
     strategy_name = args.strategy
     sp = _resolve_strategy_params(strategy_name, args.params)
+
+    # 设备解析: --device gpu 无 CUDA 抛错; auto 降级 (三子命令统一)
+    from .backends import gpu_available, resolve_device
+    args.device = resolve_device(args.device, gpu_available())
 
     bars = read_bars_log(args.log)
     if not bars:
@@ -439,8 +386,7 @@ def replay_main(argv=None):
     k = replay_vectorized(bars, args.period, warm,
                           strategy_name=strategy_name, strategy_params=sp,
                           scale=args.scale,
-                          buy_pct=args.buy_pct, sell_pct=args.sell_pct,
-                          device=args.device)
+                          buy_pct=args.buy_pct, sell_pct=args.sell_pct)
     s = k["summary"]
     n_sig = int((k["sig"] != 0).sum()) if hasattr(k["sig"], "__len__") else 0
     print(f"信号 {n_sig} 个 (BUY {s['n_buy']} / SELL {s['n_sell']}), "
@@ -460,16 +406,19 @@ def replay_main(argv=None):
                   strategy_name=strategy_name, strategy_params=sp,
                   scale=args.scale,
                   buy_pct=args.buy_pct, sell_pct=args.sell_pct,
-                  all_in=args.all_in,
-                  device=args.device)
+                  all_in=args.all_in)
 
 
 # ============ params 子命令 (默认参数落盘) ============
 
-def build_params_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(
-        prog="evtrade params",
-        description="策略默认参数管理 (落盘 evtrade/strategies/_defaults/<name>.json)")
+def build_params_parser(ap: argparse.ArgumentParser | None = None
+                        ) -> argparse.ArgumentParser:
+    """params 选项 (含 save / show / list 二级子命令);
+    ap 为 None 时自建 (独立调用), 否则注册到给定 parser (root 嵌套)"""
+    if ap is None:
+        ap = argparse.ArgumentParser(
+            prog="evtrade params",
+            description="策略默认参数管理 (落盘 evtrade/strategies/_defaults/<name>.json)")
     sub = ap.add_subparsers(dest="params_cmd", required=True)
 
     p_save = sub.add_parser("save", help="保存最优参数到默认目录")
@@ -482,12 +431,15 @@ def build_params_parser() -> argparse.ArgumentParser:
     p_show = sub.add_parser("show", help="打印策略当前默认参数")
     p_show.add_argument("strategy")
 
-    p_list = sub.add_parser("list", help="列出所有已有默认参数的策略")
+    sub.add_parser("list", help="列出所有已有默认参数的策略")
     return ap
 
 
 def params_main(argv=None):
-    args = build_params_parser().parse_args(argv)
+    ap = argparse.ArgumentParser(
+        prog="evtrade params",
+        description="策略默认参数管理 (落盘 evtrade/strategies/_defaults/<name>.json)")
+    args = build_params_parser(ap).parse_args(argv)
 
     if args.params_cmd == "list":
         from .strategies._defaults_loader import list_defaulted
@@ -563,14 +515,20 @@ def build_root_parser():
         description="evtrade CLI: 策略回测 / 参数扫描 / 行情回放 / 默认参数管理",
     )
     sub = ap.add_subparsers(dest="cmd", help="子命令")
-    for name, builder in (("backtest", build_backtest_parser),
-                          ("sweep", build_sweep_parser),
-                          ("replay", build_replay_parser),
-                          ("params", build_params_parser)):
-        sub_p = sub.add_parser(name, help=f"{name} 子命令 (见 {name} -h)",
-                               add_help=False)
-        for action in builder()._actions:
-            sub_p._add_action(action)
+    builders = (
+        ("backtest", build_backtest_parser, (_common_parent(), _data_parent()),
+         "策略回测"),
+        ("sweep", build_sweep_parser, (_common_parent(), _data_parent()),
+         "参数并发扫描"),
+        ("replay", build_replay_parser, (_common_parent(),),
+         "录制回放对账"),
+        ("params", build_params_parser, (),
+         "默认参数管理"),
+    )
+    for name, builder, parents, help_text in builders:
+        subp = sub.add_parser(name, help=f"{help_text} (见 {name} -h)",
+                              parents=list(parents))
+        builder(subp)
     return ap
 
 

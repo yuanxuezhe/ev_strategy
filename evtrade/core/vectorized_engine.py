@@ -12,10 +12,10 @@ state 由引擎持有, 跨调用持续。strategy.step 是策略唯一入口。
 
 import numpy as np
 
-from ..backends import get_xp
-from .gpu import precompute_ts_mark
+from ..execution.base import trade_decision
 from .metrics import summarize as _summarize_full
 from .timeutils import resolve_period_seconds
+from .tsbucket import precompute_ts_mark
 
 
 # ============ 桶聚合 (numpy 向量化) ============
@@ -100,36 +100,20 @@ def _execute_trades(sig_np, close_np, ts_np,
             cur_qty = trade_qty
             last_side = s
 
-        if s == 1:  # BUY
-            if price > 0:
-                max_by_cash = cash / price
-                if buy_pct > 0:
-                    target = buy_pct * max_by_cash
-                    q = target if target < max_by_cash else max_by_cash
-                else:
-                    q = cur_qty if cur_qty < max_by_cash else max_by_cash
-            else:
-                q = 0.0
-            if q > 0:
-                cash -= q * price
-                position += q
-                n_trades += 1; n_buy += 1
-                turnover += q * price
-                trades.append({"ts": ts, "side": "BUY", "qty": float(q),
-                               "price": float(price), "cash_after": float(cash)})
-        else:  # SELL
-            if sell_pct > 0:
-                target = sell_pct * position
-                q = target if target < position else position
-            else:
-                q = cur_qty if cur_qty < position else position
-            if q > 0:
-                cash += q * price
-                position -= q
-                n_trades += 1; n_sell += 1
-                turnover += q * price
-                trades.append({"ts": ts, "side": "SELL", "qty": float(q),
-                               "price": float(price), "cash_after": float(cash)})
+        cash, position, q, filled = trade_decision(
+            s, price, cash, position, cur_qty, buy_pct, sell_pct)
+        if not filled:
+            continue
+        n_trades += 1
+        turnover += q * price
+        if s == 1:
+            n_buy += 1
+            trades.append({"ts": ts, "side": "BUY", "qty": float(q),
+                           "price": float(price), "cash_after": float(cash)})
+        else:
+            n_sell += 1
+            trades.append({"ts": ts, "side": "SELL", "qty": float(q),
+                           "price": float(price), "cash_after": float(cash)})
 
     return {"cash": cash, "position": position, "last_price": last_price,
             "n_trades": n_trades, "n_buy": n_buy, "n_sell": n_sell,
@@ -224,20 +208,15 @@ def run_vectorized(bars_1m: dict, period: str, warmup_until: int,
                    init_cash: float = 200000.0, init_position: float = 200000.0,
                    trade_qty: float = 10000.0, scale: float = 1.0,
                    buy_pct: float = 0.0, sell_pct: float = 0.0,
-                   device: str = "cpu",
                    verbose: bool = False) -> dict:
     """向量化回测 (strategy-step-only)
 
     bars_1m: numpy dict (bars_to_arrays 输出)
     strategy: VectorizedStrategy 实例 (step 方法)
-    device: 接受但忽略 (PyTorch 后端无 device 路由)
     verbose: True 时, sig!=0 调 strategy.format_signal_line 并 print
 
     返回: {"sig", "trades", "summary", "buckets"}
     """
-    # device 参数保留 (策略内部自行 to(device)); 此处仅触发 gpu/cuda 不可用时的早期 warning
-    _ = get_xp(device)
-
     # 1) 桶聚合
     buckets = _aggregate_buckets(bars_1m, period, warmup_until)
 

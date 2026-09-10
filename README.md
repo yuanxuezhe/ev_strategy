@@ -98,22 +98,23 @@ export EVTRADE_DEFAULTS_DIR=/etc/evtrade/defaults
 
 ```
 evtrade/
-  __init__.py          顶层 re-export + sys.modules 兼容垫片
+  __init__.py          顶层 re-export + 少量 sys.modules 兼容垫片
   __main__.py          python -m evtrade 入口
-  backends.py          get_xp(device) -> torch.device (CPU/GPU 统一后端)
+  backends.py          get_xp(device) -> torch.device (CPU/GPU 统一后端) + resolve_device
   cli.py               argparse 子命令 (backtest/sweep/replay/params)
-  core/                engine / vectorized_engine / sweep / replay / gpu / data / metrics
+  primitives.py        Bar 结构
+  core/                engine / vectorized_engine / sweep / replay / tsbucket / data / metrics
+                       / timeutils / aggregator / permutation / config / _harness
   strategies/          VectorizedStrategy 唯一基类 + 注册表 + 默认参数 (_defaults/)
-  feeds/               行情 feed 注册表
-  execution/           Executor 抽象 (Simulated / Broker)
-  indicators/          ema / atr / rsi / boll (*_step 增量 + xp 批量 + torch 批量)
-tests/                 147 pytest 用例
+  execution/           Executor 抽象 (Simulated) + trade_decision 单一成交决策
+  indicators/          ema (*_step 增量 + numpy 批量参考; 仅 EMA)
+tests/                 140+ pytest 用例
 docs/                  使用说明
-kbs/                   中文设计文档 (spec 投影)
+kbs/                   中文设计文档 (spec 投影, 15 份)
 ```
 
 ## 详见
 
 - `docs/params-workflow.md` — 四步工作流完整说明
 - `docs/quickstart.md` — 快速开始 (含 uv 详细命令)
-- `kbs/` — 设计文档 (子包化前, 部分行号已过时)
+- `kbs/` — 中文设计文档（spec 投影，15 份，与代码同步）

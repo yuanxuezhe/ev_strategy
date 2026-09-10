@@ -1,17 +1,17 @@
 from __future__ import annotations
 """桶时间戳算法测试:
   A. 任意周期: 内核整数版 vs compute_bucket_general (datetime 参考实现)
-  B. 老 7 周期: 通用算法 vs 原始"字段取整"算法 (行为不变性的等价性证明)
+  历法 / 周期解析 / 语义抽查
 """
 
 import random
 from datetime import date, datetime, timedelta
 
-from evtrade.config import PERIODS
-from evtrade.kernel import (_days_from_civil, bucket_ts_encoded,
-                            epoch_to_encoded, encoded_to_epoch,
-                            resolve_period_seconds)
-from evtrade.timeutils import compute_bucket, compute_bucket_general
+from evtrade.core.timeutils import (
+    _days_from_civil, bucket_ts_encoded,
+    epoch_to_encoded, encoded_to_epoch,
+    resolve_period_seconds, compute_bucket_general,
+)
 
 
 def _sample_stimes(rng):
@@ -28,8 +28,8 @@ def _sample_stimes(rng):
     return out
 
 
-LEGACY_PERIODS = list(PERIODS.keys())
-ARBITRARY_PERIODS = ["2m", "7m", "13m", "45m", "90m", "120m", "2h", "5h",
+ARBITRARY_PERIODS = ["1m", "5m", "15m", "30m", "1h", "4h", "1d",
+                     "2m", "7m", "13m", "45m", "90m", "120m", "2h", "5h",
                      "7h", "12h", "3d", "7d"]
 
 
@@ -37,23 +37,12 @@ def test_bucket_matches_general_reference_all_periods():
     """内核整数版 vs datetime 参考实现: 老 7 周期 + 任意周期 全部一致"""
     rng = random.Random(7)
     stimes = _sample_stimes(rng)
-    for period in LEGACY_PERIODS + ARBITRARY_PERIODS:
+    for period in ARBITRARY_PERIODS:
         P = resolve_period_seconds(period)
         for s in stimes:
             ref = compute_bucket_general(s, P)
             got = str(bucket_ts_encoded(int(s), P))
             assert got == ref, f"period={period} stime={s} ref={ref} got={got}"
-
-
-def test_bucket_legacy_equivalence_on_original_periods():
-    """老 7 周期: 通用算法 == 原始字段取整算法 (行为不变性证明)"""
-    rng = random.Random(7)
-    stimes = _sample_stimes(rng)
-    for period, (unit, value, pos, delta) in PERIODS.items():
-        for s in stimes:
-            legacy = compute_bucket(s, value, pos, delta)
-            got = str(bucket_ts_encoded(int(s), resolve_period_seconds(period)))
-            assert got == legacy, f"period={period} stime={s} legacy={legacy} got={got}"
 
 
 def test_resolve_period_seconds():

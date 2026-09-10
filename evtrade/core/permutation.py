@@ -35,7 +35,7 @@ def permutation_test(bars: dict, params: dict, warmup_until: int,
     strategy_name: 必填, 透传给 run_one_from_dict。
     """
     real_m = run_one_from_dict(bars, params, warmup_until, strategy_name=strategy_name)
-    real = real_m.get("ann_excess_pct", 0.0)
+    real = real_m.get("cagr_excess", 0.0)
 
     stime = bars["stime"]
     nb = len(stime)
@@ -60,7 +60,7 @@ def permutation_test(bars: dict, params: dict, warmup_until: int,
         for k in price_keys:
             shuffled[k] = bars[k][new_idx]
         m = run_one_from_dict(shuffled, params, warmup_until, strategy_name=strategy_name)
-        vals[j] = m.get("ann_excess_pct", 0.0)
+        vals[j] = m.get("cagr_excess", 0.0)
         if vals[j] >= real:
             ge += 1
         if verbose and (j + 1) % 100 == 0:

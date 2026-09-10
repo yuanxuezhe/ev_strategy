@@ -85,36 +85,3 @@ def test_to_host_returns_cpu_tensor():
     assert isinstance(h, torch.Tensor)
     assert h.device.type == "cpu"
 
-
-def test_xp_ema_torch_basic():
-    """xp_ema_torch 接受 (B, T) tensor 输入"""
-    from evtrade.indicators.ema import xp_ema_torch
-    v = torch.randn(1, 50, dtype=torch.float64)
-    out = xp_ema_torch(v, 21)
-    assert out.shape == (1, 50)
-    # 前 20 个为 NaN (period=21, p-1=20)
-    assert torch.isnan(out[0, :20]).all()
-    # 第 20 个 (idx) 是 SMA seed, 不为 NaN
-    assert not torch.isnan(out[0, 20])
-
-
-def test_xp_ema_torch_1d_input_unsqueeze():
-    """1D (T,) 输入自动 unsqueeze 为 (1, T)"""
-    from evtrade.indicators.ema import xp_ema_torch
-    v = torch.randn(50, dtype=torch.float64)
-    out = xp_ema_torch(v, 21)
-    assert out.shape == (50,)
-
-
-def test_xp_ema_torch_per_row_period():
-    """per-row period: (B,) 形状 period"""
-    from evtrade.indicators.ema import xp_ema_torch
-    v = torch.randn(3, 100, dtype=torch.float64)
-    periods = torch.tensor([5, 21, 50])
-    out = xp_ema_torch(v, periods)
-    assert out.shape == (3, 100)
-    # period=5 行: 前 4 个 NaN
-    assert torch.isnan(out[0, :4]).all()
-    assert not torch.isnan(out[0, 4])
-    # period=50 行: 前 49 个 NaN
-    assert torch.isnan(out[2, :49]).all()

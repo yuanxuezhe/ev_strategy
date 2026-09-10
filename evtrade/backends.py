@@ -47,6 +47,26 @@ def gpu_available() -> bool:
         return False
 
 
+def resolve_device(requested: str, gpu_ok: bool | None = None) -> str:
+    """按 requested + CUDA 可用性解析设备 (三个子命令入口统一调用)。
+
+    - "cpu": 直接返回 cpu
+    - "gpu": CUDA 可用返回 gpu; 不可用抛 ValueError (带可操作提示)
+    - "auto": 优先 gpu (需可用), 否则降级 cpu (调用方负责打 warning)
+    """
+    if gpu_ok is None:
+        gpu_ok = gpu_available()
+    if requested == "cpu":
+        return "cpu"
+    if requested == "gpu":
+        if not gpu_ok:
+            raise ValueError(
+                "请求 --device gpu 但环境无可用 torch/CUDA; "
+                "改用 --device auto (自动降级) 或 --device cpu")
+        return "gpu"
+    return "gpu" if gpu_ok else "cpu"
+
+
 def to_tensor(arr, device: torch.device | None = None) -> torch.Tensor:
     """numpy/list/tensor -> torch.Tensor (在指定 device 上)。
 
