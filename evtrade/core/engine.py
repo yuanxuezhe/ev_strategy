@@ -50,7 +50,6 @@ class Engine:
         if rec.get("mark", 1) != 1:
             return
         price = float(rec["close"])
-        self.executor.update_price(price)
         self._state, sig_int = self.strategy.step(
             self._state, _bucket_bar(rec), self.strategy.params)
         self.bucket_signals.append(int(sig_int))

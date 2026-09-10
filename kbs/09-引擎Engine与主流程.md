@@ -38,7 +38,6 @@ on_bars(bars):                                   # aggregator 每根 1m bar 回�
 _process_bucket(rec):
   if rec.get("mark", 1) != 1: return            # 预热桶不驱动
   price = float(rec["close"])
-  executor.update_price(price)
   self._state, sig = strategy.step(self._state, {ts,o,h,l,c,v,mark}, strategy.params)
   bucket_signals.append(sig)
   if sig != 0:
