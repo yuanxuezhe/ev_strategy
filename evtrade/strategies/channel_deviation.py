@@ -135,9 +135,9 @@ class ChannelDeviationStrategy(VectorizedStrategy):
 
     def format_signal_line(self, ts: int, sig: int, info: dict | None = None) -> str:
         """自定义信号行打印; info 来自 Engine.on_bars 累积 (up/dw/dev)"""
-        from ..primitives import fmt
+        from ..primitives import fmt, sig_to_side
         info = info or {}
-        side = {1: "BUY", -1: "SELL"}.get(sig, "")
+        side = sig_to_side(sig)
         prefix = f"{side} >>> " if side else "             "
         return (f"{prefix}[{ts}] | UP={fmt(info.get('up'))} DW={fmt(info.get('dw'))} | "
                 f"low_dev(L/DW)={fmt(info.get('low_dev'))}% "

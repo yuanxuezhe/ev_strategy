@@ -278,13 +278,12 @@ def test_compute_signals_for_one_bar_default_wrapper():
 # ============ helpers ============
 
 def _aggregate_bars(period: str, bars: dict) -> dict:
-    """跑一次 vectorized_engine._aggregate_buckets_xp (numpy)"""
-    from evtrade.core.vectorized_engine import _aggregate_buckets_xp
-    return _aggregate_buckets_xp(np, bars, period, warmup_until=0)
+    """跑一次 vectorized_engine._aggregate_buckets (numpy)"""
+    from evtrade.core.vectorized_engine import _aggregate_buckets
+    return _aggregate_buckets(bars, period, warmup_until=0)
 
 
 def _aggregate_bars_gpu(period: str, bars: dict) -> dict:
-    """GPU 版桶聚合"""
-    cp = get_xp("gpu")
-    from evtrade.core.vectorized_engine import _aggregate_buckets_xp
-    return _aggregate_buckets_xp(cp, bars, period, warmup_until=0)
+    """GPU 版桶聚合 (numpy 路径, GPU device 仅影响回测主链 fast-path)"""
+    from evtrade.core.vectorized_engine import _aggregate_buckets
+    return _aggregate_buckets(bars, period, warmup_until=0)

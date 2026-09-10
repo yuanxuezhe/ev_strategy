@@ -176,7 +176,8 @@ class VectorizedStrategy:
         info 字典: 由 strategy.step() 累积的可选元数据
                   (e.g. 当前通道上轨/下轨/通道宽度)。框架不假设 info 键集。
         """
-        side = {1: "BUY", -1: "SELL"}.get(sig, "")
+        from ..primitives import sig_to_side
+        side = sig_to_side(sig)
         return f"{ts} sig={sig:+d} {side}".rstrip()
 
     def get_extra_bucket_columns(self) -> list[str]:

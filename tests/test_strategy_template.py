@@ -101,7 +101,7 @@ def test_06_unknown_rejected():
 def test_07_one_run():
     """7. 跑一次合成数据: compute_signals 形态正确, 不报错"""
     from evtrade.data import synthetic_bars
-    from evtrade.core.vectorized_engine import _aggregate_buckets_xp
+    from evtrade.core.vectorized_engine import _aggregate_buckets
 
     s = get_strategy("template_demo", fast=3, slow=10)
     raw = synthetic_bars(days=30, start_ymd="20241101", seed=42)
@@ -112,7 +112,7 @@ def test_07_one_run():
             "low":    np.array([b.low for b in raw], dtype=np.float64),
             "close":  np.array([b.close for b in raw], dtype=np.float64),
             "volume": np.array([b.volume for b in raw], dtype=np.float64)}
-    buckets = _aggregate_buckets_xp(np, bars, "5m", warmup_until=0)
+    buckets = _aggregate_buckets(bars, "5m", warmup_until=0)
     sig = s.compute_signals(np, buckets, s.params)
     assert sig.dtype == np.int8
     assert len(sig) == len(buckets["ts"])

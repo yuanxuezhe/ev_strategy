@@ -26,6 +26,10 @@ from .timeutils import resolve_period_seconds
 BAR_HEADER = "stime,code,open,high,low,close,volume"
 
 
+def _format_bar_line(b) -> str:
+    return f"{b.stime},{b.code},{b.open},{b.high},{b.low},{b.close},{b.volume}"
+
+
 def append_bar(path: str, bar: Bar):
     """实盘进程调用: 把收到的 bar 追加到日志 (首行自动写表头)"""
     import os
@@ -33,8 +37,7 @@ def append_bar(path: str, bar: Bar):
         with open(path, "w", encoding="utf-8") as f:
             f.write(BAR_HEADER + "\n")
     with open(path, "a", encoding="utf-8") as f:
-        f.write(f"{bar.stime},{bar.code},{bar.open},{bar.high},{bar.low},"
-                f"{bar.close},{bar.volume}\n")
+        f.write(_format_bar_line(bar) + "\n")
 
 
 def write_bars_log(path: str, bars) -> int:
@@ -43,8 +46,7 @@ def write_bars_log(path: str, bars) -> int:
         f.write(BAR_HEADER + "\n")
         n = 0
         for b in bars:
-            f.write(f"{b.stime},{b.code},{b.open},{b.high},{b.low},"
-                    f"{b.close},{b.volume}\n")
+            f.write(_format_bar_line(b) + "\n")
             n += 1
     return n
 
@@ -123,26 +125,12 @@ def replay_engine(bars, period: str, warmup_until: int, tf1: int,
 
     feed = ListBarFeed(bars)
 
-    class _RecExec(SimulatedExecutor):
-        def __init__(self, account, qty, scale,
-                     buy_pct=0.0, sell_pct=0.0, all_in=False):
-            super().__init__(account, qty, verbose=False, scale=scale,
-                             buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in)
-            self.records = []
-
-        def trade(self, signal, price, ts):
-            ok = super().trade(signal, price, ts)
-            if ok:
-                t = self.account.trades[-1]
-                self.records.append({"ts": int(t["ts"]), "side": t["side"],
-                                     "qty": float(t["qty"]),
-                                     "price": float(t["price"])})
-            return ok
-
-    n = len(bars)
+    records: list[dict] = []
     account = Account(cash=init_cash, position=init_position)
-    executor = _RecExec(account, qty=trade_qty, scale=scale,
-                        buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in)
+    executor = SimulatedExecutor(account, qty=trade_qty, verbose=False,
+                                 scale=scale, buy_pct=buy_pct,
+                                 sell_pct=sell_pct, all_in=all_in,
+                                 record_to=records)
     strategy = get_strategy(strategy_name, params=strategy_params or {})
     aggregator = BarAggregator(resolve_period_seconds(period), on_bars=None,
                                warmup_until=str(warmup_until) if warmup_until else None)
@@ -152,7 +140,7 @@ def replay_engine(bars, period: str, warmup_until: int, tf1: int,
 
     # bucket_signals 已是桶级信号列表, 直接返桶级数组
     return {"sig": np.array(engine.bucket_signals, dtype=np.int8),
-            "trades": executor.records,
+            "trades": records,
             "summary": None}
 
 

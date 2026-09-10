@@ -49,7 +49,8 @@ class SimulatedExecutor(Executor):
     """
 
     def __init__(self, account, qty: float, verbose=True, scale: float = 1.0,
-                 buy_pct: float = 0.0, sell_pct: float = 0.0, all_in: bool = False):
+                 buy_pct: float = 0.0, sell_pct: float = 0.0, all_in: bool = False,
+                 record_to: list | None = None):
         self.account = account
         self.qty = qty
         self.verbose = verbose
@@ -62,6 +63,8 @@ class SimulatedExecutor(Executor):
             self.sell_pct = max(self.sell_pct, 1.0)
         self.last_side = 0
         self.cur_qty = qty
+        # record_to: 若非 None, 每次成功 trade 追加 {ts,side,qty,price} 副本 (replay/对账用)
+        self.record_to = record_to
 
     def trade(self, signal: str, price: float, ts: str) -> bool:
         acc = self.account
@@ -84,6 +87,7 @@ class SimulatedExecutor(Executor):
             if qty <= 0:
                 return False
             acc.apply("BUY", qty, price, ts)
+            self._record(side="BUY", qty=qty, price=price, ts=ts)
             if self.verbose:
                 print(f"        >> BUY  {qty:.0f}股 @ {price:.4f}  花费 {qty*price:.2f}  "
                       f"剩余资金 {acc.cash:.2f} 持仓 {acc.position:.0f}", flush=True)
@@ -97,11 +101,19 @@ class SimulatedExecutor(Executor):
             if qty <= 0:
                 return False
             acc.apply("SELL", qty, price, ts)
+            self._record(side="SELL", qty=qty, price=price, ts=ts)
             if self.verbose:
                 print(f"        >> SELL {qty:.0f}股 @ {price:.4f}  收入 {qty*price:.2f}  "
                       f"剩余资金 {acc.cash:.2f} 持仓 {acc.position:.0f}", flush=True)
             return True
         return False
+
+    def _record(self, side: str, qty: float, price: float, ts: str):
+        """成功 trade 后: 同步追加副本到 record_to (供对账/回放对比成交)"""
+        if self.record_to is None:
+            return
+        self.record_to.append({"ts": int(ts), "side": side,
+                               "qty": float(qty), "price": float(price)})
 
 
 class BrokerExecutor(Executor):

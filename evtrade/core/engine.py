@@ -1,4 +1,3 @@
-from __future__ import annotations
 """逐 bar 回测/实盘引擎 (实盘/对账用)
 
 run(): feed → aggregator → on_bars → strategy.step(state, bar) → executor
@@ -9,14 +8,22 @@ run(): feed → aggregator → on_bars → strategy.step(state, bar) → executo
 Engine 不假设 info 键集; 信号行打印走 strategy.format_signal_line hook。
 """
 
-import numpy as np
-
 from ..core.aggregator import BarAggregator
 from ..execution.base import Executor
 from ..feeds.base import Feed
-from ..primitives import fmt
+from ..primitives import fmt, sig_to_side
 from ..strategies.vectorized_base import VectorizedStrategy
 from .config import INIT_CASH, INIT_POSITION, TRADE_QTY
+
+
+def _bucket_bar(rec: dict) -> dict:
+    """将 aggregator 回调的 1m bar dict 转 strategy 期望的桶级 dict"""
+    return {
+        "ts": rec["ts"],
+        "o": rec["open"], "h": rec["high"],
+        "l": rec["low"],  "c": rec["close"],
+        "v": rec["volume"], "mark": rec.get("mark", 1),
+    }
 
 
 class Engine:
@@ -24,58 +31,44 @@ class Engine:
 
     def __init__(self, feed: Feed, aggregator: BarAggregator,
                  strategy: VectorizedStrategy, executor: Executor,
-                 tf1: int = 21, verbose: bool = True, **legacy):
+                 verbose: bool = True, **legacy):
         self.feed = feed
         self.aggregator = aggregator
         self.strategy = strategy
         self.executor = executor
-        # tf1 / **legacy: 兼容历史调用, framework 不再使用
         self.verbose = verbose
-        # 桶级信号轨迹 (供 replay/reconcile 对账用; 一根 entry = 一个已闭合桶)
+        # 桶级信号轨迹 (供 replay/reconcile 对账用)
         self.bucket_signals: list[int] = []
-        # 上一根 1m bar 的 cur 快照 (用于检测桶切换; 此时上一桶 OHLCV 已 finalized)
+        # 上一根 1m bar 的 cur 快照 (检测桶切换)
         self._last_cur: dict | None = None
-        # 策略持久 state (strategy-step-only); engine 持有, 跨调用持续
+        # 策略持久 state (strategy-step-only); engine 持有跨调用持续
         self._state = strategy.init_state(strategy.params)
         # 让 aggregator 的回调指向自己
         self.aggregator.on_bars = self.on_bars
 
+    def _process_bucket(self, rec: dict):
+        """桶 finalized 后: 算一次信号 + 可选下单/打印"""
+        if rec.get("mark", 1) != 1:
+            return
+        price = float(rec["close"])
+        self.executor.update_price(price)
+        self._state, sig_int = self.strategy.step(
+            self._state, _bucket_bar(rec), self.strategy.params)
+        self.bucket_signals.append(int(sig_int))
+        if sig_int != 0:
+            signal = sig_to_side(sig_int)
+            self.executor.trade(signal, price, rec["ts"])
+            if self.verbose:
+                info = getattr(self.strategy, "_last_info", None)
+                print(self.strategy.format_signal_line(rec["ts"], sig_int, info),
+                      flush=True)
+
     def on_bars(self, bars: list[dict]):
-        """聚合器回调: 桶 CLOSE 时驱动策略一次 (用 finalized OHLCV)
-
-        mark=0 (预热): 不驱动策略, 跳过。
-        mark=1 (策略期): 检测到 cur["ts"] 切换 (= 上一桶 finalize) 时, 用上一桶的
-        finalized OHLCV -> strategy.step(self._state, bar, params) -> (state, sig) -> 执行。
-        """
+        """聚合器回调: 桶 CLOSE 时驱动策略一次 (用 finalized OHLCV)"""
         cur = bars[-1]
-
-        # 检测桶切换: 上一桶已 finalize 时, 用上一桶的最终 OHLCV 驱动策略
         if self._last_cur is not None and self._last_cur["ts"] != cur["ts"]:
-            prev = self._last_cur  # 上一桶 finalize 后的快照
-            if prev.get("mark", 1) == 1:
-                price = float(prev["close"])
-                self.executor.update_price(price)
-                bar = {
-                    "ts": prev["ts"],
-                    "o": prev["open"], "h": prev["high"],
-                    "l": prev["low"], "c": prev["close"],
-                    "v": prev["volume"], "mark": 1,
-                }
-                self._state, sig_int = self.strategy.step(
-                    self._state, bar, self.strategy.params)
-                self.bucket_signals.append(int(sig_int))
-                if sig_int != 0:
-                    signal = {1: "BUY", -1: "SELL"}.get(sig_int)
-                    if signal:
-                        self.executor.trade(signal, price, prev["ts"])
-                else:
-                    signal = None
-                if self.verbose and signal:
-                    info = getattr(self.strategy, "_last_info", None)
-                    print(self.strategy.format_signal_line(prev["ts"], sig_int, info),
-                          flush=True)
-
-        self._last_cur = dict(cur)  # 深拷防 aggregator 复用 list
+            self._process_bucket(self._last_cur)
+        self._last_cur = cur
 
     def run(self):
         total = 0
@@ -85,39 +78,13 @@ class Engine:
                 total += 1
             self.aggregator.flush()
             # flush 后手动触发最后一个桶的信号 (flush 不产生"下一桶切换")
-            self._flush_final_bucket()
+            if self._last_cur is not None:
+                self._process_bucket(self._last_cur)
         except KeyboardInterrupt:
             print("\n已停止")
         if self.verbose:
             print(f"\n完成, 共处理 {total} 根 1m bar")
         return total
-
-    def _flush_final_bucket(self):
-        """flush 后: 最后一个桶 finalize, 用其 OHLCV 驱动策略一次"""
-        cur = self._last_cur
-        if cur is None:
-            return
-        if cur.get("mark", 1) != 1:
-            return
-        price = float(cur["close"])
-        self.executor.update_price(price)
-        bar = {
-            "ts": cur["ts"],
-            "o": cur["open"], "h": cur["high"],
-            "l": cur["low"], "c": cur["close"],
-            "v": cur["volume"], "mark": 1,
-        }
-        self._state, sig_int = self.strategy.step(
-            self._state, bar, self.strategy.params)
-        self.bucket_signals.append(int(sig_int))
-        if sig_int != 0:
-            signal = {1: "BUY", -1: "SELL"}.get(sig_int)
-            if signal:
-                self.executor.trade(signal, price, cur["ts"])
-        if self.verbose and sig_int != 0:
-            info = getattr(self.strategy, "_last_info", None)
-            print(self.strategy.format_signal_line(cur["ts"], sig_int, info),
-                  flush=True)
 
     def print_summary(self):
         """回测结束: 策略总资产 vs 不操作基线, 算盈亏"""
@@ -148,7 +115,7 @@ def build_engine(feed, *, period, warmup_until=None,
                  init_cash=INIT_CASH, init_position=INIT_POSITION,
                  trade_qty=TRADE_QTY, scale=1.0,
                  buy_pct=0.0, sell_pct=0.0, all_in=False,
-                 tf1: int = 21, verbose=False, executor=None,
+                 verbose=False, executor=None,
                  **legacy) -> Engine:
     """装配 Feed → Aggregator → Strategy → Executor → Engine
 
@@ -173,4 +140,4 @@ def build_engine(feed, *, period, warmup_until=None,
                       if isinstance(period, str) else period)
     aggregator = BarAggregator(period_seconds, on_bars=None,
                                warmup_until=warmup_until)
-    return Engine(feed, aggregator, strategy, executor, tf1=tf1, verbose=verbose)
+    return Engine(feed, aggregator, strategy, executor, verbose=verbose)

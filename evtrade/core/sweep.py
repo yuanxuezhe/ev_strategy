@@ -10,16 +10,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-# 引擎级 grid key (框架自带); 策略参数名由各策略 import 时通过
-# register_grid_keys() 注入
+# 引擎级 grid key (框架自带); 策略参数名由其 params_spec 自动允许
 GRID_KEYS = ("tf1", "period", "trade_qty", "scale",
              "buy_pct", "sell_pct", "all_in")
-_GRID_EXTRA_KEYS: set[str] = set()
-
-
-def register_grid_keys(keys: set[str]) -> None:
-    """新策略注册其允许的 grid key; sweep 解析时合并"""
-    _GRID_EXTRA_KEYS.update(keys)
 
 
 def parse_grid(specs: list, extra_keys: set[str] | None = None) -> list[dict]:
@@ -29,7 +22,7 @@ def parse_grid(specs: list, extra_keys: set[str] | None = None) -> list[dict]:
                  None 时只允许 GRID_KEYS 白名单; 传非空集合时扩展。
     """
     import itertools
-    allowed = set(GRID_KEYS) | set(extra_keys or set()) | _GRID_EXTRA_KEYS
+    allowed = set(GRID_KEYS) | set(extra_keys or set())
     axes = []
     for s in specs:
         name, _, values = str(s).partition("=")
@@ -241,63 +234,49 @@ def sweep(bars: dict, base: dict, combos: list[dict],
         merged = {**base_params, **nested, **{k: v for k, v in c.items() if k in spec}}
         return {k: v for k, v in merged.items() if k in spec}
 
-    new_combos = []
-    for c in combos:
-        new_c = dict(c)
-        new_c["params"] = _strategy_params(c)
-        new_combos.append(new_c)
-    combos = new_combos
+    # 把策略 spec 字段平铺到 combo 顶层 (避免下游 setdefault + del 二次处理)
+    combos = [{k: v for k, v in c.items() if k != "params"}
+              | _strategy_params(c)
+              for c in combos]
     params_list = [{**base, **c} for c in combos]
+
+    def _run_one(wb, p, warm):
+        return run_one_vectorized(
+            wb, p["period"], warm,
+            strategy_name=strategy_name,
+            strategy_params=p.get("params", {}),
+            init_cash=p["init_cash"],
+            init_position=p["init_position"],
+            trade_qty=p["trade_qty"],
+            scale=p.get("scale", 1.0),
+            buy_pct=p.get("buy_pct", 0.0),
+            sell_pct=p.get("sell_pct", 0.0),
+            device=device,
+        )
 
     t0 = time.perf_counter()
     metrics = [[None] * len(params_list) for _ in win_data]
     if n_workers and n_workers > 1:
+        from concurrent.futures import as_completed
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            futures = {}
-            for wi, (nm, wb, warm) in enumerate(win_data):
-                for ci, p in enumerate(params_list):
-                    fut = ex.submit(
-                        run_one_vectorized, wb, p["period"], warm,
-                        strategy_name=strategy_name,
-                        strategy_params=p.get("params", {}),
-                        init_cash=p["init_cash"],
-                        init_position=p["init_position"],
-                        trade_qty=p["trade_qty"],
-                        scale=p.get("scale", 1.0),
-                        buy_pct=p.get("buy_pct", 0.0),
-                        sell_pct=p.get("sell_pct", 0.0),
-                        device=device,
-                    )
-                    futures[fut] = (wi, ci)
-            from concurrent.futures import as_completed
+            futures = {
+                ex.submit(_run_one, wb, p, warm): (wi, ci)
+                for wi, (_, wb, warm) in enumerate(win_data)
+                for ci, p in enumerate(params_list)
+            }
             for fut in as_completed(futures):
                 wi, ci = futures[fut]
                 metrics[wi][ci] = fut.result()
     else:
-        for wi, (nm, wb, warm) in enumerate(win_data):
+        for wi, (_, wb, warm) in enumerate(win_data):
             for ci, p in enumerate(params_list):
-                metrics[wi][ci] = run_one_vectorized(
-                    wb, p["period"], warm,
-                    strategy_name=strategy_name,
-                    strategy_params=p.get("params", {}),
-                    init_cash=p["init_cash"],
-                    init_position=p["init_position"],
-                    trade_qty=p["trade_qty"],
-                    scale=p.get("scale", 1.0),
-                    buy_pct=p.get("buy_pct", 0.0),
-                    sell_pct=p.get("sell_pct", 0.0),
-                    device=device,
-                )
+                metrics[wi][ci] = _run_one(wb, p, warm)
     dt = time.perf_counter() - t0
 
     # ---- 行装配 ----
     rows = []
     for ci, combo in enumerate(combos):
         row = {**combo}
-        if "params" in row:
-            for k, v in row["params"].items():
-                row.setdefault(k, v)
-            del row["params"]
         for (nm, _, _), ms in zip(win_data, metrics):
             m = ms[ci]
             pre = "" if nm == "full" else f"{nm}_"

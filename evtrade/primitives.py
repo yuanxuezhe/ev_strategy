@@ -22,3 +22,8 @@ class Bar:
 
 def fmt(v):
     return f"{v:.4f}" if isinstance(v, (int, float)) else "----"
+
+
+def sig_to_side(sig: int) -> str:
+    """策略信号 int -> 字符串下单方向 (1=BUY, -1=SELL, 0=空)"""
+    return {1: "BUY", -1: "SELL"}.get(sig, "")

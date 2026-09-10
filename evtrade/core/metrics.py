@@ -1,12 +1,10 @@
 from __future__ import annotations
-"""绩效汇总与数据打包工具
+"""绩效汇总工具
 
 公开 API:
   bars_to_arrays       list[Bar] -> numpy dict (vectorized 引擎输入)
   summarize            终态 + equity 序列 -> 25 字段绩效字典
   trades_to_list       成交记录 -> list[dict] (规范化)
-  bucket_table         全轨迹 -> 每根周期K线表格 (framework 层, 无指标列)
-  bundle_per_bar       per-bar 数组 -> 通用契约 dict
 
 summarize 字段集 (25):
   终态 (5):     final_price / final_cash / final_position / final_equity / baseline
@@ -88,21 +86,33 @@ def _round_trip_stats(trades: list, bucket_seconds: int = 300) -> dict:
     return {"pnls": pnls, "hold_bars": hold_bars, "trade_pairs": len(pnls)}
 
 
-def _max_consecutive(pnls: list[float], kind: str) -> int:
-    """最长连续盈利/亏损笔数
-
-    kind: "win" (pnl > 0) 或 "loss" (pnl < 0)
-    """
+def _max_consecutive(pnls: list[float], positive: bool) -> int:
+    """最长连续盈利 (positive=True) / 亏损 (positive=False) 笔数"""
     best = 0
     cur = 0
-    cond = (lambda p: p > 0) if kind == "win" else (lambda p: p < 0)
     for p in pnls:
-        if cond(p):
+        if (positive and p > 0) or (not positive and p < 0):
             cur += 1
             best = max(best, cur)
         else:
             cur = 0
     return best
+
+
+def _max_drawdown_fraction(eq: np.ndarray) -> tuple[float, int, int]:
+    """策略/基准通用: (max_dd 小数, trough_idx, peak_idx)
+
+    返回: (max_drawdown=小数 [非负], trough_idx, peak_idx)
+    无回撤时返回 (0.0, -1, -1)。
+    """
+    running_peak = np.maximum.accumulate(eq)
+    safe_peak = np.where(running_peak > 0, running_peak, 1.0)
+    drawdown = (eq - running_peak) / safe_peak
+    if not (drawdown < 0.0).any():
+        return 0.0, -1, -1
+    trough_idx = int(np.argmin(drawdown))
+    peak_idx = int(np.argmax(eq[:trough_idx + 1]))
+    return float(-drawdown.min()), trough_idx, peak_idx
 
 
 def _max_drawdown_recovered(eq: np.ndarray, trough_idx: int) -> int:
@@ -151,7 +161,6 @@ def summarize(final_state: dict, init_cash: float, init_position: float,
                  / (365.25 * 86400.0))
 
     # 持仓行为 (不依赖 equity 序列; 即使 equity 为 None 也能算)
-    # 持仓行为 (不依赖 equity 序列; 即使 equity 为 None 也能算)
     pnls: list[float] = []
     hold_bars: list[int] = []
     if trades:
@@ -159,18 +168,26 @@ def summarize(final_state: dict, init_cash: float, init_position: float,
         pnls = stats["pnls"]
         hold_bars = stats["hold_bars"]
 
+    # 单遍聚合 pnls -> 胜/负统计
     n_pairs = len(pnls)
-    n_win = sum(1 for p in pnls if p > 0)
-    n_loss = sum(1 for p in pnls if p < 0)
-    total_win = sum(p for p in pnls if p > 0)
-    total_loss = sum(p for p in pnls if p < 0)
+    n_win = n_loss = 0
+    total_win = total_loss = 0.0
+    sum_pnl = 0.0
+    for p in pnls:
+        if p > 0:
+            n_win += 1
+            total_win += p
+        elif p < 0:
+            n_loss += 1
+            total_loss += p
+        sum_pnl += p
 
     win_rate = (n_win / n_pairs) if n_pairs > 0 else 0.0
     profit_factor = (total_win / abs(total_loss)) if total_loss < 0 else (
         math.inf if total_win > 0 else 0.0)
-    avg_pnl = (sum(pnls) / n_pairs) if n_pairs > 0 else 0.0
-    max_consec_wins = _max_consecutive(pnls, "win")
-    max_consec_losses = _max_consecutive(pnls, "loss")
+    avg_pnl = (sum_pnl / n_pairs) if n_pairs > 0 else 0.0
+    max_consec_wins = _max_consecutive(pnls, positive=True)
+    max_consec_losses = _max_consecutive(pnls, positive=False)
     avg_hold_bars = (sum(hold_bars) / len(hold_bars)) if hold_bars else 0.0
     max_hold_bars = max(hold_bars) if hold_bars else 0
 
@@ -185,48 +202,32 @@ def summarize(final_state: dict, init_cash: float, init_position: float,
     max_drawdown = 0.0
     baseline_max_dd = 0.0
     cagr_excess = 0.0
-    x_mdd = 0.0  # 累计超额曲线回撤
+    x_mdd = 0.0
 
     if equity_curve is not None and len(equity_curve) >= 2:
         eq = np.asarray(equity_curve, dtype=np.float64)
         bl = (np.asarray(baseline_curve, dtype=np.float64)
               if baseline_curve is not None else None)
 
-        # === 1. max_drawdown (策略; 占当时 peak 的小数) ===
-        running_peak = np.maximum.accumulate(eq)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            drawdown = np.where(running_peak > 0,
-                                (eq - running_peak) / running_peak,
-                                0.0)
-        is_dd = drawdown < 0.0
-        if is_dd.any():
-            trough_idx = int(np.argmin(drawdown))
-            max_drawdown = float(-drawdown.min())
+        # 1. 策略回撤
+        max_drawdown, trough_idx, peak_idx = _max_drawdown_fraction(eq)
+        if trough_idx >= 0:
             max_dd_recovered = _max_drawdown_recovered(eq, trough_idx)
-            peak_idx = int(np.argmax(eq[:trough_idx + 1]))
             if years > 0:
-                n_dd_bars = trough_idx - peak_idx
                 bars_per_day = len(eq) / (years * 365.25)
                 if bars_per_day > 0:
-                    max_dd_days = n_dd_bars / bars_per_day
+                    max_dd_days = (trough_idx - peak_idx) / bars_per_day
 
-        # === 2. baseline_max_dd (单位与 max_drawdown 同式) ===
+        # 2. 基准回撤
         if bl is not None and len(bl) == len(eq):
-            bl_peak = np.maximum.accumulate(bl)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                bl_dd = np.where(bl_peak > 0,
-                                 (bl - bl_peak) / bl_peak,
-                                 0.0)
-            if (bl_dd < 0.0).any():
-                baseline_max_dd = float(-bl_dd.min())
+            baseline_max_dd, _, _ = _max_drawdown_fraction(bl)
 
-        # === 3. CAGR ===
+        # 3. CAGR
         if eq[0] > 0 and years > 0:
             safe_years = max(years, 1e-9)
-            cagr = (eq[-1] / eq[0]) ** (1.0 / safe_years) - 1.0
-            cagr *= 100.0
+            cagr = ((eq[-1] / eq[0]) ** (1.0 / safe_years) - 1.0) * 100.0
 
-        # === 4. Sharpe / Sortino / IR / Calmar (基于超额收益率) ===
+        # 4. Sharpe / Sortino / IR / Calmar (基于超额收益率)
         if bl is not None and len(bl) == len(eq) and bl[0] > 0 and years > 0:
             rets_eq = np.diff(eq) / eq[:-1]
             rets_bl = np.diff(bl) / bl[:-1]
@@ -240,22 +241,19 @@ def summarize(final_state: dict, init_cash: float, init_position: float,
                 std_ex = float(np.std(excess_rets, ddof=1))
                 downside = excess_rets[excess_rets < 0.0]
                 bars_per_year = len(excess_rets) / years
-                # x_mdd: 累计超额曲线最大回撤 (占初始 baseline 的小数)
                 cum_ex_arr = np.cumsum(excess_rets)
                 ex_peak = np.maximum.accumulate(cum_ex_arr)
                 x_mdd = float((ex_peak - cum_ex_arr).max()) if len(cum_ex_arr) else 0.0
                 if std_ex > 0.0:
                     sharpe_excess = (mean_ex / std_ex
                                      * (bars_per_year ** 0.5) * 100.0)
-                    # IR = 年化超额 / 年化跟踪误差; rf=0 时数值上 ≡ sharpe_excess
-                    ir = sharpe_excess
+                    ir = sharpe_excess  # rf=0 时 IR ≡ sharpe_excess
                 if len(downside) > 0:
                     down_std = float(np.sqrt(np.mean(downside ** 2)))
                     if down_std > 0.0:
                         sortino_excess = (mean_ex / down_std
                                           * (bars_per_year ** 0.5) * 100.0)
 
-            # Calmar = cagr(%) / max_dd(小数); 同单位相除
             if max_drawdown > 0:
                 calmar = (cagr / 100.0) / max_drawdown
 
@@ -316,45 +314,3 @@ def trades_to_list(trades: list) -> list[dict]:
         out.append({"ts": int(ts), "side": "BUY" if side_int == 1 else "SELL",
                     "qty": float(qty), "price": float(price)})
     return out
-
-
-def bucket_table(stime: np.ndarray, sig: np.ndarray,
-                 ts_out, o_out, h_out, l_out, c_out, v_out) -> dict:
-    """从全轨迹构建"每根周期K线"表格 (纯 numpy 向量化, framework 层)。
-
-    每行 = 一个周期桶在闭合时点的状态: ts/open/high/low/close/volume/count/sig/n_sig。
-    框架只输出行情 + 信号轨迹; 指标列由策略 hook 拼接。
-    """
-    n = len(ts_out)
-    new_bucket = np.r_[True, ts_out[1:] != ts_out[:-1]]
-    first_idx = np.flatnonzero(new_bucket)
-    last_idx = np.flatnonzero(np.r_[new_bucket[1:], True])
-    count = np.diff(np.r_[first_idx, n])
-    n_sig = np.add.reduceat(np.abs(sig).astype(np.int64), first_idx)
-
-    return {
-        "ts": ts_out[last_idx],
-        "open": o_out[last_idx],
-        "high": h_out[last_idx],
-        "low": l_out[last_idx],
-        "close": c_out[last_idx],
-        "volume": v_out[last_idx],
-        "count": count,
-        "sig": sig[last_idx],
-        "n_sig": n_sig,
-    }
-
-
-def bundle_per_bar(sig, ts_arr, o_arr, h_arr, l_arr, c_arr, v_arr) -> dict:
-    """把 per-bar 数组打包为通用契约 dict
-
-    返回: {"sig": ..., "per_bar": {"ts", "o", "h", "l", "c", "v"}}
-    (框架层不出现指标键; 策略 hook 按需从 per_bar 取值算指标)
-    """
-    return {
-        "sig": sig,
-        "per_bar": {
-            "ts": ts_arr, "o": o_arr, "h": h_arr,
-            "l": l_arr, "c": c_arr, "v": v_arr,
-        },
-    }

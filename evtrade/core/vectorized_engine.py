@@ -1,5 +1,5 @@
 from __future__ import annotations
-"""向量化引擎 (PyTorch 后端 + numpy 中间表示)
+"""向量化引擎 (numpy 向量化桶聚合 + strategy-step-only 信号循环)
 
 引擎职责:
   - 桶聚合 (numpy 向量化, 任意 m/h/d 周期)
@@ -20,17 +20,14 @@ from .timeutils import resolve_period_seconds
 
 # ============ 桶聚合 (numpy 向量化) ============
 
-def _aggregate_buckets_xp(xp, bars_1m: dict, period: str, warmup_until: int) -> dict:
+def _aggregate_buckets(bars_1m: dict, period: str, warmup_until: int) -> dict:
     """1m bar 数组 -> 周期桶聚合数组
 
     返回: {"ts", "o", "h", "l", "c", "v", "mark", "n_bars"}
     每行 = 一个闭合桶的最终 OHLCV + 含 1m 根数 + mark。
-
-    xp 参数保留兼容旧测试; 实际只走 numpy。
     """
     stime = bars_1m["stime"]
-    ts_1m_np, mark_1m_np = precompute_ts_mark(
-        {"stime": stime}, period, warmup_until)
+    ts_1m_np, mark_1m_np = precompute_ts_mark({"stime": stime}, period, warmup_until)
     ts_1m = np.asarray(ts_1m_np)
     mark_1m = np.asarray(mark_1m_np)
 
@@ -48,10 +45,10 @@ def _aggregate_buckets_xp(xp, bars_1m: dict, period: str, warmup_until: int) -> 
 
     ts_b = ts_1m[first_idx]
     o_b = o_1m[first_idx]
-    h_b = _reduceat_max(h_1m, first_idx)
-    l_b = _reduceat_min(l_1m, first_idx)
+    h_b = np.maximum.reduceat(h_1m, first_idx)
+    l_b = np.minimum.reduceat(l_1m, first_idx)
     c_b = c_1m[last_idx]
-    v_b = _reduceat_sum(v_1m, first_idx)
+    v_b = np.add.reduceat(v_1m, first_idx)
     n_bars = np.diff(np.concatenate([first_idx, np.array([n], dtype=first_idx.dtype)]))
 
     # mark 取桶首根 1m bar 的标记 (与 Engine.on_bars 仅在桶首触发语义对齐)
@@ -59,45 +56,6 @@ def _aggregate_buckets_xp(xp, bars_1m: dict, period: str, warmup_until: int) -> 
 
     return {"ts": ts_b, "o": o_b, "h": h_b, "l": l_b, "c": c_b, "v": v_b,
             "mark": mark_b, "n_bars": n_bars}
-
-
-def _aggregate_buckets(bars_1m: dict, period: str, warmup_until: int) -> dict:
-    """1m bar 数组 -> 周期桶聚合数组 (numpy 向量化)"""
-    return _aggregate_buckets_xp(None, bars_1m, period, warmup_until)
-
-
-def _reduceat_max(a, indices):
-    """分段 max (numpy reduceat 等价)"""
-    if len(indices) == 0:
-        return np.empty(0, dtype=a.dtype)
-    out = np.empty(len(indices), dtype=a.dtype)
-    for i in range(len(indices)):
-        s = indices[i]
-        e = indices[i + 1] if i + 1 < len(indices) else len(a)
-        out[i] = a[s:e].max()
-    return out
-
-
-def _reduceat_min(a, indices):
-    if len(indices) == 0:
-        return np.empty(0, dtype=a.dtype)
-    out = np.empty(len(indices), dtype=a.dtype)
-    for i in range(len(indices)):
-        s = indices[i]
-        e = indices[i + 1] if i + 1 < len(indices) else len(a)
-        out[i] = a[s:e].min()
-    return out
-
-
-def _reduceat_sum(a, indices):
-    if len(indices) == 0:
-        return np.empty(0, dtype=a.dtype)
-    out = np.empty(len(indices), dtype=a.dtype)
-    for i in range(len(indices)):
-        s = indices[i]
-        e = indices[i + 1] if i + 1 < len(indices) else len(a)
-        out[i] = a[s:e].sum()
-    return out
 
 
 # ============ 成交执行 (顺序; 与 SimulatedExecutor 同语义) ============
@@ -215,6 +173,8 @@ def _compute_signals(strategy, params: dict, buckets: dict) -> np.ndarray:
 
     sig = sig * mark_np.astype(np.int8)
     return sig
+
+
 
 
 # ============ 汇总 (metrics.summarize 25 字段) ============
