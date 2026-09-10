@@ -156,6 +156,10 @@ def build_backtest_parser() -> argparse.ArgumentParser:
                     help="同 --show-bars 内容输出 CSV")
     ap.add_argument("--signals-out", default=None,
                     help="信号轨迹 CSV (ts,sig,策略额外列)")
+    ap.add_argument("--init-cash", type=float, default=INIT_CASH,
+                    help="期初资金 (默认 20万); 传 0 忽略, 走零起点")
+    ap.add_argument("--init-position", type=float, default=INIT_POSITION,
+                    help="期初持仓股数 (默认 20万); 传 0 忽略, 走零起点")
     # --- 兼容层: --engine 已下线 (DSL/numba 已删除); 仅打 DeprecationWarning + 自动映射 device ---
     ap.add_argument("--engine", default=None, choices=["kernel", "ref", "vectorized"],
                     help=argparse.SUPPRESS)
@@ -208,7 +212,7 @@ def _run_backtest(args):
     result = run_vectorized(
         bars, period=args.period, warmup_until=int(args.start) * 1_000_000,
         strategy=strategy, params=strategy.params,
-        init_cash=INIT_CASH, init_position=INIT_POSITION,
+        init_cash=args.init_cash, init_position=args.init_position,
         trade_qty=args.trade_qty, scale=args.scale,
         buy_pct=buy_pct, sell_pct=sell_pct,
         device=args.device)
@@ -221,7 +225,7 @@ def _run_backtest(args):
               f"[{t['ts']}]  剩余资金 {t['cash_after']:.2f}", flush=True)
 
     print("\n" + "=" * 60)
-    print("回测盈亏汇总 (vectorized)")
+    print("回测盈亏汇总 (vectorized) [25 字段]")
     print("=" * 60)
     print(f"期末价 (最后一根close) : {s['final_price']:.4f}")
     print(f"交易次数              : {s['n_trades']} (BUY {s['n_buy']} / SELL {s['n_sell']})")
@@ -230,15 +234,30 @@ def _run_backtest(args):
     print(f"期末持仓市值           : {s['final_position'] * s['final_price']:.2f}")
     print(f"策略总资产 (资金+市值) : {s['final_equity']:.2f}")
     print(f"不操作基线 (资金+市值) : {s['baseline']:.2f}")
-    print(f"盈亏差额 (策略-基线)   : {s['excess']:+.2f}")
     print(f"盈亏比例              : {s['excess_pct']:+.2f}%")
-    print(f"年化超额 (择时贡献)   : {s['ann_excess_pct']:+.2f}%/年")
+    print("-" * 60)
+    print(f"跨度 years            : {s['years']:.3f}")
     print(f"年化复合 CAGR         : {s['cagr']:+.2f}%/年")
-    print(f"超额 Sharpe           : {s['sharpe_excess']:+.3f}")
+    print(f"年化超额 CAGR (复合)   : {s['cagr_excess']:+.2f}%/年")
+    print(f"超额 Sharpe / IR      : {s['sharpe_excess']:+.3f} / {s['ir']:+.3f}")
     print(f"超额 Sortino          : {s['sortino_excess']:+.3f}")
     print(f"Calmar (年化/回撤)    : {s['calmar']:+.3f}")
-    print(f"最大回撤 (逐bar盯市)   : {s['max_drawdown']:+.2%}")  # 小数 -> % (unify-metrics-units)
+    print("-" * 60)
+    print(f"最大回撤 (策略)        : {s['max_drawdown']:+.2%}")
+    print(f"最大回撤 (基准)        : {s['baseline_max_dd']:+.2%}")
+    print(f"回撤差 (策略-基准)     : {s['dd_excess']:+.2%}  (正值=策略比基准更深)")
     print(f"最大回撤持续天数       : {s['max_dd_days']:.1f} 天")
+    # max_dd_recovered: -1 sentinel 表示从未恢复
+    dd_recovered = "未恢复" if s['max_dd_recovered'] == -1 else f"{s['max_dd_recovered']} 桶"
+    print(f"最大回撤恢复 (trough→) : {dd_recovered}")
+    print("-" * 60)
+    # 持仓行为: 仅在有成交时打印关键值
+    pf_str = "inf" if s['profit_factor'] == float('inf') else f"{s['profit_factor']:.2f}"
+    print(f"胜率 / 盈亏比         : {s['win_rate']:.1%} / {pf_str}")
+    print(f"平均每笔 PnL          : {s['avg_pnl']:+.2f}")
+    print(f"最大连盈 / 连亏笔数   : {s['max_consecutive_wins']} / {s['max_consecutive_losses']}")
+    print(f"平均 / 最大持仓周期    : {s['avg_hold_bars']:.1f} / {s['max_hold_bars']} 桶")
+    print("-" * 60)
     print(f"成交额合计            : {s['turnover']:.0f}")
     print(f"引擎耗时              : {dt * 1000:.1f} ms ({n} 根 1m bar, {args.device})")
     print("=" * 60)

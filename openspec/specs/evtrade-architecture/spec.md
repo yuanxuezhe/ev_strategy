@@ -161,31 +161,59 @@ Engine MUST 是唯一装配点：构造时把 `aggregator.on_bars` 覆写为自�
 
 ### Requirement: metrics.summary covers full field shape
 
-`evtrade.core.metrics.summarize` MUST 返回以下字段（缺一即视为 broken）：`final_price / n_trades / n_buy / n_sell / final_cash / final_position / final_equity / baseline / excess / excess_pct / years / ann_excess_pct / cagr / sharpe_excess / sortino_excess / calmar / max_dd_days / max_dd_recovered / x_mdd / max_drawdown / turnover`。`run_vectorized` MUST 累积 `equity_curve`（cash + position * close_to_now）与 `baseline_curve`（期初 init_position * close_to_now + init_cash），末尾调 `metrics.summarize` 输出。`sweep` 评分函数 MUST 不再依赖占位 0.0（所有 Sharpe / Sortino / Calmar / CAGR / max_dd_days 字段由 `metrics.summarize` 实算）。
+`evtrade.core.metrics.summarize` MUST 返回 25 字段（缺一即视为 broken）：
 
-字段单位 MUST 统一为下表约定（unify-metrics-units, 2026-09-09）：
+**终态字段**（5）：`final_price / final_cash / final_position / final_equity / baseline`
+
+**交易字段**（5）：`n_trades / n_buy / n_sell / turnover / excess_pct`
+
+**时间字段**（2）：`years / cagr_excess`（注：`ann_excess_pct` 已重命名为 `cagr_excess`，口径改为复合年化与 `cagr` 对齐）
+
+**风险调整字段**（5）：`cagr / sharpe_excess / sortino_excess / calmar / ir`
+
+**回撤字段**（3）：`max_drawdown / max_dd_days / max_dd_recovered`
+- `max_drawdown` 单一真源：基于 `equity_curve` 由 metrics 算出，不再依赖 caller
+  传入的 `final_state["max_drawdown"]`（删除 `x_mdd` 重复字段）
+- `max_dd_recovered` 语义：**trough 到首个恢复 ≥ 前高**的 bar 数；未恢复时 MUST
+  返回 `-1`（sentinel，区分"恢复用了 N bar"和"从未恢复"）
+
+**持仓行为字段**（5）：`win_rate / profit_factor / avg_pnl / max_consecutive_wins / max_consecutive_losses / avg_hold_bars / max_hold_bars`（注：7 字段，但 trade-derived 与 hold-derived 并列）
+
+**基准对比字段**（2）：`baseline_max_dd / dd_excess`（`dd_excess = max_drawdown - baseline_max_dd`，正值=策略比基准回撤更深）
+
+`run_vectorized` MUST 累积 `equity_curve`（cash + position * close_to_now）与 `baseline_curve`（init_cash + init_position * close_to_now），末尾调 `metrics.summarize` 输出。`sweep` 评分函数 MUST 不再依赖占位 0.0（所有 Sharpe / Sortino / Calmar / CAGR / max_dd_days / IR 字段由 `metrics.summarize` 实算）。
+
+#### Scenario: vectorized summary 25 字段齐全
+
+字段单位 MUST 统一为下表约定（unify-metrics-units, 2026-09-09；extend-metrics, 2026-09-10 扩展字段集 16 → 25）：
 
 | 字段 | 单位 | 说明 |
 |---|---|---|
 | `cagr` | 百分数 (%) | `(eq[-1]/eq[0])^(1/years) - 1` 后 ×100 |
+| `cagr_excess` | 百分数 (%) | `(eq/bl 累计比例)^(1/years) - 1` 后 ×100；与 cagr 同口径 |
 | `max_drawdown` | **占当时 peak 的小数** (0.0~1.0+) | `max(0, peak - trough) / peak`；业界惯例 (Tradestation / PT) |
-| `x_mdd` | **累计超额回撤小数** | 累计超额曲线同样的归一化 |
-| `sharpe_excess` / `sortino_excess` | 年化（无量纲） | `mean(excess_rets) / std(excess_rets) * sqrt(bars_per_year)` |
+| `baseline_max_dd` | 占当时 peak 的小数 | 买入持有曲线同算法 |
+| `dd_excess` | 小数 | `max_drawdown - baseline_max_dd`；正值=策略比基准回撤更深 |
+| `sharpe_excess` / `sortino_excess` / `ir` | 年化（无量纲） | `mean(excess_rets) / std(excess_rets) * sqrt(bars_per_year)` |
 | `calmar` | **无量纲**（比率） | `cagr(小数) / max_drawdown(小数)` = `(cagr/100) / max_drawdown` |
 | `max_dd_days` | 自然日 | `n_dd_bars / bars_per_day` |
-| `max_dd_recovered` | bar 数 | 触底到末尾 bar 数 |
-| `final_equity` / `baseline` / `excess` | 金额（元） | `cash + position * last_price` |
+| `max_dd_recovered` | bar 数 | trough → 首个恢复 ≥ 前高 的 bar 数；**未恢复时 MUST = -1** |
+| `win_rate` / `profit_factor` / `avg_pnl` / `max_consecutive_wins` / `max_consecutive_losses` | 比率 / 比值 / 金额 / 笔数 | BUY→SELL 配对统计 |
+| `avg_hold_bars` / `max_hold_bars` | 桶数 | `encoded_to_epoch` 差分 → 秒数 → 桶数 |
+| `final_equity` / `baseline` | 金额（元） | `cash + position * last_price` |
 | `final_price` | 价格（元） | 最后一根 close |
 | `final_cash` / `turnover` | 金额（元） | |
 | `final_position` | 股数 | |
-| `excess_pct` / `ann_excess_pct` | 百分数 (%) | `(equity - baseline) / baseline * 100` |
+| `excess_pct` | 百分数 (%) | `(equity - baseline) / baseline * 100` |
 | `years` | 年 | `(last_ts - first_ts) / (365.25 * 86400)` |
 
-CLI 打印 MUST 与字段单位一致：`max_drawdown` / `cagr` / `excess_pct` / `ann_excess_pct` MUST 用 `:.2%`；`final_equity` / `baseline` / `excess` / `final_cash` / `turnover` MUST 用 `:.2f`；`max_dd_days` MUST 用 `:.1f` + " 天" 后缀；`calmar` MUST 用 `:.3f`（无量纲）。CLI 打印行 MUST NOT 出现"金额元"字段被 `:.2%` 格式化的输出。
+CLI 打印 MUST 与字段单位一致：`max_drawdown` / `baseline_max_dd` / `dd_excess` / `cagr` / `cagr_excess` / `excess_pct` / `win_rate` MUST 用 `:.2%`；`final_equity` / `baseline` / `final_cash` / `turnover` / `avg_pnl` MUST 用 `:.2f`；`max_dd_days` MUST 用 `:.1f` + " 天" 后缀；`calmar` / `sharpe_excess` / `sortino_excess` / `ir` MUST 用 `:.3f`（无量纲）。CLI 打印行 MUST NOT 出现"金额元"字段被 `:.2%` 格式化的输出。
+
+`x_mdd` 字段已删除（与 `max_drawdown` 重复）；`ann_excess_pct` 已重命名为 `cagr_excess`（口径改为复合年化）。
 
 #### Scenario: vectorized summary 字段齐
 - **WHEN** `run_vectorized(...)` 返回 `result["summary"]`
-- **THEN** dict keys MUST 包含上述字段；数值 MUST 非 NaN（无数据时填 0.0）
+- **THEN** dict keys MUST 包含上述全部 25 字段；数值 MUST 非 NaN（无数据时填 0.0；profit_factor 无亏损时填 `inf`；max_dd_recovered 未恢复时填 `-1`）
 
 #### Scenario: sweep 评分不再依赖占位
 - **WHEN** `sweep.run_one_vectorized(...)` 返回 metrics dict
@@ -205,21 +233,45 @@ CLI 打印 MUST 与字段单位一致：`max_drawdown` / `cagr` / `excess_pct` /
 - **THEN** `最大回撤` 行 MUST 输出合理量级的百分比（如 `-12.34%` 量级），MUST NOT 输出 `1.5e7%`
 - **AND** `Calmar` 行 MUST 输出无量纲数字（如 `+0.500`），MUST NOT 输出带 `%` 后缀或与 mdd 量级挂钩
 
+#### Scenario: max_dd_recovered sentinel
+- **WHEN** equity 序列存在最大回撤且**已恢复**（trough 后存在某 bar 使 equity ≥ 前高）
+- **THEN** `max_dd_recovered` MUST 等于 (recovery_idx - trough_idx)，单位 bar
+- **WHEN** 存在最大回撤但**从未恢复**（trough 后 equity 始终 < 前高）
+- **THEN** `max_dd_recovered` MUST 等于 -1（sentinel，区别于"恢复用了 N bar"）
+
+#### Scenario: 持仓周期从 BUY→SELL 配对计算
+- **WHEN** trades 序列已知
+- **THEN** `avg_hold_bars / max_hold_bars` MUST 基于相邻 BUY/SELL 配对的 (sell_ts - buy_ts) 桶数计算；未配对的开仓/平仓忽略
+
 ### Requirement: metrics field units are normalized
 
-`metrics.summarize` / `vectorized_engine._execute_trades` / `cli.py` / `sweep.py` MUST 在**单位约定**上保持一致：所有下游消费者（CLI 打印、sweep 过滤、回归测试） MUST 假设上述单位表。任何"金额元"与"百分比"混用 MUST 视为 broken，由 `tests/test_metrics_units.py` 锁定。`sweep --max-mdd` 默认 1.0 MUST 含义为"100% 回撤 = 不限"；实盘建议 `0.15` 现在能真正生效（默认 `1.0` 永远过；`0.15` 拒回撤 > 15% 的策略）。
+`metrics.summarize` / `vectorized_engine._execute_trades` / `cli.py` / `sweep.py` MUST 在**单位约定**上保持一致：所有下游消费者（CLI 打印、sweep 过滤、回归测试） MUST 假设上述单位表。任何"金额元"与"百分比"混用 MUST 视为 broken，由 `tests/test_metrics_units.py` + `tests/test_metrics_v3.py` 锁定。`sweep --max-mdd` 默认 1.0 MUST 含义为"100% 回撤 = 不限"；实盘建议 `0.15` 现在能真正生效（默认 `1.0` 永远过；`0.15` 拒回撤 > 15% 的策略）。
 
 #### Scenario: sweep filter_pass 跨单位对齐
 - **WHEN** `sweep.run(...)` 跑出某组参数 `max_drawdown=0.18` 且 `--max-mdd=0.15`
 - **THEN** 该参数 MUST NOT 出现在 `filter_pass=True` 行（MUST 被 18% > 15% 拒掉）
 
-#### Scenario: vectorized summary 字段齐
-- **WHEN** `run_vectorized(...)` 返回 `result["summary"]`
-- **THEN** dict keys MUST 包含上述字段；数值 MUST 非 NaN（无数据时填 0.0）
-
 #### Scenario: sweep 评分不再依赖占位
+
 - **WHEN** `sweep.run_one_vectorized(...)` 返回 metrics dict
-- **THEN** `sharpe_excess / sortino_excess / calmar / cagr / max_dd_days` MUST 由 equity 序列实算（非默认 0.0）
+- **THEN** `sharpe_excess / sortino_excess / calmar / cagr / max_dd_days / ir / baseline_max_dd` MUST 由 equity 序列实算（非默认 0.0）
+
+#### Scenario: max_dd_recovered 三档语义
+
+- **WHEN** equity 序列存在最大回撤且**已恢复**（trough 后存在某 bar 使 equity ≥ 前高）
+- **THEN** `max_dd_recovered` MUST 等于 (recovery_idx - trough_idx)，单位 bar
+- **WHEN** 存在最大回撤但**从未恢复**（trough 后 equity 始终 < 前高）
+- **THEN** `max_dd_recovered` MUST 等于 -1（sentinel，区别于"恢复用了 N bar"）
+
+#### Scenario: x_mdd 字段已删除
+
+- **WHEN** 调用 `metrics.summarize(...)` 返回 dict
+- **THEN** MUST NOT 含 `x_mdd` key（与 `max_drawdown` 重复）
+
+#### Scenario: 持仓周期从 BUY→SELL 配对计算
+
+- **WHEN** trades 序列已知
+- **THEN** `avg_hold_bars / max_hold_bars` MUST 基于相邻 BUY/SELL 配对的 (sell_ts - buy_ts) 桶数计算；未配对的开仓/平仓忽略
 
 ### Requirement: CLI surface = `--device {cpu, gpu, auto}`
 

@@ -20,6 +20,7 @@ import numpy as np
 from ..backends import get_xp
 from .gpu import precompute_ts_mark
 from .metrics import summarize as _summarize_full
+from .timeutils import resolve_period_seconds
 
 
 # ============ helpers ============
@@ -237,11 +238,11 @@ def _compute_signals_xp(strategy, params: dict, buckets: dict) -> np.ndarray:
     return sig
 
 
-# ============ 汇总 (metrics.summarize 16 字段) ============
+# ============ 汇总 (metrics.summarize 25 字段) ============
 
 def _summarize(exec_state: dict, init_cash: float, init_position: float,
-               first_ts: int, last_ts: int) -> dict:
-    """终态 + equity 序列 -> 绩效字典 (16 字段, 由 metrics.summarize 算)"""
+               first_ts: int, last_ts: int, bucket_seconds: int = 300) -> dict:
+    """终态 + equity 序列 -> 绩效字典 (25 字段, 由 metrics.summarize 算)"""
     eq = exec_state.get("equity_curve")
     bl = exec_state.get("baseline_curve")
     last_price = exec_state.get("last_price", 0.0)
@@ -257,7 +258,6 @@ def _summarize(exec_state: dict, init_cash: float, init_position: float,
             "n_buy": exec_state["n_buy"],
             "n_sell": exec_state["n_sell"],
             "turnover": exec_state["turnover"],
-            "max_drawdown": exec_state.get("max_drawdown", 0.0),
         },
         init_cash=init_cash,
         init_position=init_position,
@@ -265,6 +265,8 @@ def _summarize(exec_state: dict, init_cash: float, init_position: float,
         baseline_curve=bl,
         first_ts=first_ts,
         last_ts=last_ts,
+        trades=exec_state["trades"],
+        bucket_seconds=bucket_seconds,
     )
     summary["trades"] = exec_state["trades"]
     return summary
@@ -297,9 +299,10 @@ def run_vectorized(bars_1m: dict, period: str, warmup_until: int,
     # 3) 成交 (host 顺序执行; 正确性优先)
     close_np = _to_host(buckets["c"])
     ts_np = _to_host(buckets["ts"])
+    mark_np = _to_host(buckets["mark"])
 
     # 首末策略期 ts (年化用)
-    strat_mask = _to_host(buckets["mark"]) == 1
+    strat_mask = mark_np == 1
     first_ts = int(ts_np[strat_mask][0]) if strat_mask.any() else 0
     last_ts = int(ts_np[strat_mask][-1]) if strat_mask.any() else 0
 
@@ -307,10 +310,11 @@ def run_vectorized(bars_1m: dict, period: str, warmup_until: int,
         sig_np, close_np, ts_np, init_cash, init_position, trade_qty,
         scale, buy_pct, sell_pct)
 
-    summary = _summarize(exec_state, init_cash, init_position, first_ts, last_ts)
+    bucket_seconds = resolve_period_seconds(period)
+    summary = _summarize(exec_state, init_cash, init_position,
+                          first_ts, last_ts, bucket_seconds=bucket_seconds)
 
     # sig 只保留 mark=1 的桶 (与 Engine.bucket_signals 同形: 预热段不进 sig)
-    mark_np = _to_host(buckets["mark"])
     sig_live = sig_np[mark_np == 1]
 
     return {"sig": sig_live, "trades": exec_state["trades"],

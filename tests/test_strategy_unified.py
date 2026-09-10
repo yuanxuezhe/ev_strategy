@@ -147,23 +147,34 @@ def test_vectorized_vs_engine_on_bars_reconcile():
         f"成交笔数差异过大 vectorized={len(trades_v)} engine={len(trades_r)}"
 
 
-def test_metrics_summary_has_16_fields():
-    """run_vectorized.summary 必须含 cagr/sharpe_excess/sortino_excess/calmar/
-    max_dd_days/max_dd_recovered/x_mdd/max_drawdown 等 16+ 字段"""
+def test_metrics_summary_has_26_fields():
+    """run_vectorized.summary 必须含 26 字段 (25 + x_mdd)"""
     strat = evtrade.get_strategy("ma_crossover", fast=5, slow=20)
     out = run_vectorized(_make_bars(n=300), "5m", warmup_until=0,
                          strategy=strat, params=strat.params, device="cpu")
     s = out["summary"]
     required = {
-        "final_price", "final_cash", "final_position", "final_equity",
-        "baseline", "excess", "excess_pct", "years",
-        "n_trades", "n_buy", "n_sell", "turnover",
-        "cagr", "sharpe_excess", "sortino_excess", "calmar",
-        "max_dd_days", "max_dd_recovered", "x_mdd", "max_drawdown",
+        # 终态 (5)
+        "final_price", "final_cash", "final_position", "final_equity", "baseline",
+        # 交易 (5)
+        "n_trades", "n_buy", "n_sell", "turnover", "excess_pct",
+        # 时间 (2)
+        "years", "cagr_excess",
+        # 风险调整 (5)
+        "cagr", "sharpe_excess", "sortino_excess", "calmar", "ir",
+        # 回撤 (4, 含 unify-units 保留的 x_mdd)
+        "max_drawdown", "max_dd_days", "max_dd_recovered", "x_mdd",
+        # 持仓行为 (7)
+        "win_rate", "profit_factor", "avg_pnl",
+        "max_consecutive_wins", "max_consecutive_losses",
+        "avg_hold_bars", "max_hold_bars",
+        # 基准对比 (2)
+        "baseline_max_dd", "dd_excess",
     }
     missing = required - set(s.keys())
     assert not missing, f"summary 缺字段: {sorted(missing)}"
-    assert s["years"] > 0 or s["n_trades"] == 0  # 退化场景下 years 可为 0
+    assert "ann_excess_pct" not in s  # 已重命名为 cagr_excess
+    assert s["years"] > 0 or s["n_trades"] == 0
 
 
 # ============ strategy-step-only 新增锁定 ============
