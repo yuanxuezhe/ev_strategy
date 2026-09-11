@@ -11,6 +11,7 @@
 当前已注册:
   - channel_deviation    通道偏离回撤 (stateful step + EMA 通道 + FSM)
   - ma_crossover         双均线交叉 (stateful step)
+  - filtered_mr          4 重过滤均值回归 (大周期顺势 + ADX + ATR + close FSM, 不 batched)
 
 用法 (唯一策略契约 step(state, bar, params) -> (state, sig)):
   from evtrade.strategies import get_strategy
@@ -27,6 +28,7 @@ from .vectorized_base import (
 )
 from . import channel_deviation  # noqa: F401  注册 channel_deviation
 from . import ma_crossover       # noqa: F401  注册 ma_crossover
+from . import filtered_mr        # noqa: F401  注册 filtered_mr
 
 __all__ = [
     "VectorizedStrategy",
