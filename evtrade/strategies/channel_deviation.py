@@ -113,6 +113,11 @@ class ChannelDeviationStrategy(VectorizedStrategy):
 
     def step(self, state: ChannelDeviationState, bar: dict, params: dict
              ) -> tuple[ChannelDeviationState, int]:
+        # 注: 与 ma_crossover 不同, 预热段 (mark==0) 整段跳过 (EMA 也不累积)
+        # -- 因 vectorized 桶首 mark 与 Engine 桶末 mark 在预热边界桶可能不一致
+        # (vectorized._aggregate_buckets 取首根, BarAggregator 取末根), 让 EMA 在
+        # mark=0 也推会暴露两侧 signal 不对齐 (bucket_diff_cap=8 容忍不了);
+        # 见 KB 09 §"bucket mark 取值" 备注。若要解决, 先统一两侧 mark 取值约定。
         if bar["mark"] == 0:
             return state, 0
 
@@ -137,7 +142,7 @@ class ChannelDeviationStrategy(VectorizedStrategy):
         sig = _fsm_step(state.fsm, cur_ts, devs,
                         float(params["low1"]), float(params["low2"]),
                         float(params["high1"]), float(params["high2"]))
-        # 暴露给 format_signal_line 的可选元数据 (engine 读 self._last_info)
+        # 暴露给 format_signal_line 的元数据 (经 strategy._last_info 传, KB 09 已固化)
         self._last_info = {"up": up, "dw": dw,
                            "low_dev": devs.low, "high_dev": devs.high}
         return state, sig
