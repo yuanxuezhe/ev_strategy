@@ -98,6 +98,8 @@ def _data_parent() -> argparse.ArgumentParser:
     ap.add_argument("--warmup-days", type=int, default=365,
                     help="预热天数 (拉取 start 之前的行情供指标就绪)")
     ap.add_argument("--data-cache", default=None, help="行情 npz 缓存目录")
+    ap.add_argument("--synthetic-days", type=int, default=0,
+                    help=">0 时用合成数据 (不连库, A 股交易时段 seed=42)")
     return ap
 
 
@@ -136,8 +138,19 @@ def _run_backtest(args):
     from .strategies import get_strategy
 
     strategy = get_strategy(args.strategy, params=strategy_params)
-    bars = load_bars(args.code, args.start, args.end,
-                     warmup_days=args.warmup_days, cache_dir=args.data_cache)
+    if args.synthetic_days > 0:
+        from datetime import datetime, timedelta
+        from .core.data import synthetic_bars
+        from .core.metrics import bars_to_arrays
+        d_end = datetime.strptime(args.end, "%Y%m%d")
+        d_start = d_end - timedelta(days=args.synthetic_days)
+        print(f"生成合成数据: {d_start:%Y%m%d} ~ {args.end} "
+              f"({args.synthetic_days} 天, seed=42)", flush=True)
+        bars = bars_to_arrays(synthetic_bars(days=args.synthetic_days,
+                                             start_ymd=f"{d_start:%Y%m%d}"))
+    else:
+        bars = load_bars(args.code, args.start, args.end,
+                         warmup_days=args.warmup_days, cache_dir=args.data_cache)
     n = len(bars["stime"])
     print(f"证券: {args.code}  周期: {args.period}  策略日期: {args.start}~{args.end}  "
           f"预热: {args.warmup_days}天  "
@@ -237,8 +250,6 @@ def build_sweep_parser(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--mc", type=int, default=0)
     ap.add_argument("--mc-top", type=int, default=5)
     ap.add_argument("--workers", type=int, default=None)
-    ap.add_argument("--synthetic-days", type=int, default=0,
-                    help=">0 时用合成数据 (不连库)")
     ap.add_argument("--out", default="sweep_results.csv")
     ap.add_argument("--top", type=int, default=20)
     ap.add_argument("--save-defaults", action="store_true", default=False)
@@ -276,7 +287,10 @@ def sweep_main(argv=None):
             "init_cash": INIT_CASH, "init_position": INIT_POSITION,
             "params": base_params}
     spec_keys = set(get_strategy_param_spec(args.strategy))
-    combos = parse_grid(args.grid, extra_keys=spec_keys) or [{}]
+    spec_map = get_strategy_param_spec(args.strategy)
+    combos = parse_grid(args.grid, extra_keys=spec_keys,
+                       type_hints={k: v.get("type")
+                                   for k, v in (spec_map or {}).items()}) or [{}]
     splits = [s.strip() for s in args.splits.split(",") if s.strip()] if args.splits else None
     if splits:
         print(f"扫描 {len(combos)} 组参数 (滚动 WFO {len(splits)} 窗: "
