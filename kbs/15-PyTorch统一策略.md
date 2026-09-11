@@ -252,6 +252,106 @@ state 增量接口（`ema_step`）已跳过窗口重算，每桶 O(1) 递推。
 
 ---
 
+## 7.4 Batched sweep hook (可选, opt-in)
+
+> 2026-09-11 新增：`openspec/changes/gpu-batched-sweep` 落地。
+
+### 动机
+
+`core/sweep.sweep()` 当前走 `ThreadPoolExecutor` + `--workers` 多进程，每组参数独立跑一遍 `run_vectorized` → `strategy.step` Python 循环。扩展性受核数限制（4-32 倍）。**参数间并行**才是 GPU 真正的高价值维度——N_combos 组共享同一份 bars，作为 torch batch dim 在 1 次 kernel launch 内出 N 份信号。
+
+第一刀只加速**信号生成**；成交执行仍逐 combo 调现有 `_execute_trades`，改动面小、bitwise 兼容。
+
+### Hook 契约
+
+```python
+@classmethod
+def batched_step(cls, state, bars, params, *, n_combos, n_bars):
+    """opt-in GPU 批量 hook; 默认未实现, sweep 自动走 ThreadPool"""
+    raise NotImplementedError
+```
+
+| 参数 | shape | 说明 |
+|---|---|---|
+| `state` | dataclass 字段 `[N]` Tensor | 每 combo 一份批量 state |
+| `bars` | dict[str, Tensor] `[T]` | `{"ts","o","h","l","c","v","mark"}` 全 1-D |
+| `params` | dict[str, Tensor] `[N]` | 每 combo 一份 param |
+| `n_combos`, `n_bars` | int | shape 元数据 |
+| 返回 | `(new_state, sig [N, T] int8)` | sig 第一维 combo，第二维 bar |
+
+### State dataclass (示例: ma_crossover)
+
+```python
+@dataclass
+class MABatchedState:
+    fast_sum: Tensor     # [N] float64
+    fast_count: Tensor   # [N] int64
+    fast_ema: Tensor     # [N] float64
+    slow_sum: Tensor     # [N] float64
+    slow_count: Tensor   # [N] int64
+    slow_ema: Tensor     # [N] float64
+    prev_diff: Tensor    # [N] float64
+    has_prev: Tensor     # [N] bool
+```
+
+跟原 `MACrossoverState` **并存**，batched 路径 opt-in。
+
+### 路由规则 (`core/sweep.sweep()`)
+
+`sweep()` 设备解析后判断 `use_batched`：
+
+```text
+use_batched = (
+    hasattr(cls, "batched_step")
+    and cls.batched_step is not VectorizedStrategy.batched_step  # 子类真覆写
+    and device != "cpu"
+    and len(combos) >= 32                                       # 小网格 GPU 启动开销 > 收益
+    and gpu_available()
+)
+```
+
+命中走 `run_batched`（新文件 `core/batched_sweep.py`），否则现有 ThreadPool 路径。
+`run_batched` 内捕获 `torch.cuda.OutOfMemoryError` → 自动 fallback ThreadPool + warning。
+`--workers` 在 batched 模式下被忽略，打印 notice。
+
+### EMA kernel
+
+新增 `indicators.ema.torch_ema(values: Tensor, p: int) -> Tensor`：
+
+- 输入 `[T]`、输出 `[T]`、`dtype/device` 保留（自动转 float64）
+- 前 `p-1` 个返回 0.0（跟 `ema_step` 一致，不是 numpy `ema()` 的 NaN）
+- 算法：`cumsum` seed (`cumsum[p-1]/p`) + 递推尾段 `out[i] = values[i]*k + out[i-1]*(1-k)`，`k = 2/(p+1)`
+- **跟 numpy `ema()` 参考版 float64 bit-equal**（`np.array_equal` 通过）
+
+`batched_sweep` 按 `tf1` 值**分组**调用 `torch_ema`（同 `tf1` 的 combo 一次 kernel 出整段）—— 第一刀不用 vmap，按整数取值分组够用。
+
+### 当前实现状态
+
+| 策略 | 是否实现 `batched_step` | 原因 |
+|---|---|---|
+| `ma_crossover` | ✅ 已实现 | 纯 EMA 增量、无 FSM、可向量化 |
+| `channel_deviation` | ❌ 不实现 | FSM 锁存（`lock_ts / low_hit / high_hit / low_acted / high_acted`）跨桶 latch 难 tensor 化；继续走 ThreadPool |
+
+### 关键约束（与 spec 一致）
+
+- **浮点必须 float64**，跟 per-combo `step` 循环产出 bitwise 一致（容差 1e-12）
+- `mark=0` 段复刻原 step 语义（如 ma_crossover 仍推 EMA 累积）
+- 异常立即透传（不延后到 sync point），保持 `test_sweep_does_not_crash_when_one_combo_fails` 语义
+- `run_vectorized` 签名**不动**（spec R10 MUST NOT 带 device）
+
+### 收益范围
+
+信号生成从 `N_combos × T_bars` 个 Python `step` 调用 → 1 个 `batched_step` 调用。
+成交仍 `N_combos` 次（每窗每 combo 一次），但信号部分是大头。
+
+### 不做的事（留给后续 change）
+
+- `_execute_trades` 向量化（per-combo `cash/position/cur_qty` → `[N]` Tensor）
+- `channel_deviation` FSM 向量化
+- `vmap` over `tf1`（按值分组够用）
+
+---
+
 ## 8. 与现有文档的对应
 
 | 主题 | 文档 |

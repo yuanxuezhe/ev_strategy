@@ -77,6 +77,8 @@ class VectorizedStrategy:
         merged = dict(params or {})
         merged.update(kwargs)
         self.params = self._resolve_params(merged)
+        # 把 params 镜像到 self.<k>, 方便策略/测试用 s.fast / s.low1 直读
+        # (这是便利访问, 不是 step 累积状态; step state 仍由 engine 持有)
         for k, v in self.params.items():
             setattr(self, k, v)
 
@@ -121,6 +123,21 @@ class VectorizedStrategy:
 
     def step(self, state: Any, bar: dict, params: dict) -> tuple[Any, int]:
         """策略唯一入口: state + 单桶 bar -> (new_state, signal)"""
+        raise NotImplementedError
+
+    @classmethod
+    def batched_step(cls, state: Any, bars: dict, params: dict,
+                     *, n_combos: int, n_bars: int) -> tuple[Any, "Tensor"]:
+        """opt-in GPU 批量 hook (供 sweep 大网格加速); 默认未实现, sweep 自动走 ThreadPool
+
+        实现者应满足 (详见 spec "Optional GPU-batched sweep hook"):
+          - state 为 dataclass, 每 field 为 [N] Tensor
+          - bars 为 dict[str, Tensor], 每 value 形状 [T] (1-D)
+          - params 为 dict[str, Tensor], 每 value 形状 [N]
+          - 返回 (new_state, sig [N, T] int8), 取值 ∈ {-1, 0, 1}
+          - 浮点必须 float64, 跟 per-combo step 循环 bitwise 一致
+          - 异常立即透传
+        """
         raise NotImplementedError
 
     def format_signal_line(self, ts: int, sig: int, info: dict | None = None) -> str:
