@@ -26,8 +26,17 @@ def _aggregate_buckets(bars_1m: dict, period: str, warmup_until: int) -> dict:
 
     返回: {"ts", "o", "h", "l", "c", "v", "mark", "n_bars"}
     每行 = 一个闭合桶的最终 OHLCV + 含 1m 根数 + mark。
+
+    空输入 (n=0) 返回空数组 (避免 reduceat 在 0-size 上 IndexError)。
     """
     stime = bars_1m["stime"]
+    n = len(stime)
+    if n == 0:
+        empty = np.array([], dtype=np.int64)
+        empty_f = np.array([], dtype=np.float64)
+        empty_i8 = np.array([], dtype=np.int8)
+        return {"ts": empty, "o": empty_f, "h": empty_f, "l": empty_f,
+                "c": empty_f, "v": empty_f, "mark": empty_i8, "n_bars": empty}
     ts_1m_np, mark_1m_np = precompute_ts_mark({"stime": stime}, period, warmup_until)
     ts_1m = np.asarray(ts_1m_np)
     mark_1m = np.asarray(mark_1m_np)

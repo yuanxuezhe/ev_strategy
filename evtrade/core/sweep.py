@@ -17,11 +17,15 @@ GRID_KEYS = ("period", "trade_qty", "scale",
              "buy_pct", "sell_pct")
 
 
-def parse_grid(specs: list, extra_keys: set[str] | None = None) -> list[dict]:
+def parse_grid(specs: list, extra_keys: set[str] | None = None,
+                type_hints: dict[str, type] | None = None) -> list[dict]:
     """["k1=1.0,1.5", "k2=0.3,0.5"] -> 笛卡尔积参数组合列表
 
     extra_keys: 额外允许的 grid key (由策略的 params_spec 提供)。
                  None 时只允许 GRID_KEYS 白名单; 传非空集合时扩展。
+    type_hints:  按 key 给类型提示; 用于决定 grid value 是否转 float。
+                 例如 `{"higher_period": str}` 让 "30m"/"1h" 保持字符串。
+                 缺省: int 转 int, float 转 float, str / None 保持 str。
     """
     import itertools
     allowed = set(GRID_KEYS) | set(extra_keys or set())
@@ -40,7 +44,18 @@ def parse_grid(specs: list, extra_keys: set[str] | None = None) -> list[dict]:
     for values in itertools.product(*[v for _, v in axes]):
         combo = {}
         for k, raw in zip(keys, values):
-            combo[k] = raw if k == "period" else float(raw)
+            # 类型决策: type_hints 优先; 缺省 (向后兼容) 按"period 留字符串, 其它 float"
+            if k == "period":
+                combo[k] = raw
+                continue
+            t = (type_hints or {}).get(k)
+            if t is str:
+                combo[k] = raw
+            elif t is int:
+                combo[k] = int(raw)
+            else:
+                # float / 缺省 / 未知类型: 全部按 float 转 (向后兼容旧 test)
+                combo[k] = float(raw)
         combos.append(combo)
     return combos
 
@@ -225,10 +240,14 @@ def sweep(bars: dict, base: dict, combos: list[dict],
     params_list = [{**base, **c} for c in combos]
 
     def _run_one(wb, p, warm):
+        # 抽策略 spec 字段 (per-combo 已 flat 合并到 p 顶层) 当 strategy_params
+        # 旧逻辑用 p.get("params", {}) 在 spec 字段 flat 化后拿不到 -> 走 default
+        spec_keys_set = set(spec.keys())
+        sp_params = {k: p[k] for k in spec_keys_set if k in p}
         return run_one_vectorized(
             wb, p["period"], warm,
             strategy_name=strategy_name,
-            strategy_params=p.get("params", {}),
+            strategy_params=sp_params,
             init_cash=p["init_cash"],
             init_position=p["init_position"],
             trade_qty=p["trade_qty"],
@@ -237,23 +256,55 @@ def sweep(bars: dict, base: dict, combos: list[dict],
             sell_pct=p.get("sell_pct", 0.0),
         )
 
+    # ---- 路由: batched (opt-in) vs ThreadPool ----
+    from ..strategies import get_strategy_class
+    strategy_cls = get_strategy_class(strategy_name)
+    # "真覆写" 检测: 类自身 __dict__ 里有 batched_step (排除继承来的基类默认)
+    use_batched = (
+        "batched_step" in vars(strategy_cls)
+        and device != "cpu"
+        and len(params_list) >= 32
+        and gpu_available()
+    )
+
     t0 = time.perf_counter()
     metrics = [[None] * len(params_list) for _ in win_data]
-    if n_workers and n_workers > 1:
-        from concurrent.futures import as_completed
-        with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            futures = {
-                ex.submit(_run_one, wb, p, warm): (wi, ci)
-                for wi, (_, wb, warm) in enumerate(win_data)
-                for ci, p in enumerate(params_list)
-            }
-            for fut in as_completed(futures):
-                wi, ci = futures[fut]
-                metrics[wi][ci] = fut.result()
-    else:
-        for wi, (_, wb, warm) in enumerate(win_data):
-            for ci, p in enumerate(params_list):
-                metrics[wi][ci] = _run_one(wb, p, warm)
+    if use_batched:
+        if verbose:
+            print(f"  -- batched 路径 (device={device}, n_combos={len(params_list)}); "
+                  f"--workers 忽略", flush=True)
+        from .batched_sweep import run_batched
+        try:
+            metrics = run_batched(
+                bars, base, params_list,
+                strategy_cls=strategy_cls, device=device,
+                splits=splits, fee_bp=fee_bp, lam=lam,
+                min_trades=min_trades, max_mdd=max_mdd,
+                split_ymd=split_ymd,
+            )
+        except RuntimeError as e:
+            # CUDA OOM 自动 fallback ThreadPool
+            if "out of memory" in str(e).lower() or "OutOfMemoryError" in type(e).__name__:
+                print(f"  -- batched CUDA OOM -> 降级 ThreadPool: {e}", flush=True)
+            else:
+                raise
+            use_batched = False   # 落入下方 ThreadPool 分支
+    if not use_batched:
+        if n_workers and n_workers > 1:
+            from concurrent.futures import as_completed
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                futures = {
+                    ex.submit(_run_one, wb, p, warm): (wi, ci)
+                    for wi, (_, wb, warm) in enumerate(win_data)
+                    for ci, p in enumerate(params_list)
+                }
+                for fut in as_completed(futures):
+                    wi, ci = futures[fut]
+                    metrics[wi][ci] = fut.result()
+        else:
+            for wi, (_, wb, warm) in enumerate(win_data):
+                for ci, p in enumerate(params_list):
+                    metrics[wi][ci] = _run_one(wb, p, warm)
     dt = time.perf_counter() - t0
 
     # ---- 行装配 ----
