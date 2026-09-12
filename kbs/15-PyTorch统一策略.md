@@ -1,5 +1,7 @@
 # 15 PyTorch 统一策略 (pytorch-unified-strategy, 2026-09-10)
 
+> **2026-09-13 重要更新**: framework 不再持有资金/持仓/撮合/PnL/收益概念; 策略 `step` 内部自管。`Account` / `Executor` / `SimulatedExecutor` / `trade_decision` / `metrics.summarize` 已下线; `core/metrics` / `core/replay` / `core/permutation` / `core/config` 已删; `replay` 子命令 + `--against-ref` 已下线; `--init-cash --buy-pct --sell-pct --all-in --trade-qty --warmup-days --data-cache` CLI flag 已删 (走 `--params`).
+
 > 回答的问题：**CPU/GPU/批量回测/实盘逐棒** 如何用**同一套策略代码**统一表达。
 > 本文档覆盖 PyTorch 单一后端 (`evtrade/backends.py`)、bars 契约 (桶级 numpy 数组)、
 > 批量 vs 实盘的策略接口 (同一条 `step` 路径)。

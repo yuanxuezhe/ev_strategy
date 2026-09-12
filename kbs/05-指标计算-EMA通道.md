@@ -1,5 +1,7 @@
 # 05 指标计算：EMA 与通道轨
 
+> **2026-09-13 重要更新**: framework 不再持有资金/持仓/撮合/PnL/收益概念; 策略 `step` 内部自管。`Account` / `Executor` / `SimulatedExecutor` / `trade_decision` / `metrics.summarize` 已下线; `core/metrics` / `core/replay` / `core/permutation` / `core/config` 已删; `replay` 子命令 + `--against-ref` 已下线; `--init-cash --buy-pct --sell-pct --all-in --trade-qty --warmup-days --data-cache` CLI flag 已删 (走 `--params`).
+
 > 相关源码：`indicators/ema.py`（`evtrade/indicators/ema.py`）。
 > 本文档为 2026-09-10 重构版（strategy-step-only）—— 删旧双轨标量 API,
 > 改用 `ema_step(state, value, p) -> (state, ema)` 单函数 + `@dataclass EMAState`；

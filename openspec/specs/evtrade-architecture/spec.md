@@ -10,7 +10,9 @@
 evtrade 是一个多周期 K 线 + 策略回测/扫参框架。本 spec 定义其行为契约：分层、数据流、`step`/`init_state` 策略契约、per-bar dict 契约、策略 hook 协议、CLI 参数协议。
 
 ---
+
 ## Requirements
+
 ### Requirement: Strategy interface contract
 
 策略 MUST 实现 `VectorizedStrategy.step(self, state, bar: dict, params: dict) -> tuple[state, int]`
@@ -194,124 +196,6 @@ framework 在 `__init__` / `_resolve_params` 阶段做校验（fill default + ty
 - **THEN** MUST NOT 出现 `def compute_signals(`、`def check(self,`、`state_spec`、
   `dsl_check`、`@njit`、`DSL docstring` 等已废形态
 
-### Requirement: metrics.summary covers full field shape
-
-`evtrade.core.metrics.summarize` MUST 返回 30 字段（缺一即视为 broken）：
-
-**终态字段**（5）：`final_price / final_cash / final_position / final_equity / baseline`
-
-**交易字段**（5）：`n_trades / n_buy / n_sell / turnover / excess_pct`
-
-**时间字段**（2）：`years / cagr_excess`（注：`ann_excess_pct` 已重命名为 `cagr_excess`，口径改为复合年化与 `cagr` 对齐）
-
-**风险调整字段**（5）：`cagr / sharpe_excess / sortino_excess / calmar / ir`
-
-**回撤字段**（4）：`max_drawdown / max_dd_days / max_dd_recovered / x_mdd`
-- `max_drawdown` 单一真源：基于 `equity_curve` 由 metrics 算出，不再依赖 caller
-  传入的 `final_state["max_drawdown"]`
-- `x_mdd` = 累计超额曲线（equity - baseline）的回撤，单位**小数**；与 `max_drawdown`
-  （equity 曲线回撤）不同，**保留**
-- `max_dd_recovered` 语义：**trough 到首个恢复 ≥ 前高**的 bar 数；未恢复时 MUST
-  返回 `-1`（sentinel，区分"恢复用了 N bar"和"从未恢复"）
-
-**持仓行为字段**（7）：`win_rate / profit_factor / avg_pnl / max_consecutive_wins / max_consecutive_losses / avg_hold_bars / max_hold_bars`
-
-**基准对比字段**（2）：`baseline_max_dd / dd_excess`（`dd_excess = max_drawdown - baseline_max_dd`，正值=策略比基准回撤更深）
-
-`run_vectorized` MUST 累积 `equity_curve`（cash + position * close_to_now）与 `baseline_curve`（init_cash + init_position * close_to_now），末尾调 `metrics.summarize` 输出。`sweep` 评分函数 MUST 不再依赖占位 0.0（所有 Sharpe / Sortino / Calmar / CAGR / max_dd_days / IR 字段由 `metrics.summarize` 实算）。
-
-#### Scenario: vectorized summary 30 字段齐全
-
-字段单位 MUST 统一为下表约定（unify-metrics-units, 2026-09-09；extend-metrics, 2026-09-10 扩展字段集 16 → 25 → 30，含 `x_mdd`）：
-
-| 字段 | 单位 | 说明 |
-|---|---|---|
-| `cagr` | 百分数 (%) | `(eq[-1]/eq[0])^(1/years) - 1` 后 ×100 |
-| `cagr_excess` | 百分数 (%) | `(eq/bl 累计比例)^(1/years) - 1` 后 ×100；与 cagr 同口径 |
-| `max_drawdown` | **占当时 peak 的小数** (0.0~1.0+) | `max(0, peak - trough) / peak`；业界惯例 (Tradestation / PT) |
-| `x_mdd` | 占初始 baseline 的小数 | 累计超额曲线 (equity - baseline) 的回撤 |
-| `baseline_max_dd` | 占当时 peak 的小数 | 买入持有曲线同算法 |
-| `dd_excess` | 小数 | `max_drawdown - baseline_max_dd`；正值=策略比基准回撤更深 |
-| `sharpe_excess` / `sortino_excess` / `ir` | 年化（无量纲） | `mean(excess_rets) / std(excess_rets) * sqrt(bars_per_year)` |
-| `calmar` | **无量纲**（比率） | `cagr(小数) / max_drawdown(小数)` = `(cagr/100) / max_drawdown` |
-| `max_dd_days` | 自然日 | `n_dd_bars / bars_per_day` |
-| `max_dd_recovered` | bar 数 | trough → 首个恢复 ≥ 前高 的 bar 数；**未恢复时 MUST = -1** |
-| `win_rate` / `profit_factor` / `avg_pnl` / `max_consecutive_wins` / `max_consecutive_losses` | 比率 / 比值 / 金额 / 笔数 | BUY→SELL 配对统计 |
-| `avg_hold_bars` / `max_hold_bars` | 桶数 | `encoded_to_epoch` 差分 → 秒数 → 桶数 |
-| `final_equity` / `baseline` | 金额（元） | `cash + position * last_price` |
-| `final_price` | 价格（元） | 最后一根 close |
-| `final_cash` / `turnover` | 金额（元） | |
-| `final_position` | 股数 | |
-| `excess_pct` | 百分数 (%) | `(equity - baseline) / baseline * 100` |
-| `years` | 年 | `(last_ts - first_ts) / (365.25 * 86400)` |
-
-CLI 打印 MUST 与字段单位一致：`max_drawdown` / `baseline_max_dd` / `dd_excess` / `x_mdd` / `cagr` / `cagr_excess` / `excess_pct` / `win_rate` MUST 用 `:.2%`；`final_equity` / `baseline` / `final_cash` / `turnover` / `avg_pnl` MUST 用 `:.2f`；`max_dd_days` MUST 用 `:.1f` + " 天" 后缀；`calmar` / `sharpe_excess` / `sortino_excess` / `ir` MUST 用 `:.3f`（无量纲）。CLI 打印行 MUST NOT 出现"金额元"字段被 `:.2%` 格式化的输出。
-
-`ann_excess_pct` 已重命名为 `cagr_excess`（口径改为复合年化）；`x_mdd` **保留**（超额曲线回撤，与 equity 曲线回撤 `max_drawdown` 不同）。
-
-#### Scenario: vectorized summary 字段齐
-- **WHEN** `run_vectorized(...)` 返回 `result["summary"]`
-- **THEN** `set(summary.keys())` MUST 恰好等于上述全部 30 字段（含 `x_mdd`）；数值 MUST 非 NaN（无数据时填 0.0；profit_factor 无亏损时填 `inf`；max_dd_recovered 未恢复时填 `-1`）
-
-#### Scenario: sweep 评分不再依赖占位
-- **WHEN** `sweep.run_one_vectorized(...)` 返回 metrics dict
-- **THEN** `sharpe_excess / sortino_excess / calmar / cagr / max_dd_days` MUST 由 equity 序列实算（非默认 0.0）
-
-#### Scenario: max_drawdown 单位为当时 peak 的小数
-- **WHEN** `run_vectorized(...)` 返回 `result["summary"]["max_drawdown"]`
-- **THEN** MUST 满足 `max_drawdown ∈ [0.0, 1.5]`（正常策略 ≤ 1.0；杠杆/极端可超 1.0 但应有界）；MUST NOT 是资金元（量级 ~1e5）
-- **AND** MUST 等价于 `max(0, peak_equity - trough_equity) / peak_equity`，其中 `peak_equity = max(equity_curve[:i+1])`
-
-#### Scenario: calmar 跨单位除法已修齐
-- **WHEN** 合成曲线 `cagr=10%`、`max_drawdown=0.20`
-- **THEN** `summary["calmar"]` MUST ≈ `0.10 / 0.20 = 0.5`（无量纲），MUST NOT 是 `10 / 0.20 = 50.0` 或 `10 / 200000 = 5e-5`
-
-#### Scenario: CLI 打印格式与字段单位一致
-- **WHEN** `python -m evtrade backtest ...` 打印盈亏汇总
-- **THEN** `最大回撤` 行 MUST 输出合理量级的百分比（如 `-12.34%` 量级），MUST NOT 输出 `1.5e7%`
-- **AND** `Calmar` 行 MUST 输出无量纲数字（如 `+0.500`），MUST NOT 输出带 `%` 后缀或与 mdd 量级挂钩
-
-#### Scenario: max_dd_recovered sentinel
-- **WHEN** equity 序列存在最大回撤且**已恢复**（trough 后存在某 bar 使 equity ≥ 前高）
-- **THEN** `max_dd_recovered` MUST 等于 (recovery_idx - trough_idx)，单位 bar
-- **WHEN** 存在最大回撤但**从未恢复**（trough 后 equity 始终 < 前高）
-- **THEN** `max_dd_recovered` MUST 等于 -1（sentinel，区别于"恢复用了 N bar"）
-
-#### Scenario: 持仓周期从 BUY→SELL 配对计算
-- **WHEN** trades 序列已知
-- **THEN** `avg_hold_bars / max_hold_bars` MUST 基于相邻 BUY/SELL 配对的 (sell_ts - buy_ts) 桶数计算；未配对的开仓/平仓忽略
-
-### Requirement: metrics field units are normalized
-
-`metrics.summarize` / `vectorized_engine._execute_trades` / `cli.py` / `sweep.py` MUST 在**单位约定**上保持一致：所有下游消费者（CLI 打印、sweep 过滤、回归测试） MUST 假设上述单位表。任何"金额元"与"百分比"混用 MUST 视为 broken，由 `tests/test_metrics_units.py` + `tests/test_metrics_v3.py` 锁定。`sweep --max-mdd` 默认 1.0 MUST 含义为"100% 回撤 = 不限"；实盘建议 `0.15` 现在能真正生效（默认 `1.0` 永远过；`0.15` 拒回撤 > 15% 的策略）。
-
-#### Scenario: sweep filter_pass 跨单位对齐
-- **WHEN** `sweep.run(...)` 跑出某组参数 `max_drawdown=0.18` 且 `--max-mdd=0.15`
-- **THEN** 该参数 MUST NOT 出现在 `filter_pass=True` 行（MUST 被 18% > 15% 拒掉）
-
-#### Scenario: sweep 评分不再依赖占位
-
-- **WHEN** `sweep.run_one_vectorized(...)` 返回 metrics dict
-- **THEN** `sharpe_excess / sortino_excess / calmar / cagr / max_dd_days / ir / baseline_max_dd` MUST 由 equity 序列实算（非默认 0.0）
-
-#### Scenario: max_dd_recovered 三档语义
-
-- **WHEN** equity 序列存在最大回撤且**已恢复**（trough 后存在某 bar 使 equity ≥ 前高）
-- **THEN** `max_dd_recovered` MUST 等于 (recovery_idx - trough_idx)，单位 bar
-- **WHEN** 存在最大回撤但**从未恢复**（trough 后 equity 始终 < 前高）
-- **THEN** `max_dd_recovered` MUST 等于 -1（sentinel，区别于"恢复用了 N bar"）
-
-#### Scenario: x_mdd 为超额曲线回撤小数
-
-- **WHEN** 调用 `metrics.summarize(...)` 返回 dict
-- **THEN** MUST 含 `x_mdd` key，且为小数（`0.0 <= x_mdd <= 2.0`，量级非元；
-  `tests/test_metrics_units.py::test_x_mdd_is_fraction` 锁定）
-
-#### Scenario: 持仓周期从 BUY→SELL 配对计算
-
-- **WHEN** trades 序列已知
-- **THEN** `avg_hold_bars / max_hold_bars` MUST 基于相邻 BUY/SELL 配对的 (sell_ts - buy_ts) 桶数计算；未配对的开仓/平仓忽略
-
 ### Requirement: CLI surface = `--device {cpu, gpu, auto}`
 
 `python -m evtrade backtest / sweep / replay` MUST 接受 `--device {cpu, gpu, auto}`
@@ -399,64 +283,28 @@ Hinnant 整数日历）。`gpu_info` 已删除。
 - **WHEN** `pytest tests/test_torch_backend.py -v`
 - **THEN** `get_xp` 返 `torch.device`；`gpu_available` 与 `torch.cuda.is_available()` bitwise 一致
 
-### Requirement: Single trade-execution implementation
-
-成交决策（取量 + 资金/持仓约束 + 现金/持仓更新）MUST 有唯一实现
-`evtrade.execution.base.trade_decision(side, price, cash, position, cur_qty, buy_pct,
-sell_pct) -> (new_cash, new_position, qty, filled)`。`SimulatedExecutor.trade` 与
-`run_vectorized` 的成交循环（`vectorized_engine._execute_trades`）MUST 均调用它，
-MUST NOT 各自复制取量/约束公式。scale（加仓翻倍）与 last_side 状态逻辑属于调用方
-状态，MAY 留在各自调用处。`replay --against-ref` MUST 仍逐笔（ts/side/qty/price）
-对账两条引擎路径的成交结果。
-
-#### Scenario: 成交公式仅一处
-- **WHEN** 静态扫描 `evtrade/`（排除 tests/）中的取量表达式（`cash / price`、
-  `buy_pct *`、`sell_pct *` 组合）
-- **THEN** MUST 仅出现于 `execution/base.py::trade_decision` 一处
-
-#### Scenario: 双路径逐笔一致
-- **WHEN** `replay --log <log> --strategy channel_deviation --device cpu --against-ref`
-- **THEN** 输出 `对账 [PASS]`，两条路径 trades 逐笔（ts/side/qty/price）一致且终态
-  cash/position 一致
-
-### Requirement: Account is a pure trade ledger
-
-`Account` MUST 只做资金/持仓记账：字段限 `init_cash / init_position / cash /
-position / trades`，方法限 `apply(side, qty, price, ts)`。MUST NOT 暴露权益估值
-方法（`equity` / `baseline_equity` 等），MUST NOT 持有 `last_price` 类最新价状态
-——权益 / 基线曲线与期末估值唯一真源是 `metrics.summarize`（输入 `final_state`
-= `{cash, position, last_price, ...}`，由 `vectorized_engine` 自维护）与
-`Engine` 腿的 `exec_state` 同口径字段。`Executor` 基类 MUST NOT 提供
-`update_price` 钩子（无消费者）；Engine 桶 CLOSE 驱动序列为
-`strategy.step → (sig != 0 时) executor.trade`，不含价格预更新步骤。
-
-#### Scenario: 静态扫描无 equity 估值残留
-- **WHEN** 静态扫描 `evtrade/`（排除 tests/）
-- **THEN** `equity(` / `baseline_equity` / `last_price = price`（Account 侧赋值）/
-  `update_price` MUST 均 0 命中；`Account` 实例化后无 `last_price` 属性
-
-#### Scenario: 权益口径不受影响
-- **WHEN** `python -m evtrade replay --log <log> --strategy channel_deviation
-  --device cpu --against-ref`
-- **THEN** 对账 [PASS]，两腿 trades 逐笔一致，`final_equity` / `baseline` /
-  `excess_pct` 与删除前完全一致（真源在 `metrics.summarize`）
-
 ### Requirement: CLI options declared once
 
-**共享选项 MUST 仅声明一次**：`backtest` / `sweep` / `replay` 三个子命令的共享选项（`--strategy --params --code
---start --end --period --trade-qty --scale --all-in --buy-pct --sell-pct --warmup-days
---device --data-cache --verbose` 等）MUST 声明于单一共享父 parser（argparse `parents=`），
-MUST NOT 各子命令重复声明同义选项。CLI 汇总打印 MUST 使用实际 `args` 值
-（期初资金/持仓打印 `args.init_cash` / `args.init_position`，MUST NOT 打印模块常量
-`INIT_CASH` / `INIT_POSITION`）。
+**共享选项 MUST 仅声明一次**：`backtest` / `sweep` 三个子命令的共享选项（`--strategy --params --code
+--start --end --period --device --synthetic-days --verbose --signals-out` 等）MUST 声明于单一共享父 parser
+（argparse `parents=`），MUST NOT 各子命令重复声明同义选项。`backtest` 与 `sweep` 的输出 MUST NOT 包含 PnL /
+收益 / 回撤 / 胜率 等 framework 业务概念——这些由策略自管。CLI 汇总打印仅输出信号轨迹（`format_signal_line`）
+与策略 `final_state` 关键标量（由策略 `format_final_state` hook 自定义）。
 
 #### Scenario: 共享选项单点声明
+
 - **WHEN** 静态扫描 `evtrade/cli.py` 的 `add_argument` 调用
 - **THEN** 上述共享选项名 MUST 仅出现于共享父 parser 定义处一次
 
 #### Scenario: 汇总打印实际值
-- **WHEN** `python -m evtrade backtest --init-cash 99999 ...`
-- **THEN** 汇总头部"期初资金"行 MUST 打印 99999（非默认常量 100000）
+
+- **WHEN** `python -m evtrade backtest --strategy channel_deviation ...`
+- **THEN** 输出 MUST NOT 含"期初资金/期初持仓/期末资金/期末持仓/期末持仓市值/策略总资产/不操作基线/盈亏比例/年化/CAGR/Sharpe/Calmar/最大回撤/胜率/成交额"等行；仅打印信号轨迹（verbose=True）+ 策略 `final_state` 透传（framework 不读具体字段；2026-09-13 后 framework 不再汇总 PnL/收益/回撤/胜率等业务概念）
+
+#### Scenario: 共享选项无资金/撮合参数
+
+- **WHEN** 静态扫描 `evtrade/cli.py` 的 `add_argument` 调用
+- **THEN** `--init-cash --init-position --buy-pct --sell-pct --all-in --trade-qty --warmup-days --data-cache` MUST 0 命中（2026-09-13 删除；funding/撮合 由策略 state 自管）
 
 ### Requirement: 用户文档单一入口
 
@@ -476,33 +324,30 @@ README 的"详见"清单 MUST 只指向 `kbs/` 内文档（不得指向仓库内
 
 ### Requirement: Sweep grid accepts only effective axes
 
-sweep 的 `--grid` 网格轴 MUST 仅接受两类键：引擎轴（`period / trade_qty / scale /
-buy_pct / sell_pct`）与策略 `params_spec` 声明的参数名。MUST NOT 接受"下游从不读取"
-的轴（2026-09-10 `all_in` 曾是此类——被解析为 bool 后无任何消费者，静默空转；已删）。
-资金模式网格化 MUST 经 `--grid buy_pct=...` / `sell_pct=...` 表达。`--grid all_in=...`
-MUST 报 `ValueError: 不支持的网格参数 'all_in'; 可用: [...]`。backtest 子命令的
-`--all-in` flag 不受影响（等价 `--buy-pct 1.0 --sell-pct 1.0`）。
+sweep 的 `--grid` 网格轴 MUST 仅接受**策略 `params_spec` 声明的参数名**（引擎无业务参数轴，funding/撮合 由策略
+params 承担）。MUST NOT 接受"下游从不读取"的轴。`--grid period=...` / `--grid code=...` /
+`--grid buy_pct=...` 等引擎轴 MUST 报 `ValueError: 不支持的网格参数 '<key>'; 可用: [...]`。
+backtest 子命令的 `--period` / `--code` flag 不受影响（CLI 入口，不入 grid）。
+
+#### Scenario: 引擎轴不可网格化
+
+- **WHEN** 执行 `python -m evtrade sweep --grid period=5m,15m --grid buy_pct=0.5,1.0 --grid trade_qty=10000 ...`
+- **THEN** MUST 报 `ValueError`，提示不支持的网格参数及可用列表（来自策略 `params_spec`），MUST NOT 静默跑完
+
+#### Scenario: 策略参数轴生效
+
+- **WHEN** 执行 `python -m evtrade sweep --grid low1=0.05,0.1 --grid low2=0.5,1.0 ...`（命中 channel_deviation params_spec）
+- **THEN** 正常展开笛卡尔积并逐组回测
 
 #### Scenario: all_in 网格轴被拒
+
 - **WHEN** 执行 `python -m evtrade sweep --grid all_in=true,false ...`
 - **THEN** 报 `ValueError`（提示不支持的网格参数及可用列表），MUST NOT 静默跑完
 
 #### Scenario: 资金模式经 buy_pct/sell_pct 网格化
+
 - **WHEN** 执行 `python -m evtrade sweep --grid buy_pct=0.5,1.0 --grid sell_pct=0.5,1.0 ...`
 - **THEN** 正常展开笛卡尔积并逐组回测（`all_in` 语义 = buy_pct=sell_pct=1.0 的组合）
-
-### Requirement: reconcile legs receive identical effective funding
-
-`replay --against-ref`（`core.replay.reconcile`）MUST 让 vectorized 腿与 Engine 腿收到
-**相同的有效成交参数**。`all_in` 的解析（→ `buy_pct = sell_pct = 1.0`）MUST 在
-CLI/调用边界对**两腿统一**生效，MUST NOT 只作用于 Engine 腿（`SimulatedExecutor(all_in=)`
-）而让 vectorized 腿停留在原始 `buy_pct / sell_pct`——后者会使两腿成交流不可比、
-对账必然 FAIL（2026-09-10 前 bug）。
-
-#### Scenario: all-in 对账可 PASS
-- **WHEN** `python -m evtrade replay --log <log> --strategy channel_deviation --against-ref --all-in ...`
-  且两腿在统一 buy_pct=sell_pct=1.0 下运行
-- **THEN** 成交对账（ts/side/qty/price 逐笔）MUST 不因资金模式不对称而 FAIL
 
 ### Requirement: signal trajectory output carries aligned timestamps
 
@@ -579,6 +424,214 @@ Strategy MUST 实现 `step(self, state, bar, params) -> (state, int)`，`state` 
 - **WHEN** `python -m evtrade backtest --strategy filtered_mr ...`
 - **THEN** 强趋势段（ADX > 阈值）/ 高波动段（ATR > mult × MA）/ 逆大周期段 MUST 不产信号；正常震荡段 MUST 产 close 确认后的回归信号
 
+### Requirement: Framework has no funding or PnL concept
+
+framework 的所有接口 MUST NOT 包含资金 / 持仓 / 撮合 / PnL / 收益 / 风险 / 绩效 等业务概念：
+
+- `VectorizedStrategy.step(state, bar, params) -> (state, int)` 接口签名不变；`bar` dict 仅含
+  `{ts, o, h, l, c, v, mark}`；`buckets` dict 仅含 `{ts, o, h, l, c, v, mark, n_bars}`。
+- `run_vectorized(...)` 返回 = `{sig, buckets, final_state}`（`final_state` = 策略 step 末尾
+  state 透传，**MUST NOT** 含 framework 业务字段键如 `cash / position / equity / final_cash /
+  final_position / final_equity / n_trades / n_buy / n_sell / turnover / cagr / sharpe / drawdown /
+  win_rate / profit_factor / 等` —— 这些键由策略自己维护在 dataclass state field，framework 不读不写）。
+- framework MUST NOT 提供 `format_final_state` / `sweep_export_columns` 等"摘要导出 hook"；
+  策略若要看 PnL / 收益 / 绩效，自己加 state 字段 + 自己写打印/导出代码。
+- `evtrade/execution/` 子包 MUST NOT 存在；`Account` / `Executor` / `SimulatedExecutor` /
+  `trade_decision` / `apply(side, qty, price, ts)` MUST NOT 出现在 framework 代码。
+- `evtrade/core/metrics.py` MUST NOT 存在；`summarize` / `metrics.*` MUST NOT 出现在 framework 代码。
+- `evtrade/core/permutation.py` MUST NOT 存在（依赖 metrics）。
+- `evtrade/core/replay.py` MUST NOT 存在（依赖 Account + metrics）。
+- `evtrade/core/config.py` MUST NOT 含 `INIT_CASH / INIT_POSITION / TRADE_QTY` 等常量
+  （CLI 不再传；策略 init_state 自定）。
+
+#### Scenario: framework grep hygiene
+
+- **WHEN** 执行 `grep -rn "trade_decision\|Account\|Executor\|SimulatedExecutor\|cash\|position\|equity\|cagr\|sharpe\|drawdown\|win_rate\|profit_factor\|sortino\|calmar\|metrics\|max_dd\|turnover\|baseline\|format_final_state\|sweep_export_columns" evtrade/core/ evtrade/cli.py evtrade/__init__.py evtrade/strategies/vectorized_base.py`
+- **THEN** MUST 0 命中（仅桶聚合、step 驱动、numpy/tsbucket 路由相关代码；funding/PnL/绩效 概念全部下放到具体策略文件内）
+
+#### Scenario: execution 子包已删除
+
+- **WHEN** 静态检查仓库
+- **THEN** `evtrade/execution/` 目录 MUST 不存在；`from evtrade.execution.* import` MUST ImportError
+
+#### Scenario: run_vectorized 返回无业务字段
+
+- **WHEN** `run_vectorized(...)` 返回 dict
+- **THEN** MUST 仅含 `sig / buckets / final_state` 三个 key；`final_state` 是策略 step 末尾
+  state（dataclass 或 dict），framework 仅透传其内容，不识别具体字段
+
+### Requirement: Strategy owns trade execution and PnL accounting
+
+策略 MUST 自负责以下业务概念（在 `step(state, bar, params)` 内部 / state 字段内 / `init_state` 内）：
+
+- **资金 / 持仓状态**：state 字段（推荐 `@dataclass`，含 `cash / position / init_cash / init_position`
+  等），或外部 dict
+- **撮合数学**（buy/sell 决策 + 现金/持仓约束 + 成交价 = `bar["c"]`）：策略 `step` 内部 inline 实现
+  （`trade_decision` 旧实现内联）；3 个策略各写一份，**不抽取共享**（避免 framework 隐藏业务概念）
+- **记账**（trade ledger）：state 字段 `trades: list[dict]`
+- **PnL 与风险**（equity curve / cagr / sharpe / drawdown / win_rate / 等）：**可选**——
+  策略需要时自行加 state 字段与计算（旧 `metrics.summarize` 30 字段公式内联到策略或策略的
+  helper 文件中）；framework **不强制**、**不提供**、**不识别**
+
+#### Scenario: 策略 step state 含 cash/position/trades 字段
+
+- **WHEN** 静态扫描 `evtrade/strategies/*.py`（排除 `vectorized_base.py`）
+- **THEN** 至少一个策略的 `@dataclass` state MUST 含 `cash / position / trades` 字段（策略自管资金/持仓/账本）
+
+#### Scenario: 策略 step 内自写撮合数学
+
+- **WHEN** 静态扫描 `evtrade/strategies/*.py`
+- **THEN** MUST 出现 `cash / price`、`buy_pct *`、`sell_pct *`、`min(cur_qty, max_by_cash)` 等
+  撮合数学表达式（内联在 step 内或策略内部 helper，**不**走 framework `from evtrade.execution.* import`）
+
+#### Scenario: 策略 PnL 字段可选
+
+- **WHEN** 静态扫描 `evtrade/strategies/*.py`
+- **THEN** PnL / 收益 / 绩效相关字段（`equity_curve / cagr / sharpe / drawdown / win_rate /
+  profit_factor / ...`）**MUST NOT** 出现在 framework 代码（`evtrade/core/` / `evtrade/cli.py` /
+  `evtrade/strategies/vectorized_base.py`）；允许出现在具体策略文件内（由策略自维护）
+
+### Requirement: Engine drives step only
+
+framework 唯一职责 = 桶预计算 + `step` 驱动循环 + 累计 sig/state。
+
+- `VectorizedEngine.run_vectorized` MUST 仅做：
+  1. 桶聚合（numpy 向量化；调用 `core/tsbucket.py::precompute_ts_mark`）
+  2. 循环调 `strategy.step(state, bar, params)`（`_compute_signals`），state 由 framework 持有
+  3. 返回 `{sig, buckets, final_state}`（`final_state` = 策略 step 最终 state 透传）
+- `Engine.on_bars` MUST 仅做逐 bar 循环调 `strategy.step` + 累计 sig/state；不持 cash/position/
+  Account/Executor；不调 metrics
+- framework MUST NOT 调 `trade_decision` / `Account.apply` / `Executor.trade` 等业务接口
+  （这些在策略侧 step 内完成）
+
+#### Scenario: vectorized_engine 不含业务概念
+
+- **WHEN** 静态扫描 `evtrade/core/vectorized_engine.py`
+- **THEN** MUST NOT 出现 `trade_decision` / `Account` / `cash` / `position` / `equity` /
+  `turnover` / `metrics` / `summarize` 等业务概念符号
+
+#### Scenario: engine.py 不含业务概念
+
+- **WHEN** 静态扫描 `evtrade/core/engine.py`
+- **THEN** MUST NOT 出现 `Account` / `Executor` / `SimulatedExecutor` / `trade_decision` /
+  `cash` / `position` / `equity` / `apply(` 等业务概念符号
+
+### Requirement: Sweep runs strategy over a parameter grid
+
+`sweep --grid` MUST 仅扫描**策略 `params_spec` 声明的参数名**；引擎无业务参数轴（funding/撮合 由策略
+params 承担）。每组参数组合 MUST 调一次 `run_vectorized` 跑完桶，返回 `final_state`；CSV 写策略
+`final_state`（由 sweep 序列化 dataclass/dict 字段）。
+
+#### Scenario: sweep 跑策略参数组合
+
+- **WHEN** 执行 `python -m evtrade sweep --strategy channel_deviation --grid low1=0.05,0.1 --grid low2=0.5,1.0 ...`
+- **THEN** MUST 展开 4 组笛卡尔积，每组跑一次 `run_vectorized`，CSV 每行 = 策略 params + final_state 字段
+
+### Requirement: CLI is step-driver surface
+
+CLI = `python -m evtrade {backtest, sweep, params}` 三个子命令。
+
+- `backtest`：仅 `--strategy / --params / --period / --code / --start / --end / --synthetic-days /
+  --device / --verbose / --signals-out`。**删除** `--init-cash / --init-position / --buy-pct /
+  --sell-pct / --all-in / --trade-qty / --warmup-days / --data-cache`（2026-09-13）
+- `sweep`：保留 `--grid / --split / --splits / --fee-bp / --score-lambda / --min-trades / --max-mdd /
+  --mc / --mc-top / --workers / --out / --top / --save-defaults`（funding 相关参数由策略 params 承担）
+- `replay` 子命令**删除**（framework 不再有逐笔对账口径）
+- CLI 汇总打印 MUST NOT 包含 PnL / 收益 / 回撤 / 胜率 / 资金 / 持仓 / 期末市值 / 成交额 / 等 framework
+  业务概念；`backtest` 输出仅打印信号轨迹（`format_signal_line`）。策略若要看自己 state，由策略内部
+  提供打印 hook（由策略代码决定，非 framework 职责）
+
+#### Scenario: 旧资金/撮合 flag 已删除
+
+- **WHEN** 执行 `python -m evtrade backtest --init-cash 100000 ...` 或 `--buy-pct 1.0 ...` 等
+- **THEN** argparse 报 `unrecognized arguments: --init-cash` / `--buy-pct` 退出（2026-09-13 删除）
+
+#### Scenario: replay 子命令已删除
+
+- **WHEN** 执行 `python -m evtrade replay ...`
+- **THEN** argparse 报 `error: argument {backtest,sweep,params}: invalid choice: 'replay'` 退出
+
+#### Scenario: backtest 仅打印信号轨迹
+
+- **WHEN** `python -m evtrade backtest --strategy channel_deviation --synthetic-days 30 --device cpu`
+- **THEN** 输出 MUST NOT 含 `盈亏比例 / CAGR / Sharpe / Calmar / 最大回撤 / 胜率 / 期末资金 / 期末持仓 /
+  期末持仓市值 / 策略总资产 / 不操作基线 / 成交额` 等行；仅打印信号轨迹（`format_signal_line`）
+
+### Requirement: replay & permutation removed
+
+`evtrade/core/replay.py` 与 `evtrade/core/permutation.py` MUST NOT 存在（2026-09-13 删除）。framework
+不再提供逐笔对账与置换检验口径。CLI 无 `replay` 子命令；`--against-ref` 不存在；`--mc` flag
+MUST NOT 触发置换检验（保留参数解析但调 `NotImplementedError`，明示 framework 不再支持）。
+
+#### Scenario: replay / permutation 模块已删除
+
+- **WHEN** 静态检查仓库
+- **THEN** `evtrade/core/replay.py` / `evtrade/core/permutation.py` MUST 不存在；`from
+  evtrade.core.replay import *` / `from evtrade.core.permutation import *` MUST ImportError
+
+### Requirement: Market data DB connection has a sane default
+
+`evtrade.core.data.load_bars` 在未指定 `db_url` 参数时 MUST 解析到一个对当前协作组开箱即用的 MySQL 连接串默认值；默认主机 = `192.168.10.2:33066`、库 = `evtrade`、用户 = `EvTrade`。密码中 `@` MUST URL-encode 为 `%40`。`TABLE` 默认名 MUST 仍为 `minute_bars`。这两个常量是 framework 行为契约的一部分，被 `load_bars` / `_fetch` / CLI `backtest` / `sweep` 间接依赖；`EVTRADE_DB_URL` 与 `EVTRADE_TABLE` 环境变量 MUST 优先于默认值（分别覆写连接串与表名），作为"临时切库 / 离线 / 测"的逃生口。
+
+#### Scenario: 默认 DB_URL 指向 192.168.10.2
+- **WHEN** 协作者在不设 `EVTRADE_DB_URL` 的情况下跑 `python -m evtrade backtest --strategy filtered_mr --code 159992.SZ --start 20260101 --end 20260903 --device gpu`
+- **THEN** `load_bars` MUST 尝试连 `mysql+pymysql://EvTrade:p%40ssw0rd@192.168.10.2:33066/evtrade?charset=utf8mb4`（不是 `127.0.0.1:3306`），即默认主机 = `192.168.10.2`、端口 = `33066`、库 = `evtrade`
+
+#### Scenario: EVTRADE_DB_URL 优先于默认
+- **WHEN** 协作者 `export EVTRADE_DB_URL=mysql+pymysql://other:other@10.0.0.1:3306/other?charset=utf8mb4` 后再跑 `backtest`
+- **THEN** `load_bars` MUST 尝试连 `10.0.0.1:3306/other`，不连 `192.168.10.2`；`EVTRADE_DB_URL` 必须解析到最终 SQLAlchemy `create_engine` 调用
+
+#### Scenario: EVTRADE_TABLE 覆写表名
+- **WHEN** 协作者 `export EVTRADE_TABLE=other_table` 后跑 `backtest`
+- **THEN** `_fetch` 生成的 SQL MUST FROM `other_table`，不是 `minute_bars`；`EVTRADE_TABLE` 默认值 MUST 为 `minute_bars`（与 spec 一致）
+
+#### Scenario: 默认 DB_URL 中 `@` 已 URL-encode
+- **WHEN** 静态扫描 `evtrade/core/data.py` 中的 `DB_URL` 默认值
+- **THEN** MUST 含 `p%40ssw0rd`（而非裸 `p@ssw0rd`）；确保 SQLAlchemy / pymysql 不会把 `@` 当 host 分割符
+
+#### Scenario: DB 不可达时 CLI 输出默认主机提示
+- **WHEN** 协作者在不设 `EVTRADE_DB_URL`、默认 DB 也无法连接的环境下跑 `backtest`
+- **THEN** CLI MUST 在 SQLAlchemy 抛 `OperationalError` 后打印包含 `192.168.10.2:33066` 与 `EVTRADE_DB_URL` 的中文提示行，并以非零退出码退出；非 `OperationalError` MUST 不被该分支吞掉
+
+### Requirement: Strategy signal line shows trigger bar context
+
+策略（至少 `filtered_mr` 与 `channel_deviation`）的信号行 hook MUST 在 `sig != 0` 时把
+触发该信号的方向、成交价与触发 K 线 OHLCV 全部展示在一行内，方便协作现场直接读出
+"在什么价位的什么 K 线上触发了 BUY/SELL"，不再需要拿 `ts` 反查行情。具体契约：
+
+- `step` 入口处 MUST 写 `self._last_info = {"side": "", "price": float, "o": float,
+  "h": float, "l": float, "c": float, "v": float|int}`，字段值取自当前 step 接收的 finalized
+  bar（确保任何 early-return 路径都让 framework 拿到最新 bar 的字段）；`side` 在 step 末尾
+  覆写为 `"BUY"` / `"SELL"` / `""` 之一
+- `format_signal_line` hook MUST 用 `info.get(...)` 而非 `info[...]`，防止 info 缺字段时
+  KeyError
+- 当 `sig != 0` 时 hook 返回字符串 MUST 包含方向词（`BUY` 或 `SELL`）、价格数字、
+  以及 4 个 OHLC 字段名（`o=` / `h=` / `l=` / `c=`）；否则视为该策略违反本契约
+- `VectorizedStrategy` 基类默认 hook 不变（仅 `ts / sig / side`），不强制所有策略实现本契约
+
+framework 行为（`Engine._process_bucket` / `run_vectorized` 的 `info` 透传机制）不变，
+本条 Requirement 只约束策略层。
+
+#### Scenario: filtered_mr 信号行包含方向/价格/OHLCV
+- **WHEN** `filtered_mr` 在某个 finalized bar 上触发 `sig=+1`（BUY）
+- **THEN** `format_signal_line(ts, sig, info)` 返回字符串 MUST 同时含 `BUY`、价格字段
+  （与该 bar 的 `close` 一致）、`o=`、`h=`、`l=`、`c=` 四个 OHLC 字段名；不含这些的视为缺漏
+
+#### Scenario: channel_deviation 信号行扩展后含触发 K 线
+- **WHEN** `channel_deviation` 在某个 finalized bar 上触发 `sig=-1`（SELL）
+- **THEN** `format_signal_line(ts, sig, info)` 返回字符串 MUST 含 `SELL`、价格、4 个 OHLC
+  字段名；原有的 `up` / `dw` / `low_dev` / `high_dev` 字段 MUST 仍然出现（向后兼容）
+
+#### Scenario: hook 用 info.get 不抛 KeyError
+- **WHEN** 协作者直接调用 `strategy.format_signal_line(ts, sig, info={})`（info 为空 dict）
+- **THEN** hook MUST NOT 抛 `KeyError`；MUST 返回包含 `ts` / `sig` / `BUY`-or-`SELL`-or-空
+  的字符串（OHLCV 字段可显示为空或缺失标记，不报错）
+
+#### Scenario: _last_info 字段集与 step 触发 bar 一致
+- **WHEN** 协作者断言 `_last_info["c"]` 必须等于触发该 sig 的 bar 的 `close`
+- **THEN** MUST 等值（MUST NOT 是上一桶或下一桶的 close）；同理 `o` / `h` / `l` / `v`
+  与触发 bar 的同名字段一一对应
+
 ## 与 `kbs/` 的对应关系
 
 | 本 spec 节 | `kbs/` 详述 |
@@ -592,6 +645,8 @@ Strategy MUST 实现 `step(self, state, bar, params) -> (state, int)`，`state` 
 | metrics.summary covers full field shape | kbs/13, kbs/09 |
 | Code hygiene (no unused imports, internal helpers underscored) | kbs/01 (源码地图: 本次清理 + 改名) |
 | PyTorch 统一后端 (`gpu` extra 是受支持路径) | kbs/15 §7.1, kbs/10, 使用说明 §0 |
+| Market data DB connection has a sane default | kbs/08 §1.3 |
+| Strategy signal line shows trigger bar context | kbs/06 (策略信号行打印段) |
 | 用户文档单一入口 (无 docs/ 目录) | kbs/README, kbs/使用说明 |
 | Sweep grid accepts only effective axes (无空转轴) | kbs/10 (sweep 参数), kbs/13 |
 | reconcile legs receive identical effective funding | kbs/09, kbs/10 (replay) |

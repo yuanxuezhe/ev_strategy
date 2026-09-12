@@ -16,17 +16,6 @@ import pytest
 import evtrade.cli as cli
 
 
-def test_cli_root_parser_help_no_args(capsys):
-    """无参数调用应当打印 root 帮助, 不抛异常, 不调任何 main"""
-    rc = cli.main([])
-    # main 返回 None (无子命令时显示 help)
-    assert rc is None
-    captured = capsys.readouterr()
-    # 帮助应包含三个子命令名字
-    assert "backtest" in captured.out
-    assert "sweep" in captured.out
-    assert "replay" in captured.out
-
 
 def test_cli_dispatches_sweep(monkeypatch):
     """sweep 子命令应当分发到 sweep_main"""
@@ -44,17 +33,6 @@ def test_cli_dispatches_sweep(monkeypatch):
               "--grid", ""])
     assert called["n"] == 1
 
-
-def test_cli_dispatches_replay(monkeypatch):
-    called = {"n": 0}
-
-    def spy(argv):
-        called["n"] += 1
-        return None
-
-    monkeypatch.setattr(cli, "replay_main", spy)
-    cli.main(["replay", "--log", "/tmp/nonexistent.npz"])
-    assert called["n"] == 1
 
 
 def test_cli_backward_compatible_no_subcommand(monkeypatch):

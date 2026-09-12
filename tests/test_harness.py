@@ -20,10 +20,3 @@ def test_sweep_module_imports():
     import evtrade.core.sweep as sweep_mod
     assert hasattr(sweep_mod, "run_one_vectorized")
 
-
-def test_replay_module_imports_ListBarFeed():
-    """replay.py 在 replay_engine 中已 import 并使用 ListBarFeed"""
-    import evtrade.core.replay as replay_mod
-    from evtrade.core._harness import ListBarFeed
-    assert callable(ListBarFeed)
-    assert hasattr(replay_mod, "replay_engine")

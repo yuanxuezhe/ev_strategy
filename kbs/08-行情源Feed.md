@@ -1,5 +1,7 @@
 # 08 行情数据加载与 bar 流
 
+> **2026-09-13 重要更新**: framework 不再持有资金/持仓/撮合/PnL/收益概念; 策略 `step` 内部自管。`Account` / `Executor` / `SimulatedExecutor` / `trade_decision` / `metrics.summarize` 已下线; `core/metrics` / `core/replay` / `core/permutation` / `core/config` 已删; `replay` 子命令 + `--against-ref` 已下线; `--init-cash --buy-pct --sell-pct --all-in --trade-qty --warmup-days --data-cache` CLI flag 已删 (走 `--params`).
+
 > 相关源码：`load_bars` / `synthetic_bars` / `_fetch`（`evtrade/core/data.py`）、
 > bar 流契约与 `ListBarFeed`（`evtrade/core/_harness.py`）、`Bar`（`evtrade/primitives.py`）
 >
@@ -50,15 +52,18 @@ A股时段 09:30-11:29 / 13:00-14:59 每天 240 根，含周末（保证跨日/�
 少量非整分秒（练习桶边界逻辑）。CLI `--synthetic-days N` 走此路径，转成与 `load_bars`
 同构的数组字典（`metrics.bars_to_arrays`）后喂给 vectorized 引擎。
 
-### 1.3 数据库连接串（`config.DB_URL`，敏感信息勿外传）
+### 1.3 数据库连接串（`evtrade/core/data.py::DB_URL` 默认值）
 
-默认值 `mysql+pymysql://EvTrade:p%40ssw0rd@192.168.10.2:33066/evtrade?charset=utf8mb4`，
-可用环境变量 `EVTRADE_DB_URL` 覆盖（避免凭据硬编码进版本库）。
+默认连接串 `mysql+pymysql://EvTrade:p%40ssw0rd@192.168.10.2:33066/evtrade?charset=utf8mb4`，
+即 `data.DB_URL` 的当前实现值（与 spec `R: Market data DB connection has a sane default` 同源）。
+可用环境变量 `EVTRADE_DB_URL` 覆盖——临时切库 / 离线 / 测时 escape 入口。
 
 - 主机 `192.168.10.2:33066`，库 `evtrade`，用户 `EvTrade`，密码 `p@ssw0rd`（URL 编码为 `p%40ssw0rd`）
-- 表 `minute_bars` 字段：`stock_code, stime, open, high, low, close, volume`
+- 表 `minute_bars` 字段：`stock_code, stime, open, high, low, close, volume`；表名可用 `EVTRADE_TABLE` 覆写
 - `stime` 为 14 位字符串 `YYYYMMDDHHmmss`，字符串比较即时间序，SQL 的范围过滤因此有效
 - 建议确认 `stime` 上有索引（按 stime 范围过滤 + 排序）
+- 默认 DB 不可达时 `cli.py::_run_backtest` 会接住 SQLAlchemy `OperationalError` 并打印一行中文提示
+  （含 `192.168.10.2:33066` 与 `EVTRADE_DB_URL`），再以 `SystemExit(2)` 退出
 
 ## 2. bar 流契约 —— 鸭子类型 `.stream() -> Iterator[Bar]`
 
