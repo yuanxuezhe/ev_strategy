@@ -1,20 +1,17 @@
 from __future__ import annotations
-"""参数并发扫描 + 鲁棒选参框架
+"""参数并发扫描
 
-WFO 多窗回测 + 复合评分 (score = ann_net_min / (1 + λ·S)) + 帕累托标记 + 硬过滤。
-单一执行路径: vectorized_engine.run_vectorized。
+2026-09-13 重构: framework 不再汇总 metrics; sweep 仅按策略 params_spec 网格
+跑策略 step, 返回每组的 final_state 透传 + 邻域 S + pareto 标记。
 """
-
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from .config import INIT_CASH, INIT_POSITION, TRADE_QTY
 
-# 引擎级 grid key (框架自带); 策略参数名由其 params_spec 自动允许
-GRID_KEYS = ("period", "trade_qty",
-             "buy_pct", "sell_pct")
+# 引擎级 grid key (仅 period; funding/撮合 由策略 params 承担)
+GRID_KEYS = ("period",)
 
 
 def parse_grid(specs: list, extra_keys: set[str] | None = None,
@@ -60,39 +57,13 @@ def parse_grid(specs: list, extra_keys: set[str] | None = None,
     return combos
 
 
-def run_one_from_dict(bars: dict, p: dict, warmup_until: int,
-                      strategy_name: str | None = None) -> dict:
-    """单组参数单窗回测 (dict 形式; 委托 run_one_vectorized)
-
-    strategy_name: 必填 (策略 key), 见 evtrade.strategies.available_strategies()
-    p 必含键: period / init_cash / init_position / trade_qty / params
-    可选:    buy_pct / sell_pct
-    """
-    if not strategy_name:
-        raise ValueError("run_one_from_dict: strategy_name is required")
-    return run_one_vectorized(
-        bars, p["period"], warmup_until,
-        strategy_name=strategy_name,
-        strategy_params=p.get("params") or {},
-        init_cash=p["init_cash"],
-        init_position=p["init_position"],
-        trade_qty=p["trade_qty"],
-        buy_pct=p.get("buy_pct", 0.0),
-        sell_pct=p.get("sell_pct", 0.0),
-    )
-
-
 def run_one_vectorized(bars: dict, period: str, warmup_until: int,
                        strategy_name: str,
-                       strategy_params: dict | None = None,
-                       init_cash: float = INIT_CASH,
-                       init_position: float = INIT_POSITION,
-                       trade_qty: float = TRADE_QTY,
-                       buy_pct: float = 0.0,
-                       sell_pct: float = 0.0) -> dict:
+                       strategy_params: dict | None = None) -> dict:
     """单组参数单窗回测 (vectorized 入口; 内部走 run_vectorized)
 
     strategy_params: 策略参数 dict (会被 _resolve_params 校验)
+    返回: {"final_state": ..., "sig": ndarray, "buckets": dict} 透传 run_vectorized
     """
     from ..strategies import get_strategy
     from .vectorized_engine import run_vectorized
@@ -100,19 +71,7 @@ def run_one_vectorized(bars: dict, period: str, warmup_until: int,
     return run_vectorized(
         bars_1m=bars, period=period, warmup_until=warmup_until,
         strategy=strategy, params=strategy.params,
-        init_cash=init_cash, init_position=init_position,
-        trade_qty=trade_qty,
-        buy_pct=buy_pct, sell_pct=sell_pct,
-    )["summary"]
-
-
-def _ann_net(m: dict, fee_bp: float) -> float:
-    """年化扣费超额% = excess_pct/years - turnover×fee/baseline/years×100"""
-    fee = fee_bp / 10000.0
-    if m.get("years", 0) > 0 and m.get("baseline", 0) > 0:
-        return (m["excess_pct"] / m["years"]
-                - m["turnover"] * fee / m["baseline"] / m["years"] * 100.0)
-    return 0.0
+    )
 
 
 def _neighbor_decay(combos: list[dict], values: np.ndarray) -> np.ndarray:
@@ -170,14 +129,17 @@ def _pareto_flag(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 def sweep(bars: dict, base: dict, combos: list[dict],
           split_ymd: str = None, n_workers: int | None = None,
           verbose: bool = True,
-          device: str = "cpu", splits: list = None, fee_bp: float = 5.0,
-          lam: float = 1.0, min_trades: int = 30, max_mdd: float = 1.0,
+          device: str = "cpu", splits: list = None,
+          lam: float = 1.0,
           strategy_name: str | None = None):
-    """并发扫描 + 鲁棒评分; 返回 pandas.DataFrame (按 score 降序)
+    """并发扫描; 返回 pandas.DataFrame (按 score 降序)
+
+    2026-09-13 重构: framework 不再汇总 metrics; 只按 params 网格跑策略 step,
+    透传 final_state, 用 final_state 中策略自定的标量字段做评分。
+    若策略未声明标量, score=0 (排序 fallback)。
 
     strategy_name: 必填 (策略 key); 通过 params_spec 解析所有策略参数。
-
-    base 键: start/period/trade_qty/init_cash/init_position + strategy_params
+    base 键: start + strategy_params
     combos:  parse_grid 的输出, 覆盖 base 中的对应键 (策略参数键)。
     splits:  滚动 WFO 分割日列表 ["20260101","20260401"]; 1 个时窗口名为 train/test,
              多个时为 train/test1..testK。None=单窗 (列名无前缀)。
@@ -186,7 +148,7 @@ def sweep(bars: dict, base: dict, combos: list[dict],
         raise ValueError("sweep: strategy_name is required")
     import pandas as pd
 
-    # 设备解析: requested device + gpu_available; auto 模式下 gpu 不可用时降级 cpu
+    # 设备解析
     from ..backends import gpu_available, resolve_device
     import logging
     _log = logging.getLogger("evtrade.sweep")
@@ -237,7 +199,6 @@ def sweep(bars: dict, base: dict, combos: list[dict],
               for c in combos]
 
     # ---- 预校验: 跨字段 validators 失败的 combo 跳过 (不污染 sweep_results.csv) ----
-    from ..strategies import get_strategy_class
     strategy_cls_for_validate = get_strategy_class(strategy_name)
     valid_combos = []
     skipped_combos = []
@@ -262,18 +223,12 @@ def sweep(bars: dict, base: dict, combos: list[dict],
 
     def _run_one(wb, p, warm):
         # 抽策略 spec 字段 (per-combo 已 flat 合并到 p 顶层) 当 strategy_params
-        # 旧逻辑用 p.get("params", {}) 在 spec 字段 flat 化后拿不到 -> 走 default
         spec_keys_set = set(spec.keys())
         sp_params = {k: p[k] for k in spec_keys_set if k in p}
         return run_one_vectorized(
             wb, p["period"], warm,
             strategy_name=strategy_name,
             strategy_params=sp_params,
-            init_cash=p["init_cash"],
-            init_position=p["init_position"],
-            trade_qty=p["trade_qty"],
-            buy_pct=p.get("buy_pct", 0.0),
-            sell_pct=p.get("sell_pct", 0.0),
         )
 
     # ---- 路由: batched (opt-in) vs ThreadPool ----
@@ -287,18 +242,17 @@ def sweep(bars: dict, base: dict, combos: list[dict],
     )
 
     t0 = time.perf_counter()
-    metrics = [[None] * len(params_list) for _ in win_data]
+    results = [[None] * len(params_list) for _ in win_data]
     if use_batched:
         if verbose:
             print(f"  -- batched 路径 (device={device}, n_combos={len(params_list)}); "
                   f"--workers 忽略", flush=True)
         from .batched_sweep import run_batched
         try:
-            metrics = run_batched(
+            results = run_batched(
                 bars, base, params_list,
                 strategy_cls=strategy_cls, device=device,
-                splits=splits, fee_bp=fee_bp, lam=lam,
-                min_trades=min_trades, max_mdd=max_mdd,
+                splits=splits,
                 split_ymd=split_ymd,
             )
         except RuntimeError as e:
@@ -319,48 +273,46 @@ def sweep(bars: dict, base: dict, combos: list[dict],
                 }
                 for fut in as_completed(futures):
                     wi, ci = futures[fut]
-                    metrics[wi][ci] = fut.result()
+                    results[wi][ci] = fut.result()
         else:
             for wi, (_, wb, warm) in enumerate(win_data):
                 for ci, p in enumerate(params_list):
-                    metrics[wi][ci] = _run_one(wb, p, warm)
+                    results[wi][ci] = _run_one(wb, p, warm)
     dt = time.perf_counter() - t0
 
     # ---- 行装配 ----
+    # 2026-09-13: framework 不再汇总 metrics; final_state 由策略持有, framework 仅
+    # 透传 + 提供 score 计算用的标量 'primary_score' (策略 final_state 中应包含此字段;
+    # 若无则 score=0)。策略可自己定义 final_state 字段; framework 不读其它字段。
     rows = []
     for ci, combo in enumerate(combos):
         row = {**combo}
-        for (nm, _, _), ms in zip(win_data, metrics):
-            m = ms[ci]
+        for (nm, _, _), res in zip(win_data, results):
+            r = res[ci]
+            final = r.get("final_state") if r else None
             pre = "" if nm == "full" else f"{nm}_"
-            row.update({f"{pre}{k}": v for k, v in m.items()})
-            row[f"{pre}ann_net"] = _ann_net(m, fee_bp)
-        test_metrics = [ms[ci] for (nm, _, _), ms in zip(win_data, metrics)
-                        if nm != "train"]
-        anns = [_ann_net(m, fee_bp) for m in test_metrics]
-        row["ann_net_min"] = min(anns)
-        row["ann_net_mean"] = float(np.mean(anns))
-        row["pos_ratio"] = float(np.mean([a > 0 for a in anns]))
-        row["sharpe_min"] = min(m.get("sharpe_excess", 0.0) for m in test_metrics)
-        row["sortino_min"] = min(m.get("sortino_excess", 0.0) for m in test_metrics)
-        row["calmar_max"] = max(m.get("calmar", 0.0) for m in test_metrics)
-        row["cagr_max"] = max(m.get("cagr", 0.0) for m in test_metrics)
-        row["max_dd_days_max"] = max(m.get("max_dd_days", 0.0) for m in test_metrics)
-        row["x_mdd_max"] = max(m.get("x_mdd", 0.0) for m in test_metrics)
-        # max_drawdown 是占初始权益的小数; --max-mdd 默认 1.0 = 100% = 不限
-        row["filter_pass"] = bool(
-            all(m["n_trades"] >= min_trades for m in test_metrics)
-            and all(m.get("max_drawdown", 0.0) <= max_mdd for m in test_metrics))
+            primary = _extract_primary_score(final)
+            row[f"{pre}primary_score"] = primary
+            row[f"{pre}final_state"] = final  # 策略自管的 dataclass / dict 透传
+        test_scores = []
+        for (nm, _, _), res in zip(win_data, results):
+            if nm == "train":
+                continue
+            r = res[ci]
+            final = r.get("final_state") if r else None
+            test_scores.append(_extract_primary_score(final))
+        row["primary_score_min"] = min(test_scores) if test_scores else 0.0
+        row["primary_score_mean"] = float(np.mean(test_scores)) if test_scores else 0.0
         rows.append(row)
 
     # ---- 邻域衰减 S + 复合 score + 帕累托 ----
-    S = _neighbor_decay(combos, np.array([r["ann_net_min"] for r in rows]))
+    S = _neighbor_decay(combos, np.array([r["primary_score_min"] for r in rows]))
     for row, s in zip(rows, S):
         row["S"] = float(s)
-        base_v = row["ann_net_min"]
+        base_v = row["primary_score_min"]
         row["score"] = base_v / (1.0 + lam * s) if base_v > 0 else base_v
-    pf = _pareto_flag(np.array([r["ann_net_mean"] for r in rows]),
-                      np.array([r["sharpe_min"] for r in rows]))
+    pf = _pareto_flag(np.array([r["primary_score_mean"] for r in rows]),
+                      np.array([r["primary_score_min"] for r in rows]))
     for row, f in zip(rows, pf):
         row["pareto"] = bool(f)
 
@@ -370,8 +322,21 @@ def sweep(bars: dict, base: dict, combos: list[dict],
         n_bars = len(bars["stime"])
         n_runs = len(combos) * len(win_data)
         print(f"  -- 扫描 {len(combos)} 组 x {len(win_data)} 窗 x {n_bars} 根 bar "
-              f"[{device}] 费率 {fee_bp:.0f}bp λ={lam} "
+              f"[{device}] λ={lam} "
               f"耗时 {dt:.2f}s ({dt / max(n_runs, 1) * 1000:.2f} ms/次回测)",
               flush=True)
     return df
 
+
+def _extract_primary_score(final_state) -> float:
+    """从策略 final_state 提 score 用标量 (framework 不识别具体字段语义)
+
+    优先级: dataclass/dict['primary_score'] -> final_state['final_score'] -> 0
+    """
+    if final_state is None:
+        return 0.0
+    if isinstance(final_state, dict):
+        return float(final_state.get("primary_score",
+                                     final_state.get("final_score", 0.0)))
+    return float(getattr(final_state, "primary_score",
+                         getattr(final_state, "final_score", 0.0)))

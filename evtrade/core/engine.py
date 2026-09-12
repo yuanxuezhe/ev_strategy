@@ -1,16 +1,17 @@
-"""逐 bar 回测/实盘引擎 (实盘/对账用)
+"""逐 bar 步进引擎 (实盘/对账通用)
 
-run(): feed → aggregator → on_bars → strategy.step(state, bar) → executor
+run(): feed → aggregator → on_bars → strategy.step(state, bar) → 累计 sig
 
 策略在 step(state, bar, params) 内推 EMA / FSM state; state 由 engine 持有
 跨调用持续; framework 不传任何指标。
 
 Engine 不假设 info 键集; 信号行打印走 strategy.format_signal_line hook。
+2026-09-13 重构: framework 不再调 Executor / trade_decision / Account;
+策略 step 自负责撮合与记账 (framework 仅驱动 step + 累计 sig/state)。
 """
+from __future__ import annotations
 
 from ..core.aggregator import BarAggregator
-from ..execution.base import Executor
-from ..primitives import sig_to_side
 from ..strategies.vectorized_base import VectorizedStrategy
 
 
@@ -25,18 +26,21 @@ def _bucket_bar(rec: dict) -> dict:
 
 
 class Engine:
-    """回测/实盘统一引擎 (framework 不假定指标; VectorizedStrategy 唯一契约)"""
+    """逐 bar 步进引擎 (framework 仅驱动 step + 累计 sig/state)"""
 
-    def __init__(self, feed, aggregator: BarAggregator,
-                 strategy: VectorizedStrategy, executor: Executor,
+    def __init__(self, feed, strategy: VectorizedStrategy,
+                 aggregator: BarAggregator | None = None,
                  verbose: bool = True, **legacy):
         # feed: 任意 stream() -> Iterator[Bar] 的 bar 流对象 (鸭子类型)
         self.feed = feed
-        self.aggregator = aggregator
         self.strategy = strategy
-        self.executor = executor
+        # 兼容旧调用: aggregator 可显式传入, 否则按需构造
+        if aggregator is None:
+            from ..core.aggregator import BarAggregator as _Agg
+            aggregator = _Agg()
+        self.aggregator = aggregator
         self.verbose = verbose
-        # 桶级信号轨迹 (供 replay/reconcile 对账用)
+        # 桶级信号轨迹
         self.bucket_signals: list[int] = []
         # 上一根 1m bar 的 cur 快照 (检测桶切换)
         self._last_cur: dict | None = None
@@ -46,20 +50,16 @@ class Engine:
         self.aggregator.on_bars = self.on_bars
 
     def _process_bucket(self, rec: dict):
-        """桶 finalized 后: 算一次信号 + 可选下单/打印"""
+        """桶 finalized 后: 算一次信号 + 打印"""
         if rec.get("mark", 1) != 1:
             return
-        price = float(rec["close"])
         self._state, sig_int = self.strategy.step(
             self._state, _bucket_bar(rec), self.strategy.params)
         self.bucket_signals.append(int(sig_int))
-        if sig_int != 0:
-            signal = sig_to_side(sig_int)
-            self.executor.trade(signal, price, rec["ts"])
-            if self.verbose:
-                info = getattr(self.strategy, "_last_info", None)
-                print(self.strategy.format_signal_line(rec["ts"], sig_int, info),
-                      flush=True)
+        if sig_int != 0 and self.verbose:
+            info = getattr(self.strategy, "_last_info", None)
+            print(self.strategy.format_signal_line(rec["ts"], sig_int, info),
+                  flush=True)
 
     def on_bars(self, bars: list[dict]):
         """聚合器回调: 桶 CLOSE 时驱动策略一次 (用 finalized OHLCV)"""

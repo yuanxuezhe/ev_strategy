@@ -1,27 +1,21 @@
 from __future__ import annotations
-"""命令行入口: backtest / sweep / replay / params 四个子命令
+"""命令行入口: backtest / sweep / params 三个子命令 (2026-09-13 重构)
+
+framework 不持有资金/撮合/PnL/收益概念; CLI 不再有 --init-cash / --buy-pct /
+--trade-qty 等参数; 策略资金/持仓/撮合/PnL 由策略 step 自管理。
 
 唯一执行路径 (CPU/GPU 统一走 vectorized 引擎):
-  - backtest: vectorized_engine.run_vectorized
-  - sweep:    core.sweep.sweep (内部走 run_one_vectorized)
-  - replay:   replay.replay_vectorized (--against-ref 加 replay.reconcile)
+  - backtest: vectorized_engine.run_vectorized (仅驱动 step, 返回 final_state 透传)
+  - sweep:    core.sweep.sweep (内部走 run_vectorized)
 
 设备选择: --device {cpu, gpu, auto} (默认 auto)
-  - auto: 优先 gpu (torch CUDA 可用), 否则 cpu
-  - cpu:  cpu
-  - gpu:  gpu (需 torch + CUDA, 无 CUDA 时直接报错)
-
-常见修改:
-  1. 加新参数: 共享选项进 _common_parent / _data_parent; 子命令专属进 build_*_parser;
-     在对应的 _run_* 中读取并透传。
-  2. 改输出格式: _run_backtest() 末尾的 print 段。
-  3. 加新子命令: 在 build_root_parser 的 builders 列表加一项, main() 的 handlers 字典加一项。
 """
-
 import argparse
 import time
 
-from .core.config import INIT_CASH, INIT_POSITION, TRADE_QTY
+import numpy as np
+
+from .core.data import DB_URL, TABLE
 from .core.timeutils import resolve_period_seconds
 
 
@@ -65,7 +59,11 @@ def _resolve_strategy_params(strategy_name: str, params_arg: str) -> dict:
 # ============ 共享选项父 parser (argparse parents= 单点声明) ============
 
 def _common_parent() -> argparse.ArgumentParser:
-    """backtest / sweep / replay 共享选项 (声明一次, 三处 parents= 引用)"""
+    """backtest / sweep 共享选项 (声明一次, 两处 parents= 引用)
+
+    2026-09-13 重构: 不再有 --init-cash / --buy-pct / --sell-pct / --all-in /
+    --trade-qty / --warmup-days / --data-cache (framework 不再管这些)
+    """
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--strategy", default="channel_deviation",
                     help="策略 key (来自 evtrade.strategies.available_strategies())")
@@ -73,29 +71,22 @@ def _common_parent() -> argparse.ArgumentParser:
                     help="策略参数 (通用 dict 形式): 'k1:v1;k2:v2'")
     ap.add_argument("--period", default="5m", type=_period_type,
                     help="K线周期, 任意数字+m/h/d: 5m/7m/15m/30m/90m/2h/4h/6h/1d/3d ...")
-    ap.add_argument("--all-in", action="store_true",
-                    help="全仓模式 (等价 --buy-pct 1.0 --sell-pct 1.0)")
-    ap.add_argument("--buy-pct", type=float, default=0.0,
-                    help="BUY 时按当前现金的该比例下注 (0=关闭走 --trade-qty)")
-    ap.add_argument("--sell-pct", type=float, default=0.0,
-                    help="SELL 时按当前持仓的该比例卖 (0=关闭走 --trade-qty)")
     ap.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"],
                     help="计算后端: cpu / gpu / auto=优先 gpu (默认)")
-    ap.add_argument("--signals-out", default=None, help="信号轨迹 CSV (ts,sig)")
+    ap.add_argument("--signals-out", default=None,
+                    help="信号轨迹 CSV (ts,sig); framework 仅透传策略 sig")
     return ap
 
 
 def _data_parent() -> argparse.ArgumentParser:
-    """backtest / sweep 共享的行情拉取选项 (声明一次, 两处 parents= 引用)"""
+    """backtest / sweep 共享的行情拉取选项 (声明一次, 两处 parents= 引用)
+
+    2026-09-13 重构: --warmup-days / --trade-qty / --data-cache 删除
+    """
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--code", default="159992.SZ", help="证券代码")
     ap.add_argument("--start", default="20250101", help="开始日期 YYYYMMDD")
     ap.add_argument("--end", default="20260903", help="结束日期 YYYYMMDD")
-    ap.add_argument("--trade-qty", type=float, default=TRADE_QTY,
-                    help="每次信号交易股数")
-    ap.add_argument("--warmup-days", type=int, default=365,
-                    help="预热天数 (拉取 start 之前的行情供指标就绪)")
-    ap.add_argument("--data-cache", default=None, help="行情 npz 缓存目录")
     ap.add_argument("--synthetic-days", type=int, default=0,
                     help=">0 时用合成数据 (不连库, A 股交易时段 seed=42)")
     return ap
@@ -107,10 +98,6 @@ def build_backtest_parser(ap: argparse.ArgumentParser) -> argparse.ArgumentParse
     """backtest 选项 (注册到给定 parser; prog/description 在 backtest_main)"""
     ap.add_argument("--verbose", "-v", action="store_true",
                     help="逐根打印 strategy.format_signal_line 输出 (sig!=0 时)")
-    ap.add_argument("--init-cash", type=float, default=INIT_CASH,
-                    help="期初资金 (默认 20万); 传 0 忽略, 走零起点")
-    ap.add_argument("--init-position", type=float, default=INIT_POSITION,
-                    help="期初持仓股数 (默认 20万); 传 0 忽略, 走零起点")
     return ap
 
 
@@ -124,8 +111,8 @@ def _write_signals_csv(path: str, rows: list[tuple]) -> None:
 
 
 def _run_backtest(args):
-    """backtest 入口 (vectorized 引擎)"""
-    # 设备解析: --device gpu 无 CUDA 抛错; auto 降级 (三子命令统一)
+    """backtest 入口 (vectorized 引擎; 仅驱动 step)"""
+    # 设备解析: --device gpu 无 CUDA 抛错; auto 降级
     from .backends import gpu_available, resolve_device
     args.device = resolve_device(args.device, gpu_available())
 
@@ -139,77 +126,77 @@ def _run_backtest(args):
     if args.synthetic_days > 0:
         from datetime import datetime, timedelta
         from .core.data import synthetic_bars
-        from .core.metrics import bars_to_arrays
         d_end = datetime.strptime(args.end, "%Y%m%d")
         d_start = d_end - timedelta(days=args.synthetic_days)
         print(f"生成合成数据: {d_start:%Y%m%d} ~ {args.end} "
               f"({args.synthetic_days} 天, seed=42)", flush=True)
-        bars = bars_to_arrays(synthetic_bars(days=args.synthetic_days,
-                                             start_ymd=f"{d_start:%Y%m%d}"))
+        from .primitives import Bar
+        synth = synthetic_bars(days=args.synthetic_days,
+                               start_ymd=f"{d_start:%Y%m%d}")
+        # 转 numpy dict (与 load_bars 同构)
+        n = len(synth)
+        arrays = {
+            "stime": np.array([int(b.stime) for b in synth], dtype=np.int64),
+            "open":  np.array([b.open for b in synth], dtype=np.float64),
+            "high":  np.array([b.high for b in synth], dtype=np.float64),
+            "low":   np.array([b.low for b in synth], dtype=np.float64),
+            "close": np.array([b.close for b in synth], dtype=np.float64),
+            "volume": np.array([b.volume for b in synth], dtype=np.float64),
+        }
+        bars = arrays
     else:
-        bars = load_bars(args.code, args.start, args.end,
-                         warmup_days=args.warmup_days, cache_dir=args.data_cache)
+        try:
+            bars = load_bars(args.code, args.start, args.end)
+        except Exception as e:
+            # 友好提示: 默认 DB 不可达时告诉用户默认主机 + 逃生口 (设计 D3)
+            from sqlalchemy.exc import OperationalError as _SAOperationalError
+            if isinstance(e, _SAOperationalError):
+                # 用 DEFAULT_DB_URL 而非 DB_URL: 前者不受 EVTRADE_DB_URL 覆写,
+                # 始终是项目默认值 (spec Scenario "DB 不可达时 CLI 输出默认主机提示")
+                from .core.data import DEFAULT_DB_URL, DEFAULT_TABLE
+                print(
+                    f"\n[数据源不可达] 当前默认 DB_URL = {DEFAULT_DB_URL}\n"
+                    f"               默认表名 = {DEFAULT_TABLE}\n"
+                    f"  → 网络/VPN/库未启; 可 export EVTRADE_DB_URL / EVTRADE_TABLE 指向其他库,\n"
+                    f"  → 或加 --synthetic-days N 用合成数据跳过 DB。",
+                    flush=True,
+                )
+                raise SystemExit(2)
+            raise
     n = len(bars["stime"])
     print(f"证券: {args.code}  周期: {args.period}  策略日期: {args.start}~{args.end}  "
-          f"预热: {args.warmup_days}天  "
-          f"策略: {args.strategy}  "
-          f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}  "
-          f"device={args.device}\n", flush=True)
+          f"策略: {args.strategy}  device={args.device}\n", flush=True)
 
     t0 = time.perf_counter()
-    buy_pct = max(args.buy_pct, 1.0) if args.all_in else args.buy_pct
-    sell_pct = max(args.sell_pct, 1.0) if args.all_in else args.sell_pct
     result = run_vectorized(
         bars, period=args.period, warmup_until=int(args.start) * 1_000_000,
         strategy=strategy, params=strategy.params,
-        init_cash=args.init_cash, init_position=args.init_position,
-        trade_qty=args.trade_qty,
-        buy_pct=buy_pct, sell_pct=sell_pct,
         verbose=args.verbose)
     dt = time.perf_counter() - t0
 
-    s = result["summary"]
-    for t in s["trades"]:
-        side = "BUY " if t["side"] == "BUY" else "SELL"
-        print(f"        >> {side} {t['qty']:.0f}股 @ {t['price']:.4f}  "
-              f"[{t['ts']}]  剩余资金 {t['cash_after']:.2f}", flush=True)
-
     print("\n" + "=" * 60)
-    print("回测盈亏汇总 (vectorized)")
+    print(f"回测完成 (vectorized; 仅驱动 step; framework 不汇总 PnL/收益)")
     print("=" * 60)
-    print(f"期末价 (最后一根close) : {s['final_price']:.4f}")
-    print(f"交易次数              : {s['n_trades']} (BUY {s['n_buy']} / SELL {s['n_sell']})")
-    print(f"期初资金 / 期初持仓    : {args.init_cash:.0f} / {args.init_position:.0f}股")
-    print(f"期末资金 / 期末持仓    : {s['final_cash']:.2f} / {s['final_position']:.0f}股")
-    print(f"期末持仓市值           : {s['final_position'] * s['final_price']:.2f}")
-    print(f"策略总资产 (资金+市值) : {s['final_equity']:.2f}")
-    print(f"不操作基线 (资金+市值) : {s['baseline']:.2f}")
-    print(f"盈亏比例              : {s['excess_pct']:+.2f}%")
+    print(f"信号轨迹:    {len(result['sig'])} 桶 (mark=1 段)")
+    print(f"桶数:        {len(result['buckets']['ts'])} (含预热)")
+    print(f"引擎耗时:    {dt * 1000:.1f} ms ({n} 根 1m bar, {args.device})")
     print("-" * 60)
-    print(f"跨度 years            : {s['years']:.3f}")
-    print(f"年化复合 CAGR         : {s['cagr']:+.2f}%/年")
-    print(f"年化超额 CAGR (复合)   : {s['cagr_excess']:+.2f}%/年")
-    print(f"超额 Sharpe / IR      : {s['sharpe_excess']:+.3f} / {s['ir']:+.3f}")
-    print(f"超额 Sortino          : {s['sortino_excess']:+.3f}")
-    print(f"Calmar (年化/回撤)    : {s['calmar']:+.3f}")
-    print("-" * 60)
-    print(f"最大回撤 (策略)        : {s['max_drawdown']:+.2%}")
-    print(f"最大回撤 (基准)        : {s['baseline_max_dd']:+.2%}")
-    print(f"回撤差 (策略-基准)     : {s['dd_excess']:+.2%}  (正值=策略比基准更深)")
-    print(f"最大回撤持续天数       : {s['max_dd_days']:.1f} 天")
-    # max_dd_recovered: -1 sentinel 表示从未恢复
-    dd_recovered = "未恢复" if s['max_dd_recovered'] == -1 else f"{s['max_dd_recovered']} 桶"
-    print(f"最大回撤恢复 (trough→) : {dd_recovered}")
-    print("-" * 60)
-    # 持仓行为: 仅在有成交时打印关键值
-    pf_str = "inf" if s['profit_factor'] == float('inf') else f"{s['profit_factor']:.2f}"
-    print(f"胜率 / 盈亏比         : {s['win_rate']:.1%} / {pf_str}")
-    print(f"平均每笔 PnL          : {s['avg_pnl']:+.2f}")
-    print(f"最大连盈 / 连亏笔数   : {s['max_consecutive_wins']} / {s['max_consecutive_losses']}")
-    print(f"平均 / 最大持仓周期    : {s['avg_hold_bars']:.1f} / {s['max_hold_bars']} 桶")
-    print("-" * 60)
-    print(f"成交额合计            : {s['turnover']:.0f}")
-    print(f"引擎耗时              : {dt * 1000:.1f} ms ({n} 根 1m bar, {args.device})")
+    print("策略 final_state (framework 仅透传):")
+    final = result["final_state"]
+    if final is None:
+        print("  (None)")
+    elif hasattr(final, "__dataclass_fields__"):
+        for k, v in final.__dataclass_fields__.items():
+            val = getattr(final, k)
+            if isinstance(val, (int, float, str, bool)):
+                print(f"  {k} = {val!r}")
+            else:
+                print(f"  {k} = <{type(val).__name__}>")
+    elif isinstance(final, dict):
+        for k, v in final.items():
+            print(f"  {k} = {v!r}")
+    else:
+        print(f"  {final!r}")
     print("=" * 60)
 
     if args.signals_out:
@@ -240,12 +227,7 @@ def build_sweep_parser(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--split", default=None, help="单分割日 YYYYMMDD")
     ap.add_argument("--splits", default=None,
                     help="滚动 WFO 分割日, 逗号分隔")
-    ap.add_argument("--fee-bp", type=float, default=5.0)
     ap.add_argument("--score-lambda", type=float, default=1.0)
-    ap.add_argument("--min-trades", type=int, default=30)
-    ap.add_argument("--max-mdd", type=float, default=1.0)
-    ap.add_argument("--mc", type=int, default=0)
-    ap.add_argument("--mc-top", type=int, default=5)
     ap.add_argument("--workers", type=int, default=None)
     ap.add_argument("--out", default="sweep_results.csv")
     ap.add_argument("--top", type=int, default=20)
@@ -261,7 +243,6 @@ def sweep_main(argv=None):
         parents=[_common_parent(), _data_parent()])
     args = build_sweep_parser(ap).parse_args(argv)
     from .core.data import load_bars, synthetic_bars
-    from .core.metrics import bars_to_arrays
     from .core.sweep import GRID_KEYS, parse_grid, sweep as run_sweep
     from .strategies import get_strategy_param_spec
 
@@ -271,17 +252,22 @@ def sweep_main(argv=None):
         d_start = d_end - timedelta(days=args.synthetic_days)
         print(f"生成合成数据: {d_start:%Y%m%d} ~ {args.end} "
               f"({args.synthetic_days} 天, seed=42)", flush=True)
-        bars = bars_to_arrays(synthetic_bars(days=args.synthetic_days,
-                                             start_ymd=f"{d_start:%Y%m%d}"))
+        from .primitives import Bar
+        synth = synthetic_bars(days=args.synthetic_days,
+                               start_ymd=f"{d_start:%Y%m%d}")
+        bars = {
+            "stime": np.array([int(b.stime) for b in synth], dtype=np.int64),
+            "open":  np.array([b.open for b in synth], dtype=np.float64),
+            "high":  np.array([b.high for b in synth], dtype=np.float64),
+            "low":   np.array([b.low for b in synth], dtype=np.float64),
+            "close": np.array([b.close for b in synth], dtype=np.float64),
+            "volume": np.array([b.volume for b in synth], dtype=np.float64),
+        }
     else:
-        bars = load_bars(args.code, args.start, args.end,
-                         warmup_days=args.warmup_days, cache_dir=args.data_cache)
+        bars = load_bars(args.code, args.start, args.end)
 
     base_params = _resolve_strategy_params(args.strategy, args.params)
     base = {"start": args.start, "period": args.period,
-            "trade_qty": args.trade_qty,
-            "buy_pct": args.buy_pct, "sell_pct": args.sell_pct,
-            "init_cash": INIT_CASH, "init_position": INIT_POSITION,
             "params": base_params}
     spec_keys = set(get_strategy_param_spec(args.strategy))
     spec_map = get_strategy_param_spec(args.strategy)
@@ -296,15 +282,13 @@ def sweep_main(argv=None):
         print(f"扫描 {len(combos)} 组参数 (单窗) ...\n", flush=True)
     df = run_sweep(bars, base, combos, split_ymd=args.split,
                    n_workers=args.workers, device=args.device,
-                   splits=splits, fee_bp=args.fee_bp, lam=args.score_lambda,
-                   min_trades=args.min_trades, max_mdd=args.max_mdd,
+                   splits=splits, lam=args.score_lambda,
                    strategy_name=args.strategy)
     df.to_csv(args.out, index=False, encoding="utf-8-sig")
     cols = [c for c in df.columns]
     show = [c for c in df.columns
-            if c in ("score", "ann_net_min", "ann_net_mean", "pos_ratio",
-                     "sharpe_min", "sortino_min", "calmar_max", "cagr_max",
-                     "max_dd_days_max", "x_mdd_max", "S", "pareto", "filter_pass")
+            if c in ("score", "primary_score_min", "primary_score_mean",
+                     "S", "pareto")
             or c in GRID_KEYS or c in spec_keys]
     print(df[show].head(args.top).to_string(index=False))
     print(f"\n全部结果已保存: {args.out} ({len(df)} 行; 列: {cols})")
@@ -322,85 +306,6 @@ def sweep_main(argv=None):
             print(format_reason_log(args.strategy, reason,
                                     saved_path, commit_ok),
                   flush=True)
-
-    if args.mc > 0:
-        from .core.permutation import permutation_test
-        print(f"\n蒙特卡洛置换检验 (前 {args.mc_top} 名, 各打乱 {args.mc} 次):")
-        warm = int(base["start"]) * 1_000_000
-        for _, row in df.head(args.mc_top).iterrows():
-            combo = {k: row[k] for k in GRID_KEYS if k in row}
-            params = {**base, **combo}
-            r = permutation_test(bars, params, warm, n=args.mc,
-                                 fee_bp=args.fee_bp,
-                                 strategy_name=args.strategy)
-            print(f"  {' '.join(f'{k}={row[k]}' for k in combo)}  "
-                  f"真实年化超额 {r['real_ann_net']:+.2f}%/年  "
-                  f"p={r['p_value']:.3f}", flush=True)
-
-
-# ============ replay 子命令 ============
-
-def build_replay_parser(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """replay 选项 (注册到给定 parser; prog/description 在 replay_main)"""
-    ap.add_argument("--log", required=True,
-                    help="bar 日志 (CSV: stime,code,open,high,low,close,volume)")
-    ap.add_argument("--warmup-until", default=None)
-    ap.add_argument("--against-ref", action="store_true",
-                    help="同时用 Engine.on_bars 回放并逐 bar 对账")
-    return ap
-
-
-def replay_main(argv=None):
-    ap = argparse.ArgumentParser(
-        prog="evtrade replay",
-        description="录制回放对账 (vectorized 引擎; --against-ref 走 Engine.on_bars 对账)",
-        parents=[_common_parent()])
-    args = build_replay_parser(ap).parse_args(argv)
-    from .core.replay import (
-        read_bars_log, reconcile, replay_vectorized,
-    )
-
-    strategy_name = args.strategy
-    sp = _resolve_strategy_params(strategy_name, args.params)
-
-    # 设备解析: --device gpu 无 CUDA 抛错; auto 降级 (三子命令统一)
-    from .backends import gpu_available, resolve_device
-    args.device = resolve_device(args.device, gpu_available())
-
-    bars = read_bars_log(args.log)
-    if not bars:
-        raise SystemExit("日志为空")
-    warm = int(args.warmup_until) * 1_000_000 if args.warmup_until else 0
-    print(f"回放: {len(bars)} 根 bar [{bars[0].stime} ~ {bars[-1].stime}]  "
-          f"period={args.period} 策略={strategy_name} "
-          f"params={sp or '(默认)'}  device={args.device}\n",
-          flush=True)
-
-    # all_in 两腿对称: 解析为 buy/sell_pct=1.0 后统一传给 vectorized 腿与
-    # reconcile (Engine 腿 SimulatedExecutor 内部同语义); 否则对账必然不对称 FAIL
-    buy_pct = max(args.buy_pct, 1.0) if args.all_in else args.buy_pct
-    sell_pct = max(args.sell_pct, 1.0) if args.all_in else args.sell_pct
-
-    k = replay_vectorized(bars, args.period, warm,
-                          strategy_name=strategy_name, strategy_params=sp,
-                          buy_pct=buy_pct, sell_pct=sell_pct)
-    s = k["summary"]
-    n_sig = int((k["sig"] != 0).sum()) if hasattr(k["sig"], "__len__") else 0
-    print(f"信号 {n_sig} 个 (BUY {s['n_buy']} / SELL {s['n_sell']}), "
-          f"成交 {s['n_trades']} 笔, 期末总资产 {s['final_equity']:,.2f} "
-          f"(基线 {s['baseline']:,.2f}, 超额 {s['excess_pct']:+.2f}%)")
-
-    if args.signals_out:
-        _write_signals_csv(
-            args.signals_out,
-            [(int(t), int(s)) for t, s in zip(k["ts"], k["sig"])])
-
-    if args.against_ref:
-        print()
-        reconcile(bars, args.period, warm,
-                  strategy_name=strategy_name, strategy_params=sp,
-                  buy_pct=buy_pct, sell_pct=sell_pct,
-                  all_in=args.all_in)
 
 
 # ============ params 子命令 (默认参数落盘) ============
@@ -501,7 +406,7 @@ def params_main(argv=None):
 def build_root_parser():
     ap = argparse.ArgumentParser(
         prog="evtrade",
-        description="evtrade CLI: 策略回测 / 参数扫描 / 行情回放 / 默认参数管理",
+        description="evtrade CLI: 策略回测 / 参数扫描 / 默认参数管理",
     )
     sub = ap.add_subparsers(dest="cmd", help="子命令")
     builders = (
@@ -509,8 +414,6 @@ def build_root_parser():
          "策略回测"),
         ("sweep", build_sweep_parser, (_common_parent(), _data_parent()),
          "参数并发扫描"),
-        ("replay", build_replay_parser, (_common_parent(),),
-         "录制回放对账"),
         ("params", build_params_parser, (),
          "默认参数管理"),
     )
@@ -524,7 +427,7 @@ def build_root_parser():
 def main(argv=None):
     import sys
     raw = sys.argv[1:] if argv is None else argv
-    if not raw or raw[0] not in ("backtest", "sweep", "replay", "params",
+    if not raw or raw[0] not in ("backtest", "sweep", "params",
                                  "-h", "--help"):
         if raw and raw[0].startswith("-"):
             return build_root_parser().parse_args(raw)
@@ -534,7 +437,7 @@ def main(argv=None):
         return None
     args = build_root_parser().parse_args(raw)
     handlers = {"backtest": backtest_main, "sweep": sweep_main,
-                "replay": replay_main, "params": params_main}
+                "params": params_main}
     return handlers[args.cmd](raw[1:])
 
 
