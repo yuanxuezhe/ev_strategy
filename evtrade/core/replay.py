@@ -130,8 +130,9 @@ def replay_engine(bars, period: str, warmup_until: int,
 
     records: list[dict] = []
     account = Account(cash=init_cash, position=init_position)
-    # verbose=True 让 Executor 在 trade 时打 >> 行, Engine 在 sig!=0 时调 format_signal_line 并 print
-    executor = SimulatedExecutor(account, qty=trade_qty, verbose=True,
+    # Executor 仅调 trade_decision + Account.apply; 不再硬编码 print 成交明细 (2026-09-12 cleanup).
+    # Engine.verbose=True 让 sig!=0 时调 strategy.format_signal_line 并 print.
+    executor = SimulatedExecutor(account, qty=trade_qty,
                                  scale=scale, buy_pct=buy_pct,
                                  sell_pct=sell_pct, all_in=all_in,
                                  record_to=records)

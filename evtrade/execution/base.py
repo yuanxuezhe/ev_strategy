@@ -71,12 +71,11 @@ class SimulatedExecutor(Executor):
       三者均 0 时走 fixed-qty 路径
     """
 
-    def __init__(self, account, qty: float, verbose=True, scale: float = 1.0,
+    def __init__(self, account, qty: float, scale: float = 1.0,
                  buy_pct: float = 0.0, sell_pct: float = 0.0, all_in: bool = False,
                  record_to: list | None = None):
         self.account = account
         self.qty = qty
-        self.verbose = verbose
         self.scale = scale
         self.buy_pct = buy_pct
         self.sell_pct = sell_pct
@@ -105,11 +104,6 @@ class SimulatedExecutor(Executor):
         side_str = signal
         acc.apply(side_str, qty, price, ts)
         self._record(side=side_str, qty=qty, price=price, ts=ts)
-        if self.verbose:
-            verb = "BUY " if side > 0 else "SELL"
-            cash_word = "花费" if side > 0 else "收入"
-            print(f"        >> {verb}{qty:.0f}股 @ {price:.4f}  {cash_word} {qty*price:.2f}  "
-                  f"剩余资金 {cash:.2f} 持仓 {position:.0f}", flush=True)
         return True
 
     def _record(self, side: str, qty: float, price: float, ts: str):

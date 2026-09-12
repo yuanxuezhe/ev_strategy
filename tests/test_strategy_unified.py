@@ -103,7 +103,7 @@ def test_vectorized_vs_engine_on_bars_reconcile():
     strat2 = evtrade.get_strategy("channel_deviation", tf1=5)
     feed = ListBarFeed(bars_list)
     agg = BarAggregator(resolve_period_seconds("5m"), on_bars=None)
-    exe = SimulatedExecutor(Account(cash=100000, position=0), qty=100, verbose=False)
+    exe = SimulatedExecutor(Account(cash=100000, position=0), qty=100)
     eng = Engine(feed, agg, strat2, exe, verbose=False)
     eng.run()
     sig_r = np.array(eng.bucket_signals, dtype=np.int8)  # 桶级
