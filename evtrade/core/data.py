@@ -17,8 +17,18 @@ from datetime import datetime, timedelta
 
 import numpy as np
 
-from .config import DB_URL, TABLE
 from ..primitives import Bar
+
+# DB 默认值 (2026-09-13: framework 不再持有其他资金/持仓常量, 这里保留 DB URL/表名
+# 是因为数据加载是 framework 职责; 用户环境变量 EVTRADE_DB_URL / EVTRADE_TABLE 仍可覆写)
+#
+# 默认值指向项目共享开发库 192.168.10.2:33066/evtrade (见 kbs/08 §1.3 与
+# spec R "Market data DB connection has a sane default"); 密码中的 `@` URL-encode
+# 为 `%40` (design D1)。需要临时切库 / 离线 / 测试时 export EVTRADE_DB_URL / EVTRADE_TABLE。
+DEFAULT_DB_URL = "mysql+pymysql://EvTrade:p%40ssw0rd@192.168.10.2:33066/evtrade?charset=utf8mb4"
+DEFAULT_TABLE = "minute_bars"
+DB_URL = os.environ.get("EVTRADE_DB_URL", DEFAULT_DB_URL)
+TABLE = os.environ.get("EVTRADE_TABLE", DEFAULT_TABLE)
 
 BAR_KEYS = ("stime", "open", "high", "low", "close", "volume")
 
