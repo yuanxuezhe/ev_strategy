@@ -317,8 +317,13 @@ def test_sweep_batched_propagates_exceptions_immediately(monkeypatch):
                          n_workers=1, strategy_name="ma_crossover", verbose=False)
 
 
-def test_sweep_batched_fallback_to_cpu_when_no_cuda():
-    """gpu_available() == False -> use_batched False -> ThreadPool"""
+def test_sweep_batched_fallback_to_cpu_when_no_cuda(monkeypatch):
+    """gpu_available() == False -> use_batched False -> ThreadPool
+
+    用 monkeypatch 强制 gpu_available() 返回 False, 不依赖实际环境.
+    """
+    # sweep 用的是 `from ..backends import gpu_available`, 必须 patch 源头
+    monkeypatch.setattr("evtrade.backends.gpu_available", lambda: False)
     bars = _synthetic_arr(days=10, start_ymd="20260101", seed=42)
     base = {"start": "20260101", "period": "5m", "trade_qty": 10000,
             "init_cash": 200000, "init_position": 0, "scale": 1.0,
@@ -326,7 +331,7 @@ def test_sweep_batched_fallback_to_cpu_when_no_cuda():
     combos = [{"fast": fp, "slow": sp}
               for fp in [3, 5, 10, 21]
               for sp in [20, 30, 40, 60, 80, 100, 150, 200]]   # 32 combos
-    # 默认 gpu_available() 通常 False (无 CUDA); 走 ThreadPool
+    # 强制 gpu_available() False (即便本机有 CUDA, 此测试要求走 ThreadPool)
     df = sweep_mod.sweep(bars, base, combos, splits=None, device="auto",
                          n_workers=1, strategy_name="ma_crossover", verbose=False)
     assert len(df) == 32

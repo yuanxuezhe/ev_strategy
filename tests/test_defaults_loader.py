@@ -77,6 +77,31 @@ def test_save_is_atomic_no_tmp_left(isolated_defaults):
     assert leftovers == [], f"残留临时文件: {leftovers}"
 
 
+# ---------- numpy / pandas 标量兼容 ----------
+
+
+def test_save_accepts_numpy_int_params(isolated_defaults):
+    """filtered_mr 的 int 参数 (cur_ema_period / adx_period 等) 经 sweep 选出后
+    chosen[k] 是 numpy.int64; save_best_from_sweep 必须能落盘否则 json.dump 抛
+    TypeError: Object of type int64 is not JSON serializable。
+
+    直接对 save() 喂 numpy.int64 验证落盘路径通畅; save_best_from_sweep 已在
+    apply 阶段用 .item() 兼容 (见 _defaults_loader.save_best_from_sweep)。
+    """
+    import numpy as np
+    params = {
+        "band_mult": 1.8,
+        "cur_ema_period": np.int64(25),
+        "adx_threshold": np.float64(30.0),
+        "higher_period": "1h",
+    }
+    dl.save("filtered_mr", params)
+    loaded = dl.load("filtered_mr")
+    assert loaded["params"]["cur_ema_period"] == 25
+    assert loaded["params"]["adx_threshold"] == 30.0
+    assert isinstance(loaded["params"]["cur_ema_period"], int)
+
+
 # ---------- list_defaulted ----------
 
 

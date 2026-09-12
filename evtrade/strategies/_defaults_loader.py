@@ -72,12 +72,22 @@ def save(strategy_name: str, params: dict, source: dict | None = None) -> Path:
 
     source: 自由 dict, 通常含 {"kind": "from_csv", "csv": ..., "rank": N} 或
             {"kind": "from_params"}; 不强制 schema。
+
+    params 值支持 numpy/pandas 标量 (numpy.int64 / numpy.float64 / pandas 元素);
+    自动经 .item() 转 Python 原生 (int/float/str), 避免 json.dump 抛
+    TypeError: Object of type int64 is not JSON serializable.
+    （filtered_mr 的 cur_ema_period 等 int 参数经 sweep 选出后 dtype=int64,
+    2026-09-12 apply 期间发现; channel_deviation 全 float 一直不踩）
     """
     if not isinstance(params, dict):
         raise TypeError(f"params 必须是 dict, 收到 {type(params).__name__}")
+    params_json = {
+        k: (v.item() if hasattr(v, "item") else v)
+        for k, v in params.items()
+    }
     payload = {
         "strategy": strategy_name,
-        "params": params,
+        "params": params_json,
         "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source": source or {},
     }
@@ -216,7 +226,9 @@ def save_best_from_sweep(df, strategy_name: str, csv_path: str):
     chosen, reason = pick_best_row(df, strategy_name)
     if chosen is None:
         return None, reason, None, False
-    params = dict(reason["chosen_params"])
+    # reason["chosen_params"] 来自 pandas Series[k], dtype 可能为 int64/float64;
+    # save() 内已统一经 .item() 转 Python 原生, 此处直接传
+    params = reason["chosen_params"]
     if not params:
         return None, {**reason, "error": "未抽到任何 params 字段"}, None, False
 

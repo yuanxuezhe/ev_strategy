@@ -129,6 +129,31 @@ def test_save_best_from_sweep_writes_file(isolated_defaults, fake_sweep_df):
     assert src["csv"] == "/tmp/fake.csv"
 
 
+def test_save_best_from_sweep_handles_filtered_mr_int_params(isolated_defaults):
+    """filtered_mr 的 int 参数 (cur_ema_period/adx_period 等) 经 sweep 选出后
+    Series[k] 是 numpy.int64; save_best_from_sweep 必须能落盘否则 json.dump 抛
+    TypeError: Object of type int64 is not JSON serializable (2026-09-12 apply 期
+    间发现; 修法: .item() 兼容 numpy/pandas 标量)
+    """
+    df = pd.DataFrame([
+        {"band_mult": 1.8, "atr_vol_mult": 1.5, "adx_threshold": 30.0,
+         "cur_ema_period": 25, "higher_period": "1h",
+         "score": 0.10, "ann_net_min": 0.08, "S": 0.5, "filter_pass": True,
+         "train_ann_net_min": 0.09, "test1_ann_net_min": 0.08},
+    ])
+    chosen, reason, saved_path, commit_ok = save_best_from_sweep(
+        df, "filtered_mr", csv_path="/tmp/fake_fmr.csv")
+    assert saved_path is not None
+    assert saved_path.is_file()
+    data = json.loads(saved_path.read_text(encoding="utf-8"))
+    # params 字段必须全是 Python 原生 int/float/str (非 numpy.int64/float64)
+    for k, v in data["params"].items():
+        assert type(v) in (int, float, str), (
+            f"{k} 类型 {type(v).__name__} 应为 JSON 原生, 实际值 {v!r}")
+    assert data["params"]["cur_ema_period"] == 25
+    assert data["params"]["band_mult"] == 1.8
+
+
 # ---------- format_reason_log ----------
 
 
