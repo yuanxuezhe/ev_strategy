@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 
 # 行情缓存 / 扫描输出 / 回放日志
+.data_cache/
 cache/
 tmp_cache/
 tmp_*.csv

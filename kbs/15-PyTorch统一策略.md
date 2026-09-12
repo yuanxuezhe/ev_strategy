@@ -25,28 +25,34 @@
 - **批量扫描**：sweep 层按参数组合循环，每组走同一条 vectorized 路径
 - **实盘逐棒**：`Engine.on_bars` 逐桶 CLOSE 调 `step`
 
-**现状要点（2026-09-10）**：
+**现状要点（2026-09-10 + 2026-09-11）**：
 
 - 后端唯一旋钮是 `evtrade.backends.get_xp(device) -> torch.device`
   （cpu/cuda 路由 + CUDA 不可用时 fallback）。
-- 策略代码**只写一份** numpy/Python 标量运算，cpu/cuda 上行为一致；
-  **没有** `xp_ema_torch` 之类的 torch 批量指标算子 —— vectorized 批量路径
+- 策略代码**只写一份** numpy/Python 标量运算，cpu/cuda 上行为一致 —— vectorized 批量路径
   (`core/vectorized_engine` 内部逐桶信号循环) 与实盘路径
   (`Engine.on_bars`) 调用**同一个标量 `step(state, bar, params)`**，
   指标由 `ema_step` / `ema_channel_step` 增量维护。
 - 不存在 `xp` 别名要传给策略：策略直接 `from evtrade.indicators import ema_step`，
   用 numpy / Python 标量即可。
+- **GPU-batched sweep opt-in 第二路径**（2026-09-11）：策略可**可选**实现
+  `batched_step(cls, state, bars, params, *, n_combos, n_bars)` 类方法 hook，
+  sweep 在 `device != "cpu" + len(combos) ≥ 32 + gpu_available + 真覆写 hook`
+  时调用一次出 `[N, T]` 信号，对比 ThreadPool 的 `N × T_bar` 次 Python `step` 调用；
+  实现该 hook 的策略应配套 `indicators.torch_ema`（详见 §7.4 与 [12 §6.1](12-重构与性能内核.md)）。
+  **未实现该 hook 的策略（`channel_deviation` / `filtered_mr`）走现有 ThreadPool**。
 
 ---
 
 ## 2. 指标算子（evtrade/indicators/ema.py）
 
-当前 `evtrade/indicators/` 只有 `ema.py`，提供两类形态：
+当前 `evtrade/indicators/` 只有 `ema.py`，提供**三类形态**：
 
 | 形态 | 函数签名 | 适用场景 |
 |---|---|---|
 | **step 增量版** | `ema_step(state, value, p)` / `ema_channel_step(state, h, l, p)` | 策略 `step` 用；state 为 `@dataclass`（`EMAState` / `EMAChannelState`），标量 in/out |
-| **numpy 批量版** | `ema(values, p)` / `ema_channel(highs, lows, p)` | 返回 ndarray；jupyter / 复盘 / 测试对拍用 |
+| **numpy 批量参考版** | `ema(values, p)` / `ema_channel(highs, lows, p)` | 返回 ndarray；jupyter / 复盘 / 测试对拍用 |
+| **torch 批量版** | `torch_ema(values: Tensor[T], p) -> Tensor[T]` | GPU-batched sweep `batched_step` hook 内部用；float64 与 numpy `ema` bitwise 一致 |
 
 ```python
 # step 增量版 (策略内用; state 由 engine 持有, 跨调用持续)
@@ -55,13 +61,20 @@ from evtrade.indicators import EMAState, ema_step
 state = EMAState()
 state, ema = ema_step(state, 1.234, p=21)
 
-# numpy 批量版 (复盘/测试对拍)
+# numpy 批量参考版 (复盘/测试对拍)
 import numpy as np
 from evtrade.indicators import ema, ema_channel
 
 highs = np.random.rand(100) + 1.0
 lows = np.random.rand(100) + 0.5
 up, dw = ema_channel(highs, lows, 21)
+
+# torch 批量版 (batched_step 内部用, opt-in)
+import torch
+from evtrade.indicators import torch_ema
+
+close_t = torch.tensor(closes, dtype=torch.float64, device="cuda")
+ema_t = torch_ema(close_t, p=21)        # [T] Tensor, 前 p-1 个 0.0
 ```
 
 旧 `xp_ema` / `xp_ema_channel` / `xp_ema_torch` 批量 xp 算子已随 cupy 一并删除；
@@ -83,12 +96,16 @@ buckets = {
     "c":      np float64 (T,),
     "v":      np float64 (T,),
     "mark":   np int     (T,),   # 1=策略期, 0=预热段
-    "n_bars": np int64   (T,),   # 每桶含 1m 根数
+    "n_bars": np int64   (T,),   # 每桶含 1m 根数 (诊断 / 桶完整度用, 策略 step 不可见)
 }
 # 引擎逐桶取标量喂给 step:
 #   bar = {"ts","o","h","l","c","v","mark"}  ->  strategy.step(state, bar, params)
 # 返回 sig ∈ {-1, 0, 1}, 引擎聚合成 (T,) int8 数组
 ```
+
+- **batched_step 看到的 bars 契约**：`batched_sweep._build_bars_tensor` 把上述 numpy 桶数组
+  转成 dict[str, Tensor] `[T]`（不含 `n_bars`，因为 hook 内部不关心桶完整度）；
+  `mark` 转 `int8`，价格转 `float64`。
 
 - **批量扫描的 "B 维"** 不在单次 vectorized 调用内部：sweep 层
   (`core/sweep.py`, ThreadPoolExecutor) 对每个参数组合各跑一次

@@ -66,10 +66,23 @@ CLI MUST 接受 `--params "k1:v1;k2:v2"` 一次传入策略参数；`_resolve_st
 策略参数（如 `tf1` / `low1` / `high2`）不再是独立 CLI flag，一律经 `--params` 传入；
 `--device {cpu,gpu,auto}` 是唯一的后端选择参数。
 
+策略类可声明**跨字段校验** `validators: list[Callable[[dict], None]]`（类属性，类级声明）。
+校验时机：在 `_resolve_params` 完成单字段填默认 + 类型 + min/max 之后；
+校验失败 MUST 抛 `ValueError`（带字段名与不通过原因）；校验成功 MUST 静默返回。
+`validators` 的目的是表达 `low1 > low2` 这类**跨字段**硬约束（单字段 min/max 表达不了）；
+未声明 `validators` 的策略与现状一致（仅单字段校验）。
+
 #### Scenario: 未声明参数报错
 - **WHEN** CLI 传入 `--params "low1:1.5;unknown_x:0.3"`
 - **THEN** 启动时报 `ValueError: ChannelDeviationStrategy 收到未声明的参数 ['unknown_x']`
   （`vectorized_base.py::_resolve_params`）
+
+#### Scenario: 跨字段 validator 拒绝违反锁存约束的参数组合
+- **WHEN** CLI / sweep / `_defaults_loader` 任一入口传入 `low1=1.0, low2=1.5`（违反 `channel_deviation` 硬约束 `low1 > low2`）
+- **THEN** 启动时 MUST 抛 `ValueError: channel_deviation: low1 (1.0) 必须 > low2 (1.5); 否则迟滞结构退化`
+  （`ChannelDeviationStrategy._validate_latch_order` → `VectorizedStrategy._resolve_params`）
+- **AND** sweep grid 中所有违反 `validators` 的组合 MUST 在 sweep 入口的预校验阶段被识别并跳过；
+  跳过 MUST 打 warning（含 combo 字典 + 失败原因）；`sweep_results.csv` MUST NOT 含被跳过的 combo 行
 
 ### Requirement: Engine is the sole assembly point
 Engine MUST 是唯一装配点：构造时把 `aggregator.on_bars` 覆写为自己的 `on_bars`。
@@ -93,20 +106,30 @@ Engine 消费任意 `stream() -> Iterator[Bar]` 的 bar 流对象（回测用
 
 框架 MUST NOT 预计算任何指标。所有指标计算由策略在 `step(state, bar, params)` body 内通过
 `evtrade/indicators/` 子包导出的 API 完成。`evtrade/indicators/` 目前 MUST 仅提供 **EMA**
-一种指标、两种形态：
+一种指标、**三种形态**：
 
 1. **step 增量版**（`@dataclass state` in/out，策略 `step` 逐桶调用）：
    `ema_step` / `ema_channel_step`（state：`EMAState` / `EMAChannelState`）
 2. **numpy 批量参考版**（`ema` / `ema_channel`，reconcile 参考实现与测试用）
+3. **torch 批量版**（`torch_ema`；GPU-batched sweep `batched_step` hook 专用 opt-in 形态，
+   float64 与 numpy 参考版 bitwise 一致；用于 hook 内部按 period 分组调一次出整段
+   `[T]` Tensor；不暴露为策略 `step` 的替代路径——`step` 仍走 `ema_step` / `ema_channel_step`）
 
-`evtrade/indicators/` MUST NOT 包含 xp/torch 变体或 EMA 之外的指标（`atr/rsi/boll` 已于
-2026-09-10 删除；新增指标按上述两形态添加）。`evtrade/indicators/` MUST NOT `import cupy` /
+`evtrade/indicators/` MUST NOT 包含除 EMA 之外的指标（`atr/rsi/boll` 已于
+2026-09-10 删除；新增指标按上述三形态添加）。`evtrade/indicators/` MUST NOT `import cupy` /
 `import numba`。`pyproject.toml` MUST NOT 声明 `cupy` / `numba` 为依赖，MUST 声明 `torch>=2.0`。
 
-#### Scenario: indicators 提供 step 版与 numpy 参考版
+#### Scenario: indicators 提供 step 版 / numpy 参考版 / torch 批量版
 - **WHEN** 策略用 `from evtrade.indicators import ema_step` 调用
 - **THEN** `ema_step(state, value, p) -> (state, ema)` 为策略 step 用增量接口；
-  `ema(values, p) -> ndarray` 为 numpy 批量参考接口
+  `ema(values, p) -> ndarray` 为 numpy 批量参考接口；
+  `torch_ema(values: Tensor[T], p) -> Tensor[T]` 为 GPU-batched sweep 批量形态
+  （opt-in，batched_step hook 专用，不暴露给策略 `step`）
+
+#### Scenario: torch_ema 与 numpy ema bitwise 一致
+- **WHEN** 同一 `values: ndarray` 序列同 `p` 同时走 `torch_ema` 与 `ema`
+- **THEN** `np.array_equal(torch_ema(Tensor(values), p).cpu().numpy(),
+  ema(values, p)[p-1:])` MUST 为 True（首 `p-1` 个 step 形态返 0，numpy 返 NaN，对齐从 `p-1` 起）
 
 #### Scenario: 策略 step 用 ema_step 维护增量
 - **WHEN** 策略在 `step(state, bar, params)` 内维护 EMA 增量

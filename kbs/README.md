@@ -62,22 +62,27 @@
 
 | 模块 | 内容 | 相关文档 |
 |---|---|---|
-| `evtrade/primitives.py` | `Bar`、`fmt` | 03 |
+| `evtrade/primitives.py` | `Bar`、`fmt`、`sig_to_side` | 03 |
 | `evtrade/core/config.py` | DB_URL（`EVTRADE_DB_URL` 可覆盖）/ 默认资金（`INIT_CASH`/`INIT_POSITION`/`TRADE_QTY`） | 01、10 |
 | `evtrade/core/timeutils.py` | `compute_bucket_general`、`bucket_ts_encoded`、`resolve_period_seconds`、历法（标量/向量） | 04 |
 | `evtrade/core/aggregator.py` | `BarAggregator`（INT period_seconds） | 04 |
-| `evtrade/indicators/ema.py` | 增量版 `ema_step`/`ema_channel_step` + numpy 批量参考 `ema`/`ema_channel`（无 numba / 无 CUDA） | 05 |
-| `evtrade/strategies/vectorized_base.py` | ★ **唯一策略基类** `VectorizedStrategy` + 注册表 + `params_spec` + `format_signal_line` hook | 06、11、14 |
-| `evtrade/strategies/channel_deviation.py` | `ChannelDeviationStrategy`（`ema_channel_step` 增量 + Python FSM） | 06 |
-| `evtrade/strategies/ma_crossover.py` | `MACrossoverStrategy`（EMA 双均线示例） | 14 |
+| `evtrade/indicators/ema.py` | step 增量 `ema_step`/`ema_channel_step` + numpy 批量 `ema`/`ema_channel` + torch 批量 `torch_ema`（无 numba / 无 CUDA） | 05 |
+| `evtrade/strategies/vectorized_base.py` | ★ **唯一策略基类** `VectorizedStrategy` + 注册表 + `params_spec` + `batched_step` opt-in hook + `format_signal_line` hook | 06、11、14、15 |
+| `evtrade/strategies/channel_deviation.py` | `ChannelDeviationStrategy`（`ema_channel_step` 增量 + Python FSM；mark=0 跳过） | 06 |
+| `evtrade/strategies/ma_crossover.py` | `MACrossoverStrategy`（`step` + `batched_step`，mark=0 累积 EMA） | 14、15 |
+| `evtrade/strategies/filtered_mr.py` | `FilteredMRStrategy`（4 重过滤均值回归：大周期顺势 + ADX + ATR + close FSM；mark=0 累积指标） | 06 §10 |
+| `evtrade/strategies/_defaults_loader.py` | 默认参数落盘 / 加载 / sweep 自动选最优并 git commit | 10、12 |
+| `evtrade/strategies/_defaults/` | 落盘默认参数 JSON（按策略名） | 10 |
 | `evtrade/execution/account.py`、`evtrade/execution/base.py` | `Account`、`Executor`/`SimulatedExecutor` + `trade_decision` 单一成交决策 | 07 |
 | `evtrade/core/data.py` | MySQL 拉取（`load_bars`）+ npz 缓存 + 合成数据（`synthetic_bars`） | 08、12 |
 | `evtrade/core/engine.py` | ★ `Engine`（逐 bar 路径，桶 CLOSE 语义，供实盘/对账） | 09 |
-| `evtrade/core/vectorized_engine.py` | ★ `run_vectorized`（批量向量化路径，CPU/GPU 统一） | 12、13 |
+| `evtrade/core/vectorized_engine.py` | ★ `run_vectorized`（批量向量化路径，numpy 桶聚合 + strategy-step-only 信号循环） | 12、13 |
+| `evtrade/core/batched_sweep.py` | ★ `run_batched`（opt-in GPU 批量 sweep；`ma_crossover` 已接入） | 13、15 |
 | `evtrade/core/metrics.py` | `bars_to_arrays` / `summarize`（30 字段，含 x_mdd / cagr_excess） | 12、13 |
 | `evtrade/core/sweep.py` / `evtrade/cli.py` / `evtrade/core/tsbucket.py` | 扫描 / CLI / 桶预计算缓存（`precompute_ts_mark` + LRU）；`backends.py` 统一 CPU/GPU 后端 | 10、12、13 |
 | `evtrade/core/replay.py` | 行情回放 + 对账（vectorized vs Engine.on_bars） | 10、13 |
-| `tests/` | 26 个测试文件（CPU/GPU 容差 + vectorized-vs-Engine 对账 + metrics 字段集 + reconcile） | 12 |
+| `evtrade/core/permutation.py` | 蒙特卡洛日块置换检验 | 13 |
+| `tests/` | 23 个测试文件 / 60+ 用例（CPU/GPU 容差 + vectorized-vs-Engine 对账 + metrics 字段集 + batched_step + filtered_mr + pyproject 依赖审计） | 12 |
 
 > 现行代码已无 `mysql_analyze_demo.py` 兼容入口，统一用 `python -m evtrade`（子命令 `backtest`/`sweep`/`replay`/`params`）。
 > 旧单文件实现 / numba 流式内核 / DSL 渲染管线均已下线（详见 12 号文档 §1）。

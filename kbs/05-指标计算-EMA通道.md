@@ -22,7 +22,7 @@ TF1 = 21（默认，由策略 params_spec 自定义）
 - **种子（seed）**：前 p 个值做简单平均 `SMA = sum(前p个)/p`，作为第一个 EMA
 - 之后递推：`EMA_t = price_t * k + EMA_{t-1} * (1-k)`
 
-`evtrade/indicators/ema.py` 提供**两类形态**，口径一致：
+`evtrade/indicators/ema.py` 提供**三类形态**，口径一致：
 
 | 形态 | 函数 | 用途 | 复杂度 |
 |---|---|---|---|
@@ -30,6 +30,13 @@ TF1 = 21（默认，由策略 params_spec 自定义）
 | step 增量 | `ema_channel_step(EMAChannelState, h, l, p) -> (EMAChannelState, up, dw)` | 通道策略 step 调 | O(1) |
 | numpy 批量参考 | `ema(values, p)` | ndarray 输入输出，reconcile 参考 / 测试用 | O(n) |
 | numpy 批量参考 | `ema_channel(highs, lows, p)` | 上轨 + 下轨，reconcile 参考 / 测试用 | O(n) |
+| torch 批量 | `torch_ema(values: Tensor[T], p) -> Tensor[T]` | GPU-batched sweep `batched_step` hook 专用 opt-in 形态；float64 与 numpy `ema` bitwise 一致 | O(n) |
+
+> **2026-09-11 变化 (gpu-batched-sweep)**：
+> - 新增 `torch_ema(values, p) -> Tensor[T]` 批量形态，仅供 `batched_step` hook 内部按 period 分组调用。
+> - 算法与 numpy 参考版同式（`k = 2/(p+1)`，前 `p-1` 个返回 `0.0` 与 `ema_step` 对齐而非 numpy 的 NaN）；
+>   seed 必须用 `numpy.sum` 取首段避免 GPU 串行 cumsum 与 numpy pairwise 求和的 1-bit 末位差。
+> - 不暴露为策略 `step` 的替代入口；`step` 仍走 `ema_step` / `ema_channel_step`。
 
 > **2026-09-10 变化 (strategy-step-only)**：
 > - 删旧双轨标量 API（6/3 元组形式）
@@ -163,6 +170,9 @@ from evtrade.indicators import (
 
     # numpy 批量参考版 (reconcile 参考实现 / 测试用, 非引擎路径)
     ema, ema_channel,
+
+    # torch 批量版 (batched_step hook 内部用, opt-in; 2026-09-11 新增)
+    torch_ema,
 )
 ```
 

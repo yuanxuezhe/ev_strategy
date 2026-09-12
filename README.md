@@ -31,21 +31,15 @@ uv run evtrade ...                      # pyproject.toml [project.scripts] 注�
 ### 子命令
 
 ```bash
-uv run python -m evtrade backtest --strategy channel_deviation --code 159992.SZ \
-  --start 20250101 --end 20260903 --device auto
+uv run python -m evtrade backtest --strategy channel_deviation --code 159992.SZ --start 20250101 --end 20260903 --device auto
 
-uv run python -m evtrade sweep --strategy channel_deviation --code 159992.SZ \
-  --start 20250101 --end 20260903 \
-  --grid low1=1.0,1.5,2.0 --grid low2=0.5,1.0,1.5 \
-  --device auto --out sweep_results.csv \
-  --save-defaults                        # 跑完自动选最优并落盘 + git commit
+uv run python -m evtrade sweep --strategy channel_deviation --code 159992.SZ --start 20250101 --end 20260903 --grid low1=1.0,1.5,2.0 --grid low2=0.5,1.0,1.5 --device auto --out sweep_results.csv --save-defaults
 
-uv run python -m evtrade params save channel_deviation \
-  --params "low1:1.5;low2:1.0;high1:1.5;high2:0.5"
+uv run python -m evtrade params save channel_deviation --params "low1:1.5;low2:1.0;high1:1.5;high2:0.5"
 uv run python -m evtrade params show channel_deviation
 uv run python -m evtrade params list
 
-uv run python -m evtrade replay --log bars_log.csvz --against-ref
+uv run python -m evtrade replay --log bars_log.csv --against-ref
 ```
 
 ### 测试
@@ -59,26 +53,16 @@ uv run pytest -m gpu --gpu                 # GPU 路径 (需 torch CUDA)
 ## 工作流：网格 → 选参 → 落盘 → 单次回测/实盘
 
 ```bash
-# 1. 网格扫描
-uv run python -m evtrade sweep --strategy channel_deviation --code 159992.SZ \
-  --start 20250101 --end 20260903 \
-  --grid low1=1.0,1.5,2.0 --grid low2=0.5,1.0,1.5 \
-  --grid high1=1.0,1.5,2.0 --grid high2=0.3,0.5,0.8 \
-  --splits 20250901 20260301 --device auto \
-  --out sweep_results.csv --save-defaults
+# 1. 网格扫描 (3 窗 WFO + 手续费 + 置换检验 + 自动落盘最优参数)
+uv run python -m evtrade sweep --strategy channel_deviation --code 159992.SZ --start 20250101 --end 20260903 --grid low1=1.0,1.5,2.0 --grid low2=0.5,1.0,1.5 --grid high1=1.0,1.5,2.0 --grid high2=0.3,0.5,0.8 --splits 20250901,20260301 --device auto --out sweep_results.csv --save-defaults
 
-# 2. (程序自动选最优并落盘 evtrade/strategies/_defaults/channel_deviation.json,
-#    单独 git commit 含中文选择原因)
+# 2. (程序自动选最优并落盘 evtrade/strategies/_defaults/channel_deviation.json, 单独 git commit 含中文选择原因)
 
 # 3. 单次回测 (不传参数, 自动读默认)
-uv run python -m evtrade backtest --strategy channel_deviation --code 159992.SZ \
-  --start 20260101 --end 20260903 --device auto
+uv run python -m evtrade backtest --strategy channel_deviation --code 159992.SZ --start 20260101 --end 20260903 --device auto
 
 # 4. 实盘接入 (live 子命令未实现, 占位: 直接调 loader)
-uv run python -c "
-from evtrade.strategies._defaults_loader import load
-print(load('channel_deviation'))
-"
+uv run python -c "from evtrade.strategies._defaults_loader import load; print(load('channel_deviation'))"
 ```
 
 ## 参数解析优先级 (CLI)
@@ -99,18 +83,25 @@ export EVTRADE_DEFAULTS_DIR=/etc/evtrade/defaults
 
 ```
 evtrade/
-  __init__.py          顶层 re-export + 少量 sys.modules 兼容垫片
+  __init__.py          顶层 re-export + sys.modules 兼容垫片 (7 项)
   __main__.py          python -m evtrade 入口
   backends.py          get_xp(device) -> torch.device (CPU/GPU 统一后端) + resolve_device
   cli.py               argparse 子命令 (backtest/sweep/replay/params)
-  primitives.py        Bar 结构
-  core/                engine / vectorized_engine / sweep / replay / tsbucket / data / metrics
-                       / timeutils / aggregator / permutation / config / _harness
-  strategies/          VectorizedStrategy 唯一基类 + 注册表 + 默认参数 (_defaults/)
+  primitives.py        Bar 结构 + fmt + sig_to_side
+  core/                engine / vectorized_engine / batched_sweep / sweep / replay / tsbucket
+                       / data / metrics / timeutils / aggregator / permutation / config / _harness
+  strategies/          VectorizedStrategy 唯一基类 + 注册表
+                       + channel_deviation / ma_crossover / filtered_mr
+                       + _defaults_loader + _defaults/ (落盘默认参数)
   execution/           Executor 抽象 (Simulated) + trade_decision 单一成交决策
-  indicators/          ema (*_step 增量 + numpy 批量参考; 仅 EMA)
-tests/                 140+ pytest 用例
+  indicators/          ema (step 增量 + numpy 批量参考 + torch 批量 三形态; 仅 EMA)
+tests/                 23 文件 / 60+ pytest 用例
+                       (CPU/GPU 容差 + vectorized-vs-Engine 对账 + metrics 字段集
+                        + batched_step + filtered_mr + pyproject 依赖审计)
 kbs/                   中文设计文档 (spec 投影, 15 份) + 使用说明 (操作手册)
+openspec/              spec 权威 + change 流程
+examples/              format_signal_line 演示
+scripts/               run.bat 速查
 ```
 
 ## 详见

@@ -51,8 +51,8 @@
 
 ## 3. 源码地图（核心要点）
 
-- 包结构：`evtrade/{cli,primitives,backends}.py` + `core/{config,timeutils,aggregator,engine,vectorized_engine,data,metrics,sweep,replay,tsbucket,permutation,_harness}.py` + `indicators/{ema}.py` + `strategies/{vectorized_base,channel_deviation,ma_crossover}.py` + `execution/{account,base}.py`。
-  （行情子包已删——数据加载内联 `core/data.py`；`atr/boll/rsi` 指标已删——仅留 EMA；GPU 探测并入 `backends`；旧 `core/gpu.py` 更名 `tsbucket.py`。）
+- 包结构：`evtrade/{cli,primitives,backends}.py` + `core/{config,timeutils,aggregator,engine,vectorized_engine,batched_sweep,data,metrics,sweep,replay,tsbucket,permutation,_harness}.py` + `indicators/{ema}.py` + `strategies/{vectorized_base,channel_deviation,ma_crossover,filtered_mr,_defaults_loader}.py`（`_defaults/` 子目录存落盘默认参数） + `execution/{account,base}.py`。
+  （行情子包已删——数据加载内联 `core/data.py`；`atr/boll/rsi` 指标已删——仅留 EMA；GPU 探测并入 `backends`；旧 `core/gpu.py` 更名 `tsbucket.py`；`batched_sweep.py` 是 2026-09-11 GPU-batched sweep 的 opt-in 入口。）
 - 策略唯一基类：`VectorizedStrategy` (`evtrade/strategies/vectorized_base.py`)。
   - 唯一抽象方法：`step(self, state, bar, params) -> (state, int)`；`state` 由引擎持有、跨调用持续，策略**无 instance 持久状态**。
   - state 初值：`init_state(self, params) -> state`（无状态策略默认返回 `None`；stateful 策略覆写返 `@dataclass`）。
@@ -96,5 +96,5 @@
   - `grep -rn "--no-sleep\|--step-days\|--show-bars\|--bars-out\|ann_excess_pct" evtrade/ kbs/ CLAUDE.md`
   （spec / kbs 内"已删除/已下线"的显式删注与历史 change-note 除外。）
 - spec 校验：`openspec validate --specs` 应通过。
-- 测试：`uv run pytest -q`（应 130+ passed；含 CPU/GPU 容差、vectorized-vs-Engine 对账、metrics 字段集）。
+- 测试：`uv run pytest -q`（应 60+ passed；含 CPU/GPU 容差、vectorized-vs-Engine 对账、metrics 字段集、batched_step、filtered_mr、pyproject 依赖审计）。
 - 对账：`python -m evtrade replay --log <log.csv> --strategy channel_deviation --device cpu --against-ref` 应输出 PASS（`bucket_diff_cap=8` 默认 lenient；`EVT_RECONCILE_STRICT=1` 时 cap=0）。
