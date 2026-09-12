@@ -237,6 +237,29 @@ def sweep(bars: dict, base: dict, combos: list[dict],
     combos = [{k: v for k, v in c.items() if k != "params"}
               | _strategy_params(c)
               for c in combos]
+
+    # ---- 预校验: 跨字段 validators 失败的 combo 跳过 (不污染 sweep_results.csv) ----
+    from ..strategies import get_strategy_class
+    strategy_cls_for_validate = get_strategy_class(strategy_name)
+    valid_combos = []
+    skipped_combos = []
+    for c in combos:
+        try:
+            strategy_cls_for_validate._resolve_params(
+                {k: v for k, v in c.items() if k in spec})
+            valid_combos.append(c)
+        except ValueError as e:
+            skipped_combos.append((c, str(e)))
+    if skipped_combos:
+        n_skip = len(skipped_combos)
+        n_total = len(combos)
+        print(f"  -- 跳过 {n_skip}/{n_total} 个违反 validator 的 combo "
+              f"(如 {next(iter(skipped_combos))[1]})", flush=True)
+    combos = valid_combos
+    if not combos:
+        raise ValueError(
+            f"sweep: 所有 {n_total} 个 combo 都违反策略 validators; "
+            f"检查 grid 与 params_spec")
     params_list = [{**base, **c} for c in combos]
 
     def _run_one(wb, p, warm):
@@ -257,8 +280,7 @@ def sweep(bars: dict, base: dict, combos: list[dict],
         )
 
     # ---- 路由: batched (opt-in) vs ThreadPool ----
-    from ..strategies import get_strategy_class
-    strategy_cls = get_strategy_class(strategy_name)
+    strategy_cls = strategy_cls_for_validate
     # "真覆写" 检测: 类自身 __dict__ 里有 batched_step (排除继承来的基类默认)
     use_batched = (
         "batched_step" in vars(strategy_cls)

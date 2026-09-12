@@ -81,6 +81,27 @@ def _fsm_step(fsm: DeviationFSM, cur_ts: int, devs: Deviations,
     return signal
 
 
+# ============ 跨字段硬约束 (low1 > low2 / high1 > high2, 否则锁存失效) ============
+
+def _validate_latch_order(params: dict) -> None:
+    """channel_deviation 锁存硬约束: 极端偏离阈值 > 回撤确认阈值
+
+    若 low1 <= low2 或 high1 <= high2, "先冲出再收回"的迟滞结构退化为
+    "立即置位立即触发", 锁存失去意义。sweep / CLI / _defaults_loader 任一入口
+    都会触发 _resolve_params 调用本函数, 防止无效组合进入运行期。
+    """
+    low1, low2 = params["low1"], params["low2"]
+    high1, high2 = params["high1"], params["high2"]
+    if low1 <= low2:
+        raise ValueError(
+            f"channel_deviation: low1 ({low1}) 必须 > low2 ({low2}); "
+            f"否则迟滞结构退化 (立即置位立即触发, 锁存失效)")
+    if high1 <= high2:
+        raise ValueError(
+            f"channel_deviation: high1 ({high1}) 必须 > high2 ({high2}); "
+            f"否则迟滞结构退化 (立即置位立即触发, 锁存失效)")
+
+
 # ============ 策略持久状态 ============
 
 @dataclass
@@ -107,6 +128,9 @@ class ChannelDeviationStrategy(VectorizedStrategy):
         "high2": {"default": 0.5, "type": float, "min": 0.0, "max": 100.0},
         "tf1":   {"default": 21,  "type": int,   "min": 2,   "max": 1000},
     }
+
+    # 跨字段硬约束 (单字段 min/max 表达不了; 自动被 _resolve_params 调用)
+    validators = [_validate_latch_order]
 
     def init_state(self, params: dict) -> ChannelDeviationState:
         return ChannelDeviationState()

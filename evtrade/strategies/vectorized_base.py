@@ -9,7 +9,7 @@ bar 契约 (vectorized_engine._aggregate_buckets 传入):
 
 step 返回: (state, signal); signal ∈ {-1, 0, 1} (SELL/无/BUY)
 """
-from typing import Any
+from typing import Any, Callable
 
 
 # ============ 注册表 ============
@@ -65,12 +65,14 @@ class VectorizedStrategy:
       - 实现 step(self, state, bar, params) -> (state, int)
       - 类上加 @register_strategy("name")
       - (可选) 覆写 init_state(self, params) -> state  返回 state 初值 (默认 None)
+      - (可选) 声明 validators: list[Callable[[dict], None]] 跨字段硬约束
 
     引擎 (Vectorized Engine / Engine.on_bars) 持有 state, 循环调 step。
     策略 MUST NOT 在 step 内出现批量循环 / 持有 instance-level 持久状态。
     """
 
     params_spec: dict[str, dict[str, Any]] = {}
+    validators: list[Callable[[dict], None]] = []
     strategy_key: str = ""
 
     def __init__(self, params: dict[str, Any] | None = None, **kwargs):
@@ -84,7 +86,11 @@ class VectorizedStrategy:
 
     @classmethod
     def _resolve_params(cls, params: dict[str, Any]) -> dict[str, Any]:
-        """按 params_spec 校验/填默认 (框架唯一来源)"""
+        """按 params_spec 校验/填默认 + 跨字段 validators (框架唯一来源)
+
+        顺序: 未声明参数报错 → 单字段填默认/类型/min/max → 跨字段 validators
+        校验失败一律抛 ValueError, 消息含策略类名与字段名, 便于 CLI / sweep / loader 定位。
+        """
         spec = cls.params_spec or {}
         unknown = set(params) - set(spec)
         if unknown:
@@ -115,6 +121,9 @@ class VectorizedStrategy:
             if mx is not None and v > mx:
                 raise ValueError(f"{cls.__name__}.{k}={v} 大于 max={mx}")
             out[k] = v
+        # 跨字段校验: 表达 "low1 > low2" 这类单字段 min/max 表达不了的硬约束
+        for v in cls.validators or []:
+            v(out)
         return out
 
     def init_state(self, params: dict[str, Any]) -> Any:

@@ -222,7 +222,7 @@ def test_no_instance_state_in_filtered_mr():
 
 # ============ 4. CLI 集成 (smoke) ============
 
-def test_sweep_filtered_mr_runs():
+def test_sweep_filtered_mr_runs(tmp_path):
     """CLI sweep 能跑 filtered_mr (smoke, 不验证具体数值)
 
     backtest 不支持 --synthetic-days (sweep 专属), 用 sweep 验证集成。
@@ -230,6 +230,7 @@ def test_sweep_filtered_mr_runs():
     import sys
     from io import StringIO
     from evtrade.cli import main as cli_main
+    out_csv = tmp_path / "test_filtered_mr_sweep.csv"
     argv = ["sweep",
             "--strategy", "filtered_mr",
             "--device", "cpu",
@@ -238,7 +239,7 @@ def test_sweep_filtered_mr_runs():
             "--start", "20260101",
             "--end", "20260120",
             "--grid", "cur_ema_period=20,30",
-            "--out", "/tmp/test_filtered_mr_sweep.csv"]
+            "--out", str(out_csv)]
     old_argv = sys.argv
     sys.argv = ["evtrade"] + argv
     buf = StringIO()
@@ -257,6 +258,7 @@ def test_sweep_filtered_mr_runs():
     assert "扫描" in out or "sweep" in out.lower(), (
         f"sweep 输出异常: {out[:500]}"
     )
+    assert out_csv.is_file(), f"sweep CSV 未生成: {out_csv}"
 
 
 def test_filtered_mr_via_get_strategy():
