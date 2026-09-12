@@ -12,7 +12,7 @@ state 由引擎持有, 跨调用持续。strategy.step 是策略唯一入口。
 
 import numpy as np
 
-from ..execution.base import trade_decision
+from ..execution.base import _TradeStateTracker, trade_decision
 from .config import INIT_CASH, INIT_POSITION, TRADE_QTY
 from .metrics import summarize
 from .timeutils import resolve_period_seconds
@@ -80,8 +80,8 @@ def _execute_trades(sig_np, close_np, ts_np,
     """
     cash = init_cash
     position = init_position
-    last_side = 0
-    cur_qty = trade_qty
+    # 倍投状态机 (与 SimulatedExecutor 共享 _TradeStateTracker)
+    qty_tracker = _TradeStateTracker(qty=trade_qty, scale=scale)
     trades = []
     n_trades = 0
     n_buy = 0
@@ -104,11 +104,7 @@ def _execute_trades(sig_np, close_np, ts_np,
         ts = int(ts_np[i])
         last_price = price
 
-        if s == last_side:
-            cur_qty = cur_qty * scale
-        else:
-            cur_qty = trade_qty
-            last_side = s
+        cur_qty = qty_tracker.next_qty(s)
 
         cash, position, q, filled = trade_decision(
             s, price, cash, position, cur_qty, buy_pct, sell_pct)
