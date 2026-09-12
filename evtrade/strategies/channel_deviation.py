@@ -1,11 +1,17 @@
 """ChannelDeviationStrategy: 通道偏离回撤策略
 
-EMA 通道 (stateful) + 偏离 (stateless) + 桶级锁存 FSM (stateful)。
+EMA 通道 (stateful) + 偏离 (stateless) + 桶级锁存 FSM (stateful) +
+自管资金/持仓/账本 (2026-09-13 重构)。
 
 参数:
   low1/high1  下/上轨极端偏离阈值 (%)  触发锁存
   low2/high2  下/上轨回撤确认阈值 (%)  触发下单
   tf1         EMA 通道周期
+  init_cash          初始资金 (默认 200000)
+  init_position      初始持仓股数 (默认 0)
+  trade_qty          每笔交易股数 (默认 10000)
+  buy_pct            BUY 时按现金比例下注; 0=关闭走 trade_qty (默认 0)
+  sell_pct           SELL 时按持仓比例卖; 0=关闭走 trade_qty (默认 0)
 """
 from dataclasses import dataclass, field
 
@@ -51,11 +57,7 @@ class DeviationFSM:
 
 def _fsm_step(fsm: DeviationFSM, cur_ts: int, devs: Deviations,
               low1: float, low2: float, high1: float, high2: float) -> int:
-    """FSM 单步: 桶切换清锁 -> 触发检测/确认下单
-
-    返回: signal ∈ {-1, 0, 1}
-    """
-    # 桶切换清锁
+    """FSM 单步: 桶切换清锁 -> 触发检测/确认下单"""
     if cur_ts != fsm.lock_ts:
         fsm.lock_ts = cur_ts
         fsm.low_acted = False
@@ -81,38 +83,70 @@ def _fsm_step(fsm: DeviationFSM, cur_ts: int, devs: Deviations,
     return signal
 
 
-# ============ 跨字段硬约束 (low1 > low2 / high1 > high2, 否则锁存失效) ============
+# ============ 撮合数学 (内联; 2026-09-13 framework 不再提供 trade_decision) ============
+
+def _trade_decision(side: int, price: float, cash: float, position: float,
+                    cur_qty: float, buy_pct: float, sell_pct: float
+                    ) -> tuple[float, float, float, bool]:
+    """单笔成交决策 (与旧 evtrade.execution.base.trade_decision 语义一致)
+
+    side: 1=BUY, -1=SELL
+    cur_qty: 本轮基础数量
+    返回: (new_cash, new_position, qty, filled)
+    """
+    if side > 0:
+        if price > 0:
+            max_by_cash = cash / price
+            if buy_pct > 0:
+                q = min(buy_pct * max_by_cash, max_by_cash)
+            else:
+                q = min(cur_qty, max_by_cash)
+        else:
+            q = 0.0
+        if q <= 0:
+            return cash, position, 0.0, False
+        return cash - q * price, position + q, q, True
+    if sell_pct > 0:
+        q = min(sell_pct * position, position)
+    else:
+        q = min(cur_qty, position)
+    if q <= 0:
+        return cash, position, 0.0, False
+    return cash + q * price, position - q, q, True
+
+
+# ============ 跨字段硬约束 ============
 
 def _validate_latch_order(params: dict) -> None:
-    """channel_deviation 锁存硬约束: 极端偏离阈值 > 回撤确认阈值
-
-    若 low1 <= low2 或 high1 <= high2, "先冲出再收回"的迟滞结构退化为
-    "立即置位立即触发", 锁存失去意义。sweep / CLI / _defaults_loader 任一入口
-    都会触发 _resolve_params 调用本函数, 防止无效组合进入运行期。
-    """
     low1, low2 = params["low1"], params["low2"]
     high1, high2 = params["high1"], params["high2"]
     if low1 <= low2:
         raise ValueError(
             f"channel_deviation: low1 ({low1}) 必须 > low2 ({low2}); "
-            f"否则迟滞结构退化 (立即置位立即触发, 锁存失效)")
+            f"否则迟滞结构退化")
     if high1 <= high2:
         raise ValueError(
             f"channel_deviation: high1 ({high1}) 必须 > high2 ({high2}); "
-            f"否则迟滞结构退化 (立即置位立即触发, 锁存失效)")
+            f"否则迟滞结构退化")
 
 
-# ============ 策略持久状态 ============
+# ============ 策略持久状态 (含资金/持仓/账本) ============
 
 @dataclass
 class ChannelDeviationState:
-    """策略持久状态: EMA 通道 + FSM + 桶切换检测"""
+    """策略持久状态: EMA 通道 + FSM + 桶切换检测 + 资金/持仓/账本"""
     ema: EMAChannelState = field(default_factory=EMAChannelState)
     fsm: DeviationFSM = field(default_factory=DeviationFSM)
     prev_ts: int = 0
     cur_high: float = 0.0
     cur_low: float = 0.0
     has_prev: bool = False
+    # 资金 / 持仓 / 账本 (2026-09-13: framework 不再持这些; 策略自管)
+    cash: float = 0.0
+    position: float = 0.0
+    init_cash: float = 0.0
+    init_position: float = 0.0
+    trades: list = field(default_factory=list)
 
 
 # ============ 策略类 ============
@@ -127,21 +161,26 @@ class ChannelDeviationStrategy(VectorizedStrategy):
         "high1": {"default": 1.5, "type": float, "min": 0.0, "max": 100.0},
         "high2": {"default": 0.5, "type": float, "min": 0.0, "max": 100.0},
         "tf1":   {"default": 21,  "type": int,   "min": 2,   "max": 1000},
+        # 资金/持仓/撮合参数 (2026-09-13: framework 不再有 CLI flag, 走 --params)
+        "init_cash":     {"default": 200000.0, "type": float, "min": 0.0, "max": 1e12},
+        "init_position": {"default": 0.0,     "type": float, "min": 0.0, "max": 1e9},
+        "trade_qty":     {"default": 10000.0, "type": float, "min": 0.0, "max": 1e9},
+        "buy_pct":       {"default": 0.0,     "type": float, "min": 0.0, "max": 1.0},
+        "sell_pct":      {"default": 0.0,     "type": float, "min": 0.0, "max": 1.0},
     }
 
-    # 跨字段硬约束 (单字段 min/max 表达不了; 自动被 _resolve_params 调用)
     validators = [_validate_latch_order]
 
     def init_state(self, params: dict) -> ChannelDeviationState:
-        return ChannelDeviationState()
+        st = ChannelDeviationState()
+        st.init_cash = float(params.get("init_cash", 0.0))
+        st.init_position = float(params.get("init_position", 0.0))
+        st.cash = st.init_cash
+        st.position = st.init_position
+        return st
 
     def step(self, state: ChannelDeviationState, bar: dict, params: dict
              ) -> tuple[ChannelDeviationState, int]:
-        # 注: 与 ma_crossover 不同, 预热段 (mark==0) 整段跳过 (EMA 也不累积)
-        # -- 因 vectorized 桶首 mark 与 Engine 桶末 mark 在预热边界桶可能不一致
-        # (vectorized._aggregate_buckets 取首根, BarAggregator 取末根), 让 EMA 在
-        # mark=0 也推会暴露两侧 signal 不对齐 (bucket_diff_cap=8 容忍不了);
-        # 见 KB 09 §"bucket mark 取值" 备注。若要解决, 先统一两侧 mark 取值约定。
         if bar["mark"] == 0:
             return state, 0
 
@@ -149,6 +188,9 @@ class ChannelDeviationStrategy(VectorizedStrategy):
         cur_ts = int(bar["ts"])
         cur_high = float(bar["h"])
         cur_low = float(bar["l"])
+        close = float(bar["c"])
+        o = float(bar.get("o", close))
+        v = float(bar.get("v", 0.0))
 
         # 桶切换: 旧桶 high/low 闭锁入 EMA
         if state.has_prev and state.prev_ts != cur_ts:
@@ -160,21 +202,50 @@ class ChannelDeviationStrategy(VectorizedStrategy):
         state.cur_low = cur_low
         state.has_prev = True
 
-        # 当前通道值 (含 pending)
+        # 当前通道值
         state.ema, up, dw = ema_channel_step(state.ema, cur_high, cur_low, tf1)
         devs = _compute_devs(up, dw, cur_high, cur_low)
         sig = _fsm_step(state.fsm, cur_ts, devs,
                         float(params["low1"]), float(params["low2"]),
                         float(params["high1"]), float(params["high2"]))
-        # 暴露给 format_signal_line 的元数据 (经 strategy._last_info 传, KB 09 已固化)
+
+        # 撮合 (策略自负责)
+        if sig != 0:
+            trade_qty = float(params["trade_qty"])
+            buy_pct = float(params["buy_pct"])
+            sell_pct = float(params["sell_pct"])
+            new_cash, new_pos, q, filled = _trade_decision(
+                sig, close, state.cash, state.position,
+                trade_qty, buy_pct, sell_pct)
+            if filled:
+                state.cash = new_cash
+                state.position = new_pos
+                state.trades.append({"ts": cur_ts,
+                                     "side": "BUY" if sig > 0 else "SELL",
+                                     "qty": float(q),
+                                     "price": float(close)})
+
+        # 暴露给 format_signal_line 的元数据 (含触发该 sig 的 finalized bar OHLCV)
         self._last_info = {"up": up, "dw": dw,
-                           "low_dev": devs.low, "high_dev": devs.high}
+                           "low_dev": devs.low, "high_dev": devs.high,
+                           "cash": state.cash, "position": state.position,
+                           "side":  "BUY" if sig > 0 else ("SELL" if sig < 0 else ""),
+                           "price": float(close),
+                           "o": float(o), "h": float(cur_high),
+                           "l": float(cur_low), "c": float(close),
+                           "v": float(v)}
         return state, sig
 
     def format_signal_line(self, ts: int, sig: int, info: dict | None = None) -> str:
+        """策略展示 hook: 一行展示方向 + ts + 价格 + 触发 K 线 OHLCV + 通道元数据"""
         info = info or {}
-        side = sig_to_side(sig)
+        side = sig_to_side(sig) or info.get("side", "") or ""
         prefix = f"{side} >>xxx> " if side else "             "
-        return (f"{prefix}[{ts}] | UP={fmt(info.get('up'))} DW={fmt(info.get('dw'))} | "
+        return (f"{prefix}[{ts}] | price={fmt(info.get('price'))} "
+                f"o={fmt(info.get('o'))} h={fmt(info.get('h'))} "
+                f"l={fmt(info.get('l'))} c={fmt(info.get('c'))} "
+                f"v={fmt(info.get('v'))} | "
+                f"UP={fmt(info.get('up'))} DW={fmt(info.get('dw'))} | "
                 f"low_dev(L/DW)={fmt(info.get('low_dev'))}% "
-                f"high_dev(H/UP)={fmt(info.get('high_dev'))}%")
+                f"high_dev(H/UP)={fmt(info.get('high_dev'))}% "
+                f"cash={fmt(info.get('cash'))} pos={fmt(info.get('position'))}")
