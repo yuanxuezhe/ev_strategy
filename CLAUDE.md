@@ -86,7 +86,12 @@
 - Engine.on_bars 是**桶 CLOSE 语义**：桶切换时 (`cur.ts != last_cur.ts`) 用上一桶 finalized OHLCV 驱动策略一次；
   vectorized 路径在桶级 finalized OHLCV 上计算指标。两条路径通过 `reconcile` 对账，默认 `bucket_diff_cap=8` 容忍 EMA 累积漂移。
 - `--device {cpu,gpu,auto}` 是唯一后端选择参数（torch CPU / torch CUDA 统一后端，`backends.get_xp` 路由；
-  入口统一 `backends.resolve_device` resolve，`--device gpu` 无 CUDA 抛 ValueError）。旧 `--engine {kernel,ref,vectorized}` 已删除。
+  入口统一 `backends.resolve_device` resolve，`--device gpu` 无 CUDA 抛 ValueError，提示改 `auto/cpu` + GPU 机器请 `uv sync --extra gpu`）。
+  旧 `--engine {kernel,ref,vectorized}` 已删除。
+- **GPU wheel 安装约定**（2026-09-12 `add-gpu-extra-pyproject`，见 spec R `PyTorch 统一后端` + kbs/15 §7.1）：
+  `[project.optional-dependencies].gpu = ["torch==2.9.0+cu128"]` 是受支持的安装路径。
+  GPU 协作者 `uv sync --extra gpu` 锁住 cu128 wheel；`bash scripts/sync-torch-cu.sh` 是防御性
+  helper（lockfile 被 uv 重生回 CPU 时自动 reinstall）。CPU 协作者 `uv sync` 默认行为不变。
 
 ## 6. 验证命令
 

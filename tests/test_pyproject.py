@@ -6,7 +6,8 @@
   - dev-dependencies 走 [dependency-groups] dev (PEP 735, 替代已废弃的
     tool.uv.dev-dependencies)
   - 核心依赖: numpy/pandas/sqlalchemy/pymysql/torch (2026-09-09 已删 numba)
-  - 无 GPU extra: torch 为核心依赖, CPU/GPU 同一 torch 包 (2026-09-10 删 gpu/all extra)
+  - GPU extra: [project.optional-dependencies].gpu 锁 torch==2.9.0+cu128
+    (2026-09-12 add-gpu-extra-pyproject: 替代旧的"无 GPU extra"约束)
   - 排除目录 (tests/docs/...) 不被打包
   - 若环境有 uv: uv lock --check 通过
 """
@@ -39,9 +40,10 @@ def test_name_and_version():
     assert 'version = "0.1.0"' in text
 
 
-def test_requires_python_at_least_38():
+def test_requires_python_at_least_310():
+    """2026-09-12 add-gpu-extra-pyproject: torch==2.9.0+cu128 仅支持 py>=3.10"""
     text = _read_pyproject()
-    assert 'requires-python = ">=3.8"' in text
+    assert 'requires-python = ">=3.10"' in text
 
 
 def test_entry_point_evtrade_registered():
@@ -67,15 +69,42 @@ def test_numba_dependency_removed():
     assert '"numba>=' not in text, "numba 已下线, 不应再列为核心依赖"
 
 
-def test_no_optional_gpu_extra():
-    """2026-09-10 simplify-user-surface: 无独立 GPU 安装路径
+def test_gpu_optional_extra_present():
+    """2026-09-12 add-gpu-extra-pyproject: `[project.optional-dependencies].gpu`
+    锁 torch==2.9.0+cu128, 是受支持的 GPU 安装路径。
 
-    torch 在核心依赖; CPU/GPU 是同一 torch 包的不同运行时, 不是两个 extra
-    (`uv sync --extra gpu` 与 `uv sync` 无差别 → extra 空转, 已删)。
+    旧约束 "无独立 GPU 安装路径" 由本约束替代 — torch 主体在核心依赖,
+    CPU/GPU 仍由同一 torch 包的不同 wheel 提供, 但走受控 extra。
     """
     text = _read_pyproject()
-    assert "[project.optional-dependencies]" not in text, (
-        "不应再有 [project.optional-dependencies] (gpu/all extra 已删, torch 为核心依赖)")
+    assert "[project.optional-dependencies]" in text, (
+        "[project.optional-dependencies] 必须存在 (gpu extra 是受支持路径)")
+    assert 'gpu = [' in text, "gpu extra 必须存在"
+    assert "torch==2.9.0+cu128" in text, (
+        "gpu extra 必须锁 torch==2.9.0+cu128 (Blackwell sm_120 最低要求)")
+
+
+def test_no_other_gpu_extras():
+    """spec: 仅 `gpu` 一个 GPU 安装 extra; cudnn/rocm/xpu 等不出现"""
+    text = _read_pyproject()
+    # 检查 [project.optional-dependencies] 段中只有 gpu
+    import re
+    m = re.search(r"\[project\.optional-dependencies\](.*?)(?=\n\[|\Z)", text, re.S)
+    assert m, "找不到 [project.optional-dependencies] 段"
+    block = m.group(1)
+    # 提取所有 `xxx = [` 形式的 key
+    extras = re.findall(r"^(\w+)\s*=\s*\[", block, re.M)
+    assert "gpu" in extras, "gpu extra 必须存在"
+    assert len(extras) == 1, f"不应有第三个 GPU extra, 发现: {extras}"
+
+
+def test_uv_sources_for_torch():
+    """spec: torch 在启用 gpu extra 时从 pytorch-cu128 索引解析"""
+    text = _read_pyproject()
+    assert "[tool.uv.sources]" in text, "torch 必须在 [tool.uv.sources] 中指定索引"
+    assert "pytorch-cu128" in text, "torch 必须指向 pytorch-cu128 索引"
+    assert "https://download.pytorch.org/whl/cu128" in text, (
+        "cu128 索引 URL 必须正确")
 
 
 def test_cupy_dependency_removed():

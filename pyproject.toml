@@ -3,7 +3,7 @@ name = "evtrade"
 version = "0.1.0"
 description = "evtrade: 策略回测 / 参数扫描 / 行情回放 (PyTorch 统一 CPU/GPU 路径, 基于 VectorizedStrategy + torch 算子)"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = { text = "Proprietary" }
 authors = [{ name = "evtrade" }]
 keywords = ["backtest", "quant", "sweep", "vectorized", "torch", "pytorch", "walk-forward"]
@@ -17,8 +17,28 @@ dependencies = [
     "torch>=2.0",
 ]
 
+# 可选 extra: GPU 协作者显式启用 (RTX 5090 / Blackwell + sm_120 需 cu128+)
+# 装法: uv sync --extra gpu
+# 默认 uv sync 仍拉 pypi.org CPU wheel (与无 extra 行为一致)
+[project.optional-dependencies]
+gpu = ["torch==2.9.0+cu128"]
+
 [project.urls]
 # 暂无
+
+# torch 仅在启用 gpu extra 时从 cu128 索引解析; 否则走 pypi 默认 (CPU wheel)
+# (uv 0.4.7+ PEP 508 sources; list 顺序 = uv 尝试顺序)
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", extra = "gpu" },
+]
+
+# 索引定义: cu128 wheel 来源 (pytorch 官方 cu128 分发)
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+# 不设 explicit=true: 该索引仅在 gpu extra 触发时被使用;
+# CPU 默认仍走 pypi (uv 内置隐式索引)
 
 # CLI 入口: uv run evtrade ... 等价于 uv run python -m evtrade
 [project.scripts]
@@ -51,9 +71,13 @@ markers = [
 ]
 
 # ============ uv 工具配置 ============
-# uv sync: 装核心依赖 (含 torch; CPU 或 CUDA wheel 由平台/安装源决定, 无独立 GPU extra)
-# uv run pytest: 跑测试
-# uv run python -m evtrade sweep ...: 启动 CLI
+# uv sync:                   装核心依赖 + CPU torch (默认)
+# uv sync --extra gpu:       装核心 + gpu extra (cu128 wheel, 需 RTX 50 / Blackwell 或同等)
+# uv run pytest:             跑测试 (默认 CPU; GPU 单测需 --gpu)
+# uv run python -m evtrade ...: 启动 CLI
+# GPU 协作者一次性:
+#   uv sync --extra gpu
+# 若 lockfile 重生后回到 CPU wheel, 跑: bash scripts/sync-torch-cu.sh
 [tool.uv]
 managed = true
 

@@ -60,9 +60,13 @@ def resolve_device(requested: str, gpu_ok: bool | None = None) -> str:
         return "cpu"
     if requested == "gpu":
         if not gpu_ok:
+            import torch
             raise ValueError(
-                "请求 --device gpu 但环境无可用 torch/CUDA; "
-                "改用 --device auto (自动降级) 或 --device cpu")
+                f"请求 --device gpu 但当前 torch 构建无 CUDA 支持 "
+                f"(torch=={torch.__version__}, cuda={torch.version.cuda}); "
+                f"改用 --device auto (自动降级) 或 --device cpu; "
+                f"GPU 机器请先 `uv sync --extra gpu` 或 "
+                f"`bash scripts/sync-torch-cu.sh`")
         return "gpu"
     return "gpu" if gpu_ok else "cpu"
 

@@ -25,5 +25,8 @@ evtrade/strategies/_defaults/*
 uv.lock
 .python-version
 
+# openspec CLI runtime 配置 (自动生成, 不入库)
+openspec/config.yaml
+
 # setuptools 构建产物
 evtrade.egg-info/

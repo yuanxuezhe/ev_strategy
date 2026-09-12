@@ -243,10 +243,21 @@ vectorized 内部逐桶信号循环 = Python 逐桶循环 + 标量 EMA 递推（
 GPU 的价值在数据量大的 tensor 侧操作与未来扩展，当前策略信号路径 CPU/GPU
 数值行为一致。
 
-**`--device` 口径（2026-09-10）**：当前回测热路径为设备无关的 numpy/Python 标量
+**`--device` 口径（2026-09-12 更新）**：当前回测热路径为设备无关的 numpy/Python 标量
 实现，`--device {cpu,gpu,auto}`（默认 auto）选择的是 `backends.get_xp` 的
 torch 后端设备，为未来 tensor 热路径预留。`--device gpu` 在 CUDA 不可用时
-**抛错**（提示改用 auto/cpu）；`--device auto` 无 CUDA 时自动降级 cpu 并打 warning。
+**抛错**（提示改用 auto/cpu；GPU 机器请 `uv sync --extra gpu` 或
+`bash scripts/sync-torch-cu.sh`）；`--device auto` 无 CUDA 时自动降级 cpu 并打 warning。
+
+**GPU wheel 安装约定（2026-09-12 `add-gpu-extra-pyproject`）**：
+- `pyproject.toml` 声明 `[project.optional-dependencies].gpu = ["torch==2.9.0+cu128"]`，
+  由 `[tool.uv.sources]` + `[[tool.uv.index]]` 指向 `https://download.pytorch.org/whl/cu128`；
+- GPU 协作者 `uv sync --extra gpu` 一次锁住（lockfile 已 commit）；
+- CPU 协作者 `uv sync` 默认行为不变（仍拉 pypi CPU wheel；若 lockfile 强制 cu128 则接受）；
+- 防御性 helper：`bash scripts/sync-torch-cu.sh` 检测 torch 是 CPU wheel 时自动 reinstall
+  到 cu128（接受 `EVT_TORCH_CU_TAG` 环境变量覆写，默认 `cu128`）；
+- `uv lock --upgrade-package torch==2.9.0+cu128 --index-strategy unsafe-best-match`
+  用于升级 / 切换 cu tag 后重生 lockfile 并 commit。
 
 ### 7.2 实盘滑动窗口
 

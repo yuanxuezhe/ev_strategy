@@ -34,6 +34,22 @@ def test_resolve_device_gpu_request_without_gpu_raises():
         resolve_device("gpu", gpu_ok=False)
 
 
+def test_resolve_device_gpu_error_message_includes_install_hints():
+    """2026-09-12 add-gpu-extra-pyproject: --device gpu 报错的文案必须含 GPU 安装引导
+
+    当 torch 是 CPU wheel 时, ValueError 文案需提示:
+      - 当前 torch 构建无 CUDA 支持 (含 torch.__version__ / cuda 字段)
+      - 改用 --device auto 或 --device cpu
+      - GPU 机器请 `uv sync --extra gpu` 或 `bash scripts/sync-torch-cu.sh`
+    """
+    with pytest.raises(ValueError) as ei:
+        resolve_device("gpu", gpu_ok=False)
+    msg = str(ei.value)
+    assert "uv sync --extra gpu" in msg or "sync-torch-cu.sh" in msg, (
+        f"ValueError 文案必须含 GPU 安装引导, 实际: {msg!r}")
+    assert "auto" in msg and "cpu" in msg, "文案需提示改用 --device auto/cpu"
+
+
 def test_resolve_device_gpu_request_with_gpu_returns_gpu():
     assert resolve_device("gpu", gpu_ok=True) == "gpu"
 
