@@ -89,15 +89,18 @@ CLI MUST 接受 `--params "k1:v1;k2:v2"` 一次传入策略参数；`_resolve_st
 ### Requirement: Engine is the sole assembly point
 Engine MUST 是唯一装配点：构造时把 `aggregator.on_bars` 覆写为自己的 `on_bars`。
 Engine 消费任意 `stream() -> Iterator[Bar]` 的 bar 流对象（回测用
-`core/_harness.ListBarFeed`；实盘接入时提供自己的流实现），切换回测/实盘 = 换 bar 流 +
-换 Executor，Engine / Aggregator / 策略 / Account 不变。`evtrade/feeds/` 子包已于 2026-09-10
+`core/_harness.ListBarFeed`；实盘接入时提供自己的流实现），切换回测/实盘 = 换 bar 流；
+策略的撮合/账本由 `step` 内部自管（无 Executor / Account 介入）。`evtrade/feeds/` 子包已于 2026-09-10
 删除（`MySQLBacktestFeed` 的 SQL 与 `core/data.py` 重复；`ChainedFeed` 无使用方）；
 回测数据加载唯一入口 MUST 为 `core/data.load_bars`（MySQL 单次拉取 + npz 缓存）或
 `core/data.synthetic_bars`（合成数据）。
 
-#### Scenario: 切换回测/实盘仅换 bar 流 + Executor
-- **WHEN** 把 `ListBarFeed` 换成自定义实盘 bar 流，把 `SimulatedExecutor` 换成自定义 Executor
-- **THEN** Engine / Aggregator / 策略 / Account 无需改动
+#### Scenario: 切换回测/实盘仅换 bar 流
+- **WHEN** 把 `ListBarFeed`（`evtrade/core/_harness.py`）换成自定义实盘 bar 流
+  （`.stream() -> Iterator[Bar]` 鸭子类型实现）
+- **THEN** Engine / Aggregator / 策略 / 数据加载代码均无需改动；策略的撮合数学
+  在其 `step` 内部自管（无 Executor / Account 介入；参见 spec R "Strategy owns
+  trade execution and PnL accounting"）
 
 #### Scenario: feeds 子包已删除
 - **WHEN** 静态检查仓库
@@ -351,21 +354,21 @@ backtest 子命令的 `--period` / `--code` flag 不受影响（CLI 入口，不
 
 ### Requirement: signal trajectory output carries aligned timestamps
 
-`--signals-out`（backtest 与 replay 两路径）MUST 写出与信号**逐元素对齐**的桶级
-`(ts, sig)` 行。`core.replay.replay_vectorized` MUST 返回与 `"sig"` 等长的桶级时间戳键
-`"ts"`（与 `trades` 的 ts 同源，即 `_aggregate_buckets` 产出的桶 ts）；backtest 路径
-MUST 用 `result["buckets"]["ts"][mark==1]` 与之 zip。MUST NOT 以 1m bar 数组数索引
-**桶级** sig 数组（桶数 < bar 数）——2026-09-10 前 backtest / replay 两路径即以此
-方式索引（latent bug：warmup 存在时越界崩溃，无 warmup 时写出大量 sig=0 错位行）。
+`--signals-out`（`backtest` 子命令）MUST 写出与信号**逐元素对齐**的桶级
+`(ts, sig)` 行。`run_vectorized(...)` 返回的 `result["buckets"]["ts"][mark==1]`
+MUST 与 `result["sig"]` 等长（与 `_aggregate_buckets` 产出的桶 ts 同源）；`backtest`
+MUST 用此对子写出 CSV。MUST NOT 以 1m bar 数组数索引**桶级** sig 数组（桶数 < bar 数）——
+2026-09-10 前 backtest / replay 两路径即以此方式索引（latent bug：warmup 存在时越界崩溃，
+无 warmup 时写出大量 sig=0 错位行）。`replay` 子命令已于 2026-09-13 下线。
 
-#### Scenario: replay sig 与 ts 等长且对齐
-- **WHEN** `replay_vectorized(...)` 返回 `out`
-- **THEN** `len(out["ts"]) == len(out["sig"])`；每对 `(ts, sig)` 中 ts 与该笔
-  `trades` 用的桶 ts 同源
+#### Scenario: run_vectorized 返回的 sig 与 ts 等长且对齐
+- **WHEN** `run_vectorized(...)` 返回 `result`
+- **THEN** `len(result["buckets"]["ts"][mark==1]) == len(result["sig"])`；每对 `(ts, sig)`
+  中 ts 与 `_aggregate_buckets` 产出的桶 ts 同源
 
 #### Scenario: --signals-out 写出桶级轨迹
-- **WHEN** `python -m evtrade replay --log <log> --signals-out <out.csv> --warmup-until <ymd> ...`
-- **THEN** 正常完成，`<out.csv>` 行数 = 桶数（非 1m bar 数），无越界异常
+- **WHEN** `python -m evtrade backtest --strategy <name> ... --signals-out <out.csv>`
+- **THEN** 正常完成，`<out.csv>` 行数 = 桶级 `mark==1` 段的行数（非 1m bar 数），无越界异常
 
 ### Requirement: Optional GPU-batched sweep hook (`batched_step`)
 
