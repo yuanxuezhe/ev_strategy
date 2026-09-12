@@ -1,22 +1,22 @@
 {
   "params": {
     "high1": 1.0,
-    "high2": 0.3,
+    "high2": 0.8,
     "low1": 1.0,
-    "low2": 1.0
+    "low2": 0.5
   },
-  "saved_at": "2026-09-12T05:14:11+00:00",
+  "saved_at": "2026-09-12T05:22:36+00:00",
   "source": {
-    "S": 1.0,
-    "ann_net_min": 2.5122420435048594,
-    "candidate_total": 81,
+    "S": 0.0,
+    "ann_net_min": -0.5410847178566311,
+    "candidate_total": 54,
     "csv": "sweep_results.csv",
     "filter_pass": true,
     "kind": "from_sweep",
-    "rank": 1,
-    "runner_up_gap": 0.18869272336480636,
-    "runner_up_score": 1.0674282983876233,
-    "score": 1.2561210217524297,
+    "rank": 7,
+    "runner_up_gap": -0.7409572089785337,
+    "runner_up_score": 0.19987249112190258,
+    "score": -0.5410847178566311,
     "sort_key": "filter_pass=True 且 score 最高"
   },
   "strategy": "channel_deviation"
