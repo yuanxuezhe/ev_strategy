@@ -13,7 +13,7 @@ import numpy as np
 from .config import INIT_CASH, INIT_POSITION, TRADE_QTY
 
 # 引擎级 grid key (框架自带); 策略参数名由其 params_spec 自动允许
-GRID_KEYS = ("period", "trade_qty", "scale",
+GRID_KEYS = ("period", "trade_qty",
              "buy_pct", "sell_pct")
 
 
@@ -66,7 +66,7 @@ def run_one_from_dict(bars: dict, p: dict, warmup_until: int,
 
     strategy_name: 必填 (策略 key), 见 evtrade.strategies.available_strategies()
     p 必含键: period / init_cash / init_position / trade_qty / params
-    可选:    scale / buy_pct / sell_pct
+    可选:    buy_pct / sell_pct
     """
     if not strategy_name:
         raise ValueError("run_one_from_dict: strategy_name is required")
@@ -77,7 +77,6 @@ def run_one_from_dict(bars: dict, p: dict, warmup_until: int,
         init_cash=p["init_cash"],
         init_position=p["init_position"],
         trade_qty=p["trade_qty"],
-        scale=p.get("scale", 1.0),
         buy_pct=p.get("buy_pct", 0.0),
         sell_pct=p.get("sell_pct", 0.0),
     )
@@ -89,7 +88,6 @@ def run_one_vectorized(bars: dict, period: str, warmup_until: int,
                        init_cash: float = INIT_CASH,
                        init_position: float = INIT_POSITION,
                        trade_qty: float = TRADE_QTY,
-                       scale: float = 1.0,
                        buy_pct: float = 0.0,
                        sell_pct: float = 0.0) -> dict:
     """单组参数单窗回测 (vectorized 入口; 内部走 run_vectorized)
@@ -103,7 +101,7 @@ def run_one_vectorized(bars: dict, period: str, warmup_until: int,
         bars_1m=bars, period=period, warmup_until=warmup_until,
         strategy=strategy, params=strategy.params,
         init_cash=init_cash, init_position=init_position,
-        trade_qty=trade_qty, scale=scale,
+        trade_qty=trade_qty,
         buy_pct=buy_pct, sell_pct=sell_pct,
     )["summary"]
 
@@ -274,7 +272,6 @@ def sweep(bars: dict, base: dict, combos: list[dict],
             init_cash=p["init_cash"],
             init_position=p["init_position"],
             trade_qty=p["trade_qty"],
-            scale=p.get("scale", 1.0),
             buy_pct=p.get("buy_pct", 0.0),
             sell_pct=p.get("sell_pct", 0.0),
         )

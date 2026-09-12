@@ -12,7 +12,7 @@ state 由引擎持有, 跨调用持续。strategy.step 是策略唯一入口。
 
 import numpy as np
 
-from ..execution.base import _TradeStateTracker, trade_decision
+from ..execution.base import trade_decision
 from .config import INIT_CASH, INIT_POSITION, TRADE_QTY
 from .metrics import summarize
 from .timeutils import resolve_period_seconds
@@ -72,7 +72,7 @@ def _aggregate_buckets(bars_1m: dict, period: str, warmup_until: int) -> dict:
 
 def _execute_trades(sig_np, close_np, ts_np,
                     init_cash, init_position, trade_qty,
-                    scale, buy_pct, sell_pct):
+                    buy_pct, sell_pct):
     """顺序遍历信号数组, 模拟成交 (与 SimulatedExecutor.trade + Account.apply 同式)
 
     sig_np / close_np / ts_np 必须为 numpy 1D array。
@@ -80,8 +80,6 @@ def _execute_trades(sig_np, close_np, ts_np,
     """
     cash = init_cash
     position = init_position
-    # 倍投状态机 (与 SimulatedExecutor 共享 _TradeStateTracker)
-    qty_tracker = _TradeStateTracker(qty=trade_qty, scale=scale)
     trades = []
     n_trades = 0
     n_buy = 0
@@ -104,10 +102,8 @@ def _execute_trades(sig_np, close_np, ts_np,
         ts = int(ts_np[i])
         last_price = price
 
-        cur_qty = qty_tracker.next_qty(s)
-
         cash, position, q, filled = trade_decision(
-            s, price, cash, position, cur_qty, buy_pct, sell_pct)
+            s, price, cash, position, trade_qty, buy_pct, sell_pct)
         if not filled:
             continue
         n_trades += 1
@@ -179,7 +175,7 @@ def _compute_signals(strategy, params: dict, buckets: dict,
 def run_vectorized(bars_1m: dict, period: str, warmup_until: int,
                    strategy, params: dict,
                    init_cash: float = INIT_CASH, init_position: float = INIT_POSITION,
-                   trade_qty: float = TRADE_QTY, scale: float = 1.0,
+                   trade_qty: float = TRADE_QTY,
                    buy_pct: float = 0.0, sell_pct: float = 0.0,
                    verbose: bool = False) -> dict:
     """向量化回测 (strategy-step-only)
@@ -207,7 +203,7 @@ def run_vectorized(bars_1m: dict, period: str, warmup_until: int,
 
     exec_state = _execute_trades(
         sig_np, close_np, ts_np, init_cash, init_position, trade_qty,
-        scale, buy_pct, sell_pct)
+        buy_pct, sell_pct)
 
     # 汇总 (metrics.summarize, 30 字段)
     summary = summarize(

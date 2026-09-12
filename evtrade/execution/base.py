@@ -8,8 +8,9 @@
       保证两条引擎路径逐笔 bitwise 一致 (replay --against-ref 对账依赖)。
 
   - SimulatedExecutor.trade (回测模拟, 调 trade_decision)
-      scale: 同方向连续信号时, 数量按 scale 倍投; 翻转时重置为基础数量。
-      (scale/last_side 是调用方状态, 留在 executor 侧)
+      直接用传入的 qty 走 trade_decision; 不再维护 scale 倍投状态机
+      (2026-09-12 下线: 多次实测发现 scale>1 仅放大回撤, 不改善超额,
+       详见 kbs/06 §8 '倍投下线观察')。
 
   - Account.apply (记账)
 
@@ -20,39 +21,6 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
-
-@dataclass
-class _TradeStateTracker:
-    """scale 倍投状态机 (SimulatedExecutor 与 vectorized_engine 共享)
-
-    连续同方向信号时, 下一笔数量 = 上一笔 × scale (首次为 qty);
-    方向翻转时重置为基础数量 qty。信号即计数 (未成交也计); scale=1.0 = 关闭。
-
-    抽到这里是为了消除 SimulatedExecutor.trade 与 vectorized_engine._execute_trades
-    两处重复 6 行 (last_side/cur_qty 维护); spec R 'Single trade-execution
-    implementation' 的延伸 — 不仅成交公式一处, 倍投状态机也一处。
-    """
-    qty: float
-    scale: float = 1.0
-    last_side: int = field(default=0, init=False)
-    cur_qty: float = field(init=False)
-
-    def __post_init__(self):
-        self.cur_qty = self.qty
-
-    def next_qty(self, side: int) -> float:
-        """根据本次信号方向返 cur_qty; 调用方拿到后传给 trade_decision.
-        同方向倍投 / 翻转重置都在这里维护, 调用方无需再判断.
-        """
-        if side == self.last_side:
-            self.cur_qty = self.cur_qty * self.scale
-        else:
-            self.cur_qty = self.qty
-            self.last_side = side
-        return self.cur_qty
-
 
 def trade_decision(side: int, price: float, cash: float, position: float,
                    cur_qty: float, buy_pct: float, sell_pct: float
@@ -60,7 +28,7 @@ def trade_decision(side: int, price: float, cash: float, position: float,
     """单一成交决策实现 (SimulatedExecutor / vectorized 引擎共用)
 
     side: 1=BUY, -1=SELL (调用方保证非 0)
-    cur_qty: 本轮基础数量 (scale 倍投后的量, 由调用方维护)
+    cur_qty: 本轮成交数量; 由调用方 (固定 qty 或 buy_pct/sell_pct 比例) 算出
     返回 (new_cash, new_position, qty, filled); filled=False 时现金/持仓原样返回。
     """
     if side > 0:
@@ -94,17 +62,16 @@ class Executor:
 class SimulatedExecutor(Executor):
     """回测模拟下单: 以信号当根 close 成交, 资金/持仓不足则买满/卖完
 
-    scale 倍投: 连续同方向信号时, 下一笔数量 = 上一笔 × scale (首次为 qty);
-    方向翻转重置。信号即计数 (未成交也计); 1.0 = 关闭. 由内部 _TradeStateTracker 维护.
-
     资金模式:
       buy_pct  ∈ [0,1]: BUY 时按当前 cash 的比例下注
       sell_pct ∈ [0,1]: SELL 时按当前 position 的比例卖
       all_in=True: 等价于 buy_pct=sell_pct=1.0
-      三者均 0 时走 fixed-qty 路径
+      三者均 0 时走 fixed-qty 路径 (qty 即每笔固定数量)
+
+    注: 早期版本支持 scale 倍投 (连续同方向信号数量累乘), 2026-09-12 下线.
     """
 
-    def __init__(self, account, qty: float, scale: float = 1.0,
+    def __init__(self, account, qty: float,
                  buy_pct: float = 0.0, sell_pct: float = 0.0, all_in: bool = False,
                  record_to: list | None = None):
         self.account = account
@@ -115,17 +82,14 @@ class SimulatedExecutor(Executor):
         if all_in:
             self.buy_pct = max(self.buy_pct, 1.0)
             self.sell_pct = max(self.sell_pct, 1.0)
-        # 倍投状态机: scale/last_side/cur_qty 收敛到一个 tracker (与 vectorized_engine 共享)
-        self._qty_tracker = _TradeStateTracker(qty=qty, scale=scale)
         # record_to: 若非 None, 每次成功 trade 追加 {ts,side,qty,price} 副本 (replay/对账用)
         self.record_to = record_to
 
     def trade(self, signal: str, price: float, ts: str) -> bool:
         acc = self.account
         side = 1 if signal == "BUY" else -1
-        cur_qty = self._qty_tracker.next_qty(side)
         cash, position, qty, filled = trade_decision(
-            side, price, acc.cash, acc.position, cur_qty,
+            side, price, acc.cash, acc.position, self.qty,
             self.buy_pct, self.sell_pct)
         if not filled:
             return False

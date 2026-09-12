@@ -78,7 +78,7 @@ def replay_vectorized(bars, period: str, warmup_until: int,
                       strategy_name: str, strategy_params: dict,
                       init_cash: float = INIT_CASH,
                       init_position: float = INIT_POSITION,
-                      trade_qty: float = TRADE_QTY, scale: float = 1.0,
+                      trade_qty: float = TRADE_QTY,
                       buy_pct: float = 0.0, sell_pct: float = 0.0) -> dict:
     """vectorized 引擎回放: 返回逐 bar 信号轨迹 (桶级对齐) + 成交流 + 绩效
 
@@ -97,7 +97,7 @@ def replay_vectorized(bars, period: str, warmup_until: int,
         bars_1m=arr, period=period, warmup_until=warmup_until,
         strategy=strategy, params=strategy.params,
         init_cash=init_cash, init_position=init_position,
-        trade_qty=trade_qty, scale=scale,
+        trade_qty=trade_qty,
         buy_pct=buy_pct, sell_pct=sell_pct,
     )
     return {
@@ -111,7 +111,7 @@ def replay_vectorized(bars, period: str, warmup_until: int,
 def replay_engine(bars, period: str, warmup_until: int,
                   strategy_name: str, strategy_params: dict,
                   init_cash: float = INIT_CASH, init_position: float = INIT_POSITION,
-                  trade_qty: float = TRADE_QTY, scale: float = 1.0,
+                  trade_qty: float = TRADE_QTY,
                   buy_pct: float = 0.0, sell_pct: float = 0.0,
                   all_in: bool = False) -> dict:
     """参考引擎 (Engine 全链路) 回放: 输出与 replay_vectorized 同构 (桶级对齐)
@@ -133,7 +133,7 @@ def replay_engine(bars, period: str, warmup_until: int,
     # Executor 仅调 trade_decision + Account.apply; 不再硬编码 print 成交明细 (2026-09-12 cleanup).
     # Engine.verbose=True 让 sig!=0 时调 strategy.format_signal_line 并 print.
     executor = SimulatedExecutor(account, qty=trade_qty,
-                                 scale=scale, buy_pct=buy_pct,
+                                 buy_pct=buy_pct,
                                  sell_pct=sell_pct, all_in=all_in,
                                  record_to=records)
     strategy = get_strategy(strategy_name, params=strategy_params or {})
@@ -163,7 +163,7 @@ def diff_signals(sig_a: np.ndarray, sig_b: np.ndarray) -> dict:
 def reconcile(bars, period: str, warmup_until: int,
               strategy_name: str, strategy_params: dict,
               init_cash: float = INIT_CASH, init_position: float = INIT_POSITION,
-              trade_qty: float = TRADE_QTY, scale: float = 1.0,
+              trade_qty: float = TRADE_QTY,
               buy_pct: float = 0.0, sell_pct: float = 0.0, all_in: bool = False,
               verbose: bool = True,
               strict: bool | None = None,
@@ -181,10 +181,10 @@ def reconcile(bars, period: str, warmup_until: int,
     if bucket_diff_cap is None:
         bucket_diff_cap = 0 if strict else 8
     k = replay_vectorized(bars, period, warmup_until, strategy_name, strategy_params,
-                          init_cash, init_position, trade_qty, scale,
+                          init_cash, init_position, trade_qty,
                           buy_pct=buy_pct, sell_pct=sell_pct)
     r = replay_engine(bars, period, warmup_until, strategy_name, strategy_params,
-                      init_cash, init_position, trade_qty, scale,
+                      init_cash, init_position, trade_qty,
                       buy_pct=buy_pct, sell_pct=sell_pct, all_in=all_in)
     d_sig = diff_signals(k["sig"], r["sig"])
     trades_ok = (len(k["trades"]) == len(r["trades"]) and all(

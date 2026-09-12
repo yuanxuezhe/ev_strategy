@@ -91,14 +91,14 @@ def test_sweep_does_not_crash_when_one_combo_fails():
     def flaky(bars, period, warmup_until, strategy_name,
               strategy_params=None,
               init_cash=200000.0, init_position=200000.0, trade_qty=10000.0,
-              scale=1.0, buy_pct=0.0, sell_pct=0.0):
+              buy_pct=0.0, sell_pct=0.0):
         calls["n"] += 1
         if calls["n"] == 2:
             raise RuntimeError("simulated combo failure")
         return real(bars, period, warmup_until, strategy_name,
                     strategy_params=strategy_params,
                     init_cash=init_cash, init_position=init_position,
-                    trade_qty=trade_qty, scale=scale,
+                    trade_qty=trade_qty,
                     buy_pct=buy_pct, sell_pct=sell_pct)
 
     with unittest.mock.patch.object(sweep_mod, "run_one_vectorized", flaky):

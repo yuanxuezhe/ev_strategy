@@ -88,7 +88,7 @@ def run_batched(bars: dict, base: dict, params_list: list[dict],
 
     参数:
       bars         1m bar dict (numpy 数组)
-      base         sweep base (含 start/period/trade_qty/init_cash/init_position/scale/buy_pct/sell_pct)
+      base         sweep base (含 start/period/trade_qty/init_cash/init_position/buy_pct/sell_pct)
       params_list  per-combo 已合并的参数字典列表
       strategy_cls VectorizedStrategy 子类
       device       "cpu" / "gpu" (字符串; 用 backends.get_xp 转 torch.device)
@@ -173,7 +173,6 @@ def run_batched(bars: dict, base: dict, params_list: list[dict],
                     init_cash=base["init_cash"],
                     init_position=base["init_position"],
                     trade_qty=p["trade_qty"],
-                    scale=p.get("scale", 1.0),
                     buy_pct=p.get("buy_pct", 0.0),
                     sell_pct=p.get("sell_pct", 0.0),
                 )

@@ -29,7 +29,7 @@ def _run(fast=5, slow=20):
         arr, period="5m", warmup_until=20250110000000,
         strategy=strat, params=strat.params,
         init_cash=200000.0, init_position=200000.0,
-        trade_qty=10000.0, scale=1.0)
+        trade_qty=10000.0)
 
 
 # ---------- CPU smoke ----------

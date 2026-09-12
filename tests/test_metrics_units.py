@@ -204,7 +204,6 @@ def test_sweep_filter_pass_respects_max_mdd():
         init_cash=200000.0,
         init_position=200000.0,
         trade_qty=10000.0,
-        scale=1.0,
         buy_pct=0.0,
         sell_pct=0.0)
     assert m["max_drawdown"] > 0.0, "synthetic 数据应有 mdd > 0"

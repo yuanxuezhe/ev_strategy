@@ -132,7 +132,7 @@ trades=None, bucket_seconds=300) -> dict` 给出，vectorized 路径
 2. strategy= get_strategy(strategy_name, params=strategy_params)
 3. result  = run_vectorized(bars, period, warmup_until=int(start)*1_000_000,
                             strategy, params, init_cash, init_position,
-                            trade_qty, scale, buy_pct, sell_pct, verbose)
+                            trade_qty, buy_pct, sell_pct, verbose)
 4. → 打印成交行 → 打印 metrics.summarize 盈亏汇总
 ```
 
@@ -155,12 +155,12 @@ Engine 全链路（`replay_engine`，供 `replay --against-ref` 对账）：
   不是 bar 流对象上的属性
 - 实盘 = 自供一个 `.stream()` 对象（见 08 文档）替换 `ListBarFeed`，其余装配不变
 
-启动头打印：证券/周期/策略日期/预热天数/策略/scale/资金模式/device，便于复核每次回测的参数组合。
+启动头打印：证券/周期/策略日期/预热天数/策略/资金模式/device，便于复核每次回测的参数组合。
 
 ## 6. 一次完整回测的日志结构示例
 
 ```
-证券: 159992.SZ  周期: 5m  策略日期: 20250101~20260903  预热: 365天  策略: channel_deviation  scale=1.0  资金模式: buy=0/sell=0  device=cpu
+证券: 159992.SZ  周期: 5m  策略日期: 20250101~20260903  预热: 365天  策略: channel_deviation  资金模式: buy=0/sell=0  device=cpu
   -- 加载 102944 根 1m bar [20240102 ~ 20260903] (含预热)     ← 数据加载进度（load_bars 打印；预热段无信号输出）
 ...
 BUY  >>> [20250106101500] 159992.SZ | UP=.. DW=.. | low_dev(L/DW)=..% high_dev(H/UP)=..%

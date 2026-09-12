@@ -152,5 +152,5 @@ def test_08_replay_engine():
                     strategy_params={"low1": 1.5, "low2": 1.0,
                                      "high1": 1.5, "high2": 0.5},
                     init_cash=200000.0, init_position=200000.0,
-                    trade_qty=10000.0, scale=1.0, verbose=False)
+                    trade_qty=10000.0, verbose=False)
     assert rep["pass"] is True

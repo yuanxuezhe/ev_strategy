@@ -186,7 +186,7 @@ def test_sweep_routing_threadpool_when_small_grid():
     """N < 32 时 sweep 走 ThreadPool (batched 阈值未达)"""
     bars = _synthetic_arr(days=10, start_ymd="20260101", seed=42)
     base = {"start": "20260101", "period": "5m", "trade_qty": 10000,
-            "init_cash": 200000, "init_position": 0, "scale": 1.0,
+            "init_cash": 200000, "init_position": 0,
             "buy_pct": 0.0, "sell_pct": 0.0, "params": {}}
     combos = []
     for fp in [3, 5]:
@@ -203,7 +203,7 @@ def test_sweep_routing_threadpool_for_channel_deviation():
     """channel_deviation 不覆写 batched_step, 任何 device 都走 ThreadPool"""
     bars = _synthetic_arr(days=5, start_ymd="20260101", seed=42)
     base = {"start": "20260101", "period": "5m", "trade_qty": 10000,
-            "init_cash": 200000, "init_position": 0, "scale": 1.0,
+            "init_cash": 200000, "init_position": 0,
             "buy_pct": 0.0, "sell_pct": 0.0, "params": {}}
     combos = [{"low1": 1.5, "low2": 1.0, "high1": 1.5, "high2": 0.5, "tf1": 21}]
     # 即使 N=1 也走 ThreadPool (channel 不覆写 hook)
@@ -220,7 +220,7 @@ def test_sweep_routing_uses_batched_when_threshold_met(monkeypatch):
     """
     bars = _synthetic_arr(days=10, start_ymd="20260101", seed=42)
     base = {"start": "20260101", "period": "5m", "trade_qty": 10000,
-            "init_cash": 200000, "init_position": 0, "scale": 1.0,
+            "init_cash": 200000, "init_position": 0,
             "buy_pct": 0.0, "sell_pct": 0.0, "params": {}}
     combos = [{"fast": fp, "slow": sp}
               for fp in [3, 5, 10, 21]
@@ -255,7 +255,7 @@ def test_sweep_routing_uses_batched_when_threshold_met(monkeypatch):
                 init_cash=base["init_cash"],
                 init_position=base["init_position"],
                 trade_qty=p["trade_qty"],
-                scale=p.get("scale", 1.0),
+
                 buy_pct=p.get("buy_pct", 0.0),
                 sell_pct=p.get("sell_pct", 0.0),
             )
@@ -286,7 +286,7 @@ def test_sweep_batched_propagates_exceptions_immediately(monkeypatch):
     """batched_step 抛异常 -> sweep 立即抛 (不延后, 不吞)"""
     bars = _synthetic_arr(days=10, start_ymd="20260101", seed=42)
     base = {"start": "20260101", "period": "5m", "trade_qty": 10000,
-            "init_cash": 200000, "init_position": 0, "scale": 1.0,
+            "init_cash": 200000, "init_position": 0,
             "buy_pct": 0.0, "sell_pct": 0.0, "params": {}}
     combos = [{"fast": fp, "slow": sp}
               for fp in [3, 5, 10, 21]
@@ -326,7 +326,7 @@ def test_sweep_batched_fallback_to_cpu_when_no_cuda(monkeypatch):
     monkeypatch.setattr("evtrade.backends.gpu_available", lambda: False)
     bars = _synthetic_arr(days=10, start_ymd="20260101", seed=42)
     base = {"start": "20260101", "period": "5m", "trade_qty": 10000,
-            "init_cash": 200000, "init_position": 0, "scale": 1.0,
+            "init_cash": 200000, "init_position": 0,
             "buy_pct": 0.0, "sell_pct": 0.0, "params": {}}
     combos = [{"fast": fp, "slow": sp}
               for fp in [3, 5, 10, 21]
@@ -341,7 +341,7 @@ def test_sweep_batched_oom_falls_back(monkeypatch):
     """CUDA OOM at runtime -> 自动 fallback ThreadPool + warning"""
     bars = _synthetic_arr(days=10, start_ymd="20260101", seed=42)
     base = {"start": "20260101", "period": "5m", "trade_qty": 10000,
-            "init_cash": 200000, "init_position": 0, "scale": 1.0,
+            "init_cash": 200000, "init_position": 0,
             "buy_pct": 0.0, "sell_pct": 0.0, "params": {}}
     combos = [{"fast": fp, "slow": sp}
               for fp in [3, 5, 10, 21]
@@ -393,7 +393,7 @@ def test_sweep_batched_output_schema_matches_threadpool(monkeypatch):
     """
     bars = _synthetic_arr(days=20, start_ymd="20260101", seed=42)
     base = {"start": "20260101", "period": "5m", "trade_qty": 10000,
-            "init_cash": 200000, "init_position": 0, "scale": 1.0,
+            "init_cash": 200000, "init_position": 0,
             "buy_pct": 0.0, "sell_pct": 0.0, "params": {}}
     combos = [{"fast": fp, "slow": sp}
               for fp in [3, 5, 10, 21]
@@ -427,7 +427,7 @@ def test_sweep_batched_output_schema_matches_threadpool(monkeypatch):
                 init_cash=base["init_cash"],
                 init_position=base["init_position"],
                 trade_qty=p["trade_qty"],
-                scale=p.get("scale", 1.0),
+
                 buy_pct=p.get("buy_pct", 0.0),
                 sell_pct=p.get("sell_pct", 0.0),
             )
@@ -462,7 +462,7 @@ def test_sweep_batched_score_ranking_unchanged(monkeypatch):
     """batched 路径 score 排序 == ThreadPool 路径 (按 fast+slow 排序后比)"""
     bars = _synthetic_arr(days=20, start_ymd="20260101", seed=42)
     base = {"start": "20260101", "period": "5m", "trade_qty": 10000,
-            "init_cash": 200000, "init_position": 0, "scale": 1.0,
+            "init_cash": 200000, "init_position": 0,
             "buy_pct": 0.0, "sell_pct": 0.0, "params": {}}
     combos = [{"fast": fp, "slow": sp}
               for fp in [3, 5, 10, 21]
@@ -495,7 +495,7 @@ def test_sweep_batched_score_ranking_unchanged(monkeypatch):
                 init_cash=base["init_cash"],
                 init_position=base["init_position"],
                 trade_qty=p["trade_qty"],
-                scale=p.get("scale", 1.0),
+
                 buy_pct=p.get("buy_pct", 0.0),
                 sell_pct=p.get("sell_pct", 0.0),
             )

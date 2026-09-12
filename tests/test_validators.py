@@ -114,7 +114,7 @@ def test_sweep_skips_violating_combos():
 
     bars = bars_to_arrays(synthetic_bars(days=15, start_ymd="20250101", seed=42))
     base = {"start": "20250101", "period": "5m",
-            "trade_qty": 10000.0, "scale": 1.0,
+            "trade_qty": 10000.0,
             "buy_pct": 0.0, "sell_pct": 0.0,
             "init_cash": 200000.0, "init_position": 200000.0,
             "params": {}}
@@ -139,7 +139,7 @@ def test_sweep_all_violating_raises():
 
     bars = bars_to_arrays(synthetic_bars(days=10, start_ymd="20250101", seed=42))
     base = {"start": "20250101", "period": "5m",
-            "trade_qty": 10000.0, "scale": 1.0,
+            "trade_qty": 10000.0,
             "buy_pct": 0.0, "sell_pct": 0.0,
             "init_cash": 200000.0, "init_position": 200000.0,
             "params": {}}

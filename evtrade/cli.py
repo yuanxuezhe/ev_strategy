@@ -73,8 +73,6 @@ def _common_parent() -> argparse.ArgumentParser:
                     help="策略参数 (通用 dict 形式): 'k1:v1;k2:v2'")
     ap.add_argument("--period", default="5m", type=_period_type,
                     help="K线周期, 任意数字+m/h/d: 5m/7m/15m/30m/90m/2h/4h/6h/1d/3d ...")
-    ap.add_argument("--scale", type=float, default=1.0,
-                    help="倍投系数: 连续同向信号数量=上次×scale (反向重置); 1.0=关闭")
     ap.add_argument("--all-in", action="store_true",
                     help="全仓模式 (等价 --buy-pct 1.0 --sell-pct 1.0)")
     ap.add_argument("--buy-pct", type=float, default=0.0,
@@ -155,7 +153,6 @@ def _run_backtest(args):
     print(f"证券: {args.code}  周期: {args.period}  策略日期: {args.start}~{args.end}  "
           f"预热: {args.warmup_days}天  "
           f"策略: {args.strategy}  "
-          f"scale={args.scale}  "
           f"资金模式: {'ALL-IN' if args.all_in else f'buy={args.buy_pct}/sell={args.sell_pct}'}  "
           f"device={args.device}\n", flush=True)
 
@@ -166,7 +163,7 @@ def _run_backtest(args):
         bars, period=args.period, warmup_until=int(args.start) * 1_000_000,
         strategy=strategy, params=strategy.params,
         init_cash=args.init_cash, init_position=args.init_position,
-        trade_qty=args.trade_qty, scale=args.scale,
+        trade_qty=args.trade_qty,
         buy_pct=buy_pct, sell_pct=sell_pct,
         verbose=args.verbose)
     dt = time.perf_counter() - t0
@@ -282,7 +279,7 @@ def sweep_main(argv=None):
 
     base_params = _resolve_strategy_params(args.strategy, args.params)
     base = {"start": args.start, "period": args.period,
-            "trade_qty": args.trade_qty, "scale": args.scale,
+            "trade_qty": args.trade_qty,
             "buy_pct": args.buy_pct, "sell_pct": args.sell_pct,
             "init_cash": INIT_CASH, "init_position": INIT_POSITION,
             "params": base_params}
@@ -376,7 +373,7 @@ def replay_main(argv=None):
     warm = int(args.warmup_until) * 1_000_000 if args.warmup_until else 0
     print(f"回放: {len(bars)} 根 bar [{bars[0].stime} ~ {bars[-1].stime}]  "
           f"period={args.period} 策略={strategy_name} "
-          f"params={sp or '(默认)'}  scale={args.scale}  device={args.device}\n",
+          f"params={sp or '(默认)'}  device={args.device}\n",
           flush=True)
 
     # all_in 两腿对称: 解析为 buy/sell_pct=1.0 后统一传给 vectorized 腿与
@@ -386,7 +383,6 @@ def replay_main(argv=None):
 
     k = replay_vectorized(bars, args.period, warm,
                           strategy_name=strategy_name, strategy_params=sp,
-                          scale=args.scale,
                           buy_pct=buy_pct, sell_pct=sell_pct)
     s = k["summary"]
     n_sig = int((k["sig"] != 0).sum()) if hasattr(k["sig"], "__len__") else 0
@@ -403,7 +399,6 @@ def replay_main(argv=None):
         print()
         reconcile(bars, args.period, warm,
                   strategy_name=strategy_name, strategy_params=sp,
-                  scale=args.scale,
                   buy_pct=buy_pct, sell_pct=sell_pct,
                   all_in=args.all_in)
 
