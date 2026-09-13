@@ -4,7 +4,7 @@
   VectorizedStrategy         所有策略的基类
   get_strategy(name, **kw)   按 key 构造
   get_strategy_class(name)   按 key 拿类 (不实例化)
-  get_strategy_param_spec(name) 取 params_spec (sweep grid / CLI 校验)
+  get_strategy_param_spec(name) 取 params_spec (sweep grid / CLI 校验 / help 展示)
   available_strategies()     所有可用 key
   register_strategy(name)    装饰器
 
@@ -30,9 +30,17 @@ from . import channel_deviation  # noqa: F401  注册 channel_deviation
 from . import ma_crossover       # noqa: F401  注册 ma_crossover
 from . import filtered_mr        # noqa: F401  注册 filtered_mr
 
+# 策略简短描述 (help 子命令 list 模式用; 新增策略时一处加)
+_STRATEGY_SUMMARIES: dict[str, str] = {
+    "channel_deviation": "通道偏离回撤策略 (均值回归, EMA 通道 + 锁存 FSM)",
+    "ma_crossover":      "双均线交叉策略 (EMA 快慢线金叉/死叉)",
+    "filtered_mr":       "4 重过滤均值回归 (大周期顺势 + ADX + ATR + close FSM)",
+}
+
 __all__ = [
     "VectorizedStrategy",
     "register_strategy", "get_strategy", "get_strategy_class",
     "get_strategy_param_spec", "available_strategies",
+    "_STRATEGY_SUMMARIES",
 ]
 

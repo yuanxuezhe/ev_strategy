@@ -403,10 +403,137 @@ def params_main(argv=None):
         return
 
 
+# ============ help 子命令 (策略参数查询) ============
+
+# 简短策略描述映射 (与 strategies/__init__.py 的 _STRATEGY_SUMMARIES 同源;
+# 落在此处仅作 fallback, 主路径读 strategies 子包)
+_FALLBACK_SUMMARIES: dict[str, str] = {}
+
+
+def build_help_parser(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """help 子命令 parser: --strategy [STRATEGY ...] (nargs='*' 允许空)
+
+    空 --strategy = 列表模式 (列所有策略); 非空 = 详细参数表
+    """
+    ap.add_argument("--strategy", nargs="*", default=[],
+                    help="策略 key (可多个); 省略时列出所有已注册策略")
+    return ap
+
+
+def _summaries() -> dict[str, str]:
+    """策略简短描述字典 (从 strategies/__init__ 取, 失败回退到 _FALLBACK_SUMMARIES)"""
+    try:
+        from .strategies import _STRATEGY_SUMMARIES
+        return _STRATEGY_SUMMARIES
+    except (ImportError, AttributeError):
+        return _FALLBACK_SUMMARIES
+
+
+def _fmt_type(schema: dict) -> str:
+    t = schema.get("type")
+    return t.__name__ if t is not None else "any"
+
+
+def _fmt_default(schema: dict) -> str:
+    v = schema.get("default")
+    return repr(v) if v is not None else "(必填)"
+
+
+def _fmt_range(schema: dict) -> str:
+    mn, mx = schema.get("min"), schema.get("max")
+    if mn is None and mx is None:
+        return "any"
+    return f"[{mn}, {mx}]"
+
+
+def _print_strategy_list(names: list[str]) -> None:
+    """help 无 --strategy 时打印列表"""
+    summaries = _summaries()
+    print("evtrade 已注册策略:\n")
+    width = max((len(n) for n in names), default=20)
+    for n in names:
+        summary = summaries.get(n, "(无简短描述)")
+        print(f"  {n:<{width}}  {summary}")
+    print(f"\n共 {len(names)} 个策略。详情:  python -m evtrade help --strategy <name>")
+
+
+def _print_strategy_detail(name: str, cls, spec: dict) -> None:
+    """help --strategy NAME 时打印详细参数表"""
+    summaries = _summaries()
+    header = name
+    summary = summaries.get(name, "")
+    if summary:
+        header += f"  — {summary}"
+    print(header)
+    print("=" * max(60, len(header)))
+
+    if not spec:
+        print("\n  (无参数)\n")
+        return
+
+    print("\n参数:\n")
+    name_w = max(len(k) for k in spec)
+    type_w = max(len(_fmt_type(s)) for s in spec.values())
+    default_w = max(len(_fmt_default(s)) for s in spec.values())
+    range_w = max(len(_fmt_range(s)) for s in spec.values())
+
+    print(f"  {'参数名':<{name_w}}  {'类型':<{type_w}}  "
+          f"{'默认值':<{default_w}}  {'范围':<{range_w}}  描述")
+    print(f"  {'─' * name_w}  {'─' * type_w}  "
+          f"{'─' * default_w}  {'─' * range_w}  {'─' * 40}")
+
+    for k, schema in spec.items():
+        type_str = _fmt_type(schema)
+        default_str = _fmt_default(schema)
+        range_str = _fmt_range(schema)
+        desc = schema.get("desc", "(无描述)")
+        print(f"  {k:<{name_w}}  {type_str:<{type_w}}  "
+              f"{default_str:<{default_w}}  {range_str:<{range_w}}  {desc}")
+
+    validators = getattr(cls, "validators", []) or []
+    if validators:
+        print(f"\n约束:  策略定义了 {len(validators)} 个跨字段校验器 (validators); "
+              f"详见 evtrade/strategies/{name}.py 源码")
+
+    sample_keys = list(spec.keys())[:3]
+    sample = ";".join(f"{k}:{spec[k].get('default')}" for k in sample_keys)
+    print(f"\n用法:  --params \"{sample}...\"")
+    print(f"        也可省略 --params, 走 evtrade/strategies/_defaults/{name}.json 落盘默认")
+
+
+def help_main(argv=None):
+    """help 子命令入口: 复用 get_strategy_param_spec + available_strategies"""
+    ap = argparse.ArgumentParser(
+        prog="evtrade help",
+        description="查询策略参数 schema (--strategy 详细, 省略则列全部)")
+    args = build_help_parser(ap).parse_args(argv)
+
+    from .strategies import (
+        available_strategies, get_strategy_class, get_strategy_param_spec,
+    )
+
+    if not args.strategy:
+        _print_strategy_list(available_strategies())
+        return None
+
+    registered = set(available_strategies())
+    unknown = [s for s in args.strategy if s not in registered]
+    if unknown:
+        print(f"[错误] 未知策略 {unknown}; 已注册: {sorted(registered)}",
+              flush=True)
+        return 1
+    for i, name in enumerate(args.strategy):
+        if i > 0:
+            print()  # 策略间空一行
+        _print_strategy_detail(name, get_strategy_class(name),
+                               get_strategy_param_spec(name))
+    return None
+
+
 def build_root_parser():
     ap = argparse.ArgumentParser(
         prog="evtrade",
-        description="evtrade CLI: 策略回测 / 参数扫描 / 默认参数管理",
+        description="evtrade CLI: 策略回测 / 参数扫描 / 默认参数管理 / 策略参数查询",
     )
     sub = ap.add_subparsers(dest="cmd", help="子命令")
     builders = (
@@ -416,6 +543,8 @@ def build_root_parser():
          "参数并发扫描"),
         ("params", build_params_parser, (),
          "默认参数管理"),
+        ("help", build_help_parser, (),
+         "查询策略参数 schema (list / detail)"),
     )
     for name, builder, parents, help_text in builders:
         subp = sub.add_parser(name, help=f"{help_text} (见 {name} -h)",
@@ -427,7 +556,7 @@ def build_root_parser():
 def main(argv=None):
     import sys
     raw = sys.argv[1:] if argv is None else argv
-    if not raw or raw[0] not in ("backtest", "sweep", "params",
+    if not raw or raw[0] not in ("backtest", "sweep", "params", "help",
                                  "-h", "--help"):
         if raw and raw[0].startswith("-"):
             return build_root_parser().parse_args(raw)
@@ -437,7 +566,7 @@ def main(argv=None):
         return None
     args = build_root_parser().parse_args(raw)
     handlers = {"backtest": backtest_main, "sweep": sweep_main,
-                "params": params_main}
+                "params": params_main, "help": help_main}
     return handlers[args.cmd](raw[1:])
 
 
