@@ -17,28 +17,18 @@ dependencies = [
     "torch>=2.0",
 ]
 
-# 可选 extra: GPU 协作者显式启用 (RTX 5090 / Blackwell + sm_120 需 cu128+)
-# 装法: uv sync --extra gpu
-# 默认 uv sync 仍拉 pypi.org CPU wheel (与无 extra 行为一致)
-[project.optional-dependencies]
-gpu = ["torch==2.9.0+cu128"]
+# GPU wheel 不通过 pyproject extra 声明:
+#   `uv lock` 会把 base 依赖与所有 extras 一起锁进同一份 uv.lock; 若在此声明
+#   `gpu = ["torch==2.9.0+cu128"]`, torch 会被 base(`torch>=2.0`)与 gpu extra
+#   (`==2.9.0+cu128`)按包名统一塌缩成 cu128, 导致**默认 `uv sync`(CPU 机器)
+#   也被迫下载 GPU 版 torch wheel**。
+#   因此默认依赖只声明 `torch>=2.0`(pypi CPU wheel); GPU 协作者在 `uv sync`
+#   之后跑 `bash scripts/sync-torch-cu.sh`, 由脚本把 venv 内的 torch 覆盖到
+#   cu128 wheel(脚本自带探测/幂等/`EVT_TORCH_CU_TAG` 覆写, 与 lockfile 无关)。
+#   详见 spec `R: PyTorch 统一后端` + kbs/07 §7.1。
 
 [project.urls]
 # 暂无
-
-# torch 仅在启用 gpu extra 时从 cu128 索引解析; 否则走 pypi 默认 (CPU wheel)
-# (uv 0.4.7+ PEP 508 sources; list 顺序 = uv 尝试顺序)
-[tool.uv.sources]
-torch = [
-    { index = "pytorch-cu128", extra = "gpu" },
-]
-
-# 索引定义: cu128 wheel 来源 (pytorch 官方 cu128 分发)
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-# 不设 explicit=true: 该索引仅在 gpu extra 触发时被使用;
-# CPU 默认仍走 pypi (uv 内置隐式索引)
 
 # CLI 入口: uv run evtrade ... 等价于 uv run python -m evtrade
 [project.scripts]
@@ -71,13 +61,11 @@ markers = [
 ]
 
 # ============ uv 工具配置 ============
-# uv sync:                   装核心依赖 + CPU torch (默认)
-# uv sync --extra gpu:       装核心 + gpu extra (cu128 wheel, 需 RTX 50 / Blackwell 或同等)
+# uv sync:                   装核心依赖 + CPU torch (默认; pypi wheel)
 # uv run pytest:             跑测试 (默认 CPU; GPU 单测需 --gpu)
 # uv run python -m evtrade ...: 启动 CLI
-# GPU 协作者一次性:
-#   uv sync --extra gpu
-# 若 lockfile 重生后回到 CPU wheel, 跑: bash scripts/sync-torch-cu.sh
+# GPU 协作者 (RTX 50 / Blackwell 或同等): uv sync 之后跑
+#   bash scripts/sync-torch-cu.sh    # 把 venv 内 torch 覆盖到 cu128 wheel
 [tool.uv]
 managed = true
 

@@ -84,12 +84,14 @@
 - Engine.on_bars 是**桶 CLOSE 语义**：桶切换时 (`cur.ts != last_cur.ts`) 用上一桶 finalized OHLCV 驱动策略一次；
   vectorized 路径在桶级 finalized OHLCV 上计算指标。
 - `--device {cpu,gpu,auto}` 是唯一后端选择参数（torch CPU / torch CUDA 统一后端，`backends.get_xp` 路由；
-  入口统一 `backends.resolve_device` resolve，`--device gpu` 无 CUDA 抛 ValueError，提示改 `auto/cpu` + GPU 机器请 `uv sync --extra gpu`）。
+  入口统一 `backends.resolve_device` resolve，`--device gpu` 无 CUDA 抛 ValueError，提示改 `auto/cpu` + GPU 机器请 `uv sync` 后跑 `bash scripts/sync-torch-cu.sh`）。
   旧 `--engine {kernel,ref,vectorized}` 已删除。
-- **GPU wheel 安装约定**（2026-09-12 `add-gpu-extra-pyproject`，见 spec R `PyTorch 统一后端` + kbs/15 §7.1）：
-  `[project.optional-dependencies].gpu = ["torch==2.9.0+cu128"]` 是受支持的安装路径。
-  GPU 协作者 `uv sync --extra gpu` 锁住 cu128 wheel；`bash scripts/sync-torch-cu.sh` 是防御性
-  helper（lockfile 被 uv 重生回 CPU 时自动 reinstall）。CPU 协作者 `uv sync` 默认行为不变。
+- **GPU wheel 安装约定**（2026-09-13 `drop-gpu-extra-cpu-default`，见 spec R `PyTorch 统一后端` + kbs/07 §3.1）：
+  默认 `uv sync` 装 pypi **CPU wheel**；`pyproject.toml` **不**声明 `gpu` optional extra，
+  **不**为 torch 配 cu128 source/index（否则 `uv lock` 会把 base 与 extra 的 torch 统一塌缩成
+  cu128，害无 GPU 的 CPU 机器也被迫下载 GPU wheel）。GPU 协作者 `uv sync` 之后跑
+  `bash scripts/sync-torch-cu.sh` 把 venv 内 torch 覆盖到 cu128（与 lockfile 无关，
+  接受 `EVT_TORCH_CU_TAG` 覆写 cu tag）。`uv.lock` 不入库（`.gitignore` 忽略），各机器本地生成。
 
 ## 6. 验证命令
 

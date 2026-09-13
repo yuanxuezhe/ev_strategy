@@ -75,20 +75,32 @@ state, sig = strategy.step(state, bar, params)   # 引擎循环调用, 不感知
 `--device {cpu, gpu, auto}`(默认 `auto`)选择的是 `backends.get_xp` 的 torch 后端设备,
 为未来 tensor 热路径预留。
 
-- `--device gpu` 在 CUDA 不可用时**抛错**(提示改用 `auto`/`cpu`; GPU 机器请 `uv sync --extra gpu`
-  或 `bash scripts/sync-torch-cu.sh`)
+- `--device gpu` 在 CUDA 不可用时**抛错**(提示改用 `auto`/`cpu`; GPU 机器请 `uv sync` 后跑
+  `bash scripts/sync-torch-cu.sh` 把 torch 覆盖到 cu128 wheel)
 - `--device auto` 无 CUDA 时自动降级 cpu 并打 warning
 
-### 3.1 GPU wheel 安装约定(`add-gpu-extra-pyproject`)
+### 3.1 GPU wheel 安装约定(`drop-gpu-extra-cpu-default`)
 
-- `pyproject.toml` 声明 `[project.optional-dependencies].gpu = ["torch==2.9.0+cu128"]`,
-  由 `[tool.uv.sources]` + `[[tool.uv.index]]` 指向 `https://download.pytorch.org/whl/cu128`
-- GPU 协作者 `uv sync --extra gpu` 一次锁住(lockfile 已 commit)
-- CPU 协作者 `uv sync` 默认行为不变(仍拉 pypi CPU wheel; 若 lockfile 强制 cu128 则接受)
-- 防御性 helper: `bash scripts/sync-torch-cu.sh` 检测 torch 是 CPU wheel 时自动 reinstall 到
-  cu128(接受 `EVT_TORCH_CU_TAG` 环境变量覆写, 默认 `cu128`)
-- `uv lock --upgrade-package torch==2.9.0+cu128 --index-strategy unsafe-best-match`
-  用于升级 / 切换 cu tag 后重生 lockfile 并 commit
+**默认 `uv sync` 装 pypi CPU wheel; GPU wheel 由 `scripts/sync-torch-cu.sh` 在 sync 后覆盖,
+不走 pyproject extra。**
+
+- `pyproject.toml` 只声明核心依赖 `torch>=2.0`,**不**声明 `[project.optional-dependencies].gpu`,
+  **不**为 torch 配 `[tool.uv.sources]` / `[[tool.uv.index]]` 指向 cu128 索引
+- 为何不用 extra:`uv lock` 会把 base 依赖与所有 extras 一起锁进同一份 `uv.lock`。
+  若声明 `gpu = ["torch==2.9.0+cu128"]`, torch 会被 base(`torch>=2.0`)与 gpu extra
+  按包名**统一塌缩**成 cu128, 导致无 GPU 的 CPU 机器默认 `uv sync` 也被迫下载 GPU wheel。
+  一份共享 lock 无法表达"默认 CPU + 某 extra 才 cu128"
+- CPU 协作者:`uv sync` → pypi CPU wheel(torch `+cpu`, `cuda=None`), 零 nvidia 包
+- GPU 协作者(RTX 50 / Blackwell 或同等):
+  1. `uv sync`(装 CPU wheel)
+  2. `bash scripts/sync-torch-cu.sh` —— 脚本探测当前 torch 是 CPU wheel 时, 自动
+     `uv pip install --reinstall --index-strategy unsafe-best-match torch==2.9.0+cu128
+     --index-url https://download.pytorch.org/whl/cu128`, 把 venv 内 torch 覆盖到 cu128
+     (接受 `EVT_TORCH_CU_TAG` 环境变量覆写 cu tag, 默认 `cu128`; 已是目标版本时幂等跳过)
+- `uv.lock` **不入库**(`.gitignore` 忽略), 各机器本地生成; 因此 GPU 覆盖与 CPU 默认
+  互不影响(覆盖只改本地 venv, 不改 lockfile)
+- 旧 `uv lock --upgrade-package torch==2.9.0+cu128 ...` 重生 lockfile 的做法已废弃
+  (会让共享 lock 塌缩到 cu128, 即本约定要规避的问题)
 
 ### 3.2 bars 契约(桶级数组)
 
@@ -289,19 +301,21 @@ use_batched = (
 | 2026-09-10 | **`pytorch-unified-strategy`** | 后端从 cupy/numpy 双端统一为 PyTorch 单端; `pyproject.toml` 删 `cupy`/`numba`, 声明 `torch>=2.0`; GPU 环境探测改 `torch.cuda`; 新增 `evtrade/backends.py` 后端选择器 |
 | 2026-09-10 | `strategy-step-only` | 唯一抽象方法收敛到 `step(state, bar, params) -> (state, sig)`; 状态由 engine 持有(`@dataclass`) |
 | 2026-09-11 | `gpu-batched-sweep` | `VectorizedStrategy.batched_step` opt-in hook + `indicators.torch_ema` 落地; sweep 在大网格 GPU 自动路由 batched 路径 |
-| 2026-09-12 | `add-gpu-extra-pyproject` | pyproject 加 `[project.optional-dependencies].gpu = ["torch==2.9.0+cu128"]` + sync-torch-cu.sh helper |
+| 2026-09-12 | `add-gpu-extra-pyproject` | pyproject 加 `[project.optional-dependencies].gpu = ["torch==2.9.0+cu128"]` + sync-torch-cu.sh helper (后被 `drop-gpu-extra-cpu-default` 取代) |
+| 2026-09-13 | `drop-gpu-extra-cpu-default` | 删 pyproject `gpu` extra + torch cu128 source/index(避免 `uv lock` 把默认 torch 塌缩成 cu128, 害 CPU 机器下载 GPU wheel); GPU 改由 `uv sync` + `bash scripts/sync-torch-cu.sh` 覆盖 |
 | 2026-09-13 | `drop-engine-finance` | framework 删 execution/metrics/replay/permutation/config; 业务概念全部下放策略 step; framework 只驱动 step |
 | 2026-09-13 | `drop-scale-residue` | 收尾 SimulatedExecutor / `_TradeStateTracker` 等 scale state machine 残留 |
 
 ## 9. 验证清单
 
 ```bash
-# 安装 torch CPU (或 CUDA 版本)
-pip install torch
-# 或 GPU: uv sync --extra gpu
+# 安装: 默认 CPU wheel (pypi)
+uv sync
+# GPU 协作者 (RTX 50 / Blackwell 或同等): sync 之后覆盖到 cu128 wheel
+bash scripts/sync-torch-cu.sh
 
 # 跑全部测试
-uv run pytest -q          # 166 passed, 1 skipped (CUDA 不可用时)
+uv run pytest -q          # 169 passed, 1 skipped (CUDA 不可用时)
 
 # CLI 跑通
 python -m evtrade backtest --strategy channel_deviation --synthetic-days 30 --device cpu

@@ -99,8 +99,9 @@ CPU/GPU 双端统一由 PyTorch 后端提供(`backends.get_xp`)。
 ```bash
 # 安装 (torch 统一 CPU/GPU 后端; 无 numba)
 pip install pymysql sqlalchemy pandas numpy torch
-# GPU 机器一次性:
-uv sync --extra gpu              # 锁住 torch==2.9.0+cu128
+# GPU 机器 (RTX 50 / Blackwell 需 cu128): 默认装 CPU wheel 后覆盖到 cu128
+uv sync
+bash scripts/sync-torch-cu.sh    # 覆盖到 torch==2.9.0+cu128 (幂等)
 
 # 单次回测 (CPU)
 python -m evtrade backtest --strategy channel_deviation --device cpu \

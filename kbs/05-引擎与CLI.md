@@ -90,9 +90,10 @@ python -m evtrade backtest --strategy channel_deviation --device cpu \
 python -m evtrade backtest --strategy channel_deviation --device auto \
     --period 5m --start 20250101 --end 20260903
 
-# GPU 机器一次性安装 (RTX 50 / Blackwell 需 cu128)
-uv sync --extra gpu              # 锁住 torch==2.9.0+cu128
-bash scripts/sync-torch-cu.sh    # 防御性 helper (lockfile 被 uv 重生时恢复)
+# GPU 机器安装 (RTX 50 / Blackwell 需 cu128): 默认 uv sync 装 CPU wheel,
+# 之后用脚本把 venv 内 torch 覆盖到 cu128 (不走 pyproject extra)
+uv sync
+bash scripts/sync-torch-cu.sh    # 覆盖到 torch==2.9.0+cu128 (幂等)
 
 # 小段快速验证参数 (含资金/撮合参数, 全部走 --params)
 python -m evtrade backtest --strategy channel_deviation \

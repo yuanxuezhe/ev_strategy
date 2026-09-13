@@ -205,23 +205,22 @@ framework 在 `__init__` / `_resolve_params` 阶段做校验（fill default + ty
 （默认 `auto`）。设备解析统一由 `evtrade.backends.resolve_device(requested, gpu_available)`
 在三个子命令入口执行：`"gpu"` 且 CUDA 不可用 MUST 抛 `ValueError`（带可操作提示，
 措辞包含"当前 torch 构建无 CUDA 支持 / 改用 --device auto 或 --device cpu / GPU 机器
-请 `uv sync --extra gpu`"）；`"auto"` 优先 gpu，不可用时降级 cpu 并打 warning（不抛）。
-`"cpu"` 直接返回。**`--device gpu` 报错的根本原因是 torch 包未安装 CUDA wheel；GPU
-协作者 MUST 先 `uv sync --extra gpu`（或跑 `scripts/sync-torch-cu.sh`）再使用
-`--device gpu`。** 引擎层（`run_vectorized` 等）MUST NOT 携带 device 参数——
-后端为 torch 统一，实际计算路径设备无关（numpy 桶预计算 + 标量 step 循环）。旧
-`--engine {kernel,ref,vectorized}` flag MUST NOT 存在（2026-09-10 删除，传入报 argparse
-unknown option）。MUST NOT 存在"被接受但从不读取"的 CLI flag（`--no-sleep` /
-`--step-days` / `--show-bars` / `--bars-out` 已删除）。
+请 `uv sync` 后跑 `bash scripts/sync-torch-cu.sh`"）；`"auto"` 优先 gpu，不可用时降级
+cpu 并打 warning（不抛）。`"cpu"` 直接返回。**`--device gpu` 报错的根本原因是 torch
+包未安装 CUDA wheel；GPU 协作者 MUST 先 `uv sync` 再 `bash scripts/sync-torch-cu.sh`
+把 torch 覆盖到 cu128 wheel 后再使用 `--device gpu`。** 引擎层（`run_vectorized` 等）
+MUST NOT 携带 device 参数——后端为 torch 统一，实际计算路径设备无关（numpy 桶预计算
++ 标量 step 循环）。旧 `--engine {kernel,ref,vectorized}` flag MUST NOT 存在（2026-09-10
+删除，传入报 argparse unknown option）。MUST NOT 存在"被接受但从不读取"的 CLI flag
+（`--no-sleep` / `--step-days` / `--show-bars` / `--bars-out` 已删除）。
 
 #### Scenario: --device gpu 无 CUDA 报错
 - **WHEN** 未安装 GPU 版 torch 的机器执行 `python -m evtrade backtest --device gpu ...`
 - **THEN** MUST 抛 `ValueError`，文案明确：当前 torch 构建无 CUDA 支持；提示改用
-  `--device auto` / `--device cpu`；GPU 机器请先 `uv sync --extra gpu` 或
-  `bash scripts/sync-torch-cu.sh`
+  `--device auto` / `--device cpu`；GPU 机器请先 `uv sync` 后 `bash scripts/sync-torch-cu.sh`
 
 #### Scenario: --device gpu 安装正确时跑通
-- **WHEN** 已 `uv sync --extra gpu`（或跑过 sync helper）的机器执行
+- **WHEN** 已 `uv sync` + `bash scripts/sync-torch-cu.sh`（torch 为 cu128）的机器执行
   `python -m evtrade backtest --device gpu ...`
 - **THEN** MUST 跑通；`torch.cuda.is_available()` 为 True；与 `--device cpu` 路径
   产出 bitwise 一致
@@ -242,10 +241,14 @@ unknown option）。MUST NOT 存在"被接受但从不读取"的 CLI flag（`--n
 ### Requirement: PyTorch 统一后端
 
 `evtrade` MUST 使用 PyTorch 作为唯一 array 后端能力来源（`pyproject.toml` 声明
-`torch>=2.0`）；CPU 与 GPU 由 **同一 torch 包**的不同 wheel 提供。GPU wheel 的安装
-MUST 走 **受支持的 optional extra**：`[project.optional-dependencies]` 中含 `gpu` extra，
-GPU 协作者通过 `uv sync --extra gpu` 显式启用；未启用 `gpu` extra 时 MUST 拉 pypi.org
-的 CPU-only wheel（与旧行为一致）。`evtrade.backends.gpu_available()` MUST 委托
+`torch>=2.0`）；CPU 与 GPU 由 **同一 torch 包**的不同 wheel 提供。**默认 `uv sync`
+MUST 拉 pypi.org 的 CPU-only wheel**；`pyproject.toml` MUST NOT 声明 GPU optional
+extra（`gpu = ["torch==2.9.0+cu128"]`），MUST NOT 为 torch 配置指向 cu128 索引的
+`[tool.uv.sources]` / `[[tool.uv.index]]` —— 因为 `uv lock` 会把 base 依赖与所有
+extras 一起锁进同一份 `uv.lock`，声明 `gpu` extra 会把 torch 按包名统一塌缩成
+cu128，导致无 GPU 的 CPU 机器也被迫下载 GPU wheel。GPU 协作者的 cu128 wheel 安装
+MUST 走 `scripts/sync-torch-cu.sh`（在 `uv sync` 之后把 venv 内 torch 覆盖到 cu128，
+与 lockfile 无关）。`evtrade.backends.gpu_available()` MUST 委托
 `torch.cuda.is_available()`。当前热路径（桶预计算 + 策略 step）为设备无关 numpy/标量
 实现，`backends.get_xp` 仅为需要 tensor 的扩展代码提供 `torch.device` 路由。
 `evtrade/core/capability.py` MUST NOT 存在（能力探测收编至 `backends`）；
@@ -258,20 +261,15 @@ Hinnant 整数日历）。`gpu_info` 已删除。
 - **WHEN** 用户执行 `grep -r "import cupy" evtrade/`
 - **THEN** MUST 0 命中（cupy 已完全下线）
 
-#### Scenario: gpu 是受支持的 optional extra
-- **WHEN** 用户执行 `grep -n "optional-dependencies" pyproject.toml`
-- **THEN** MUST 命中 **恰好一个** `[project.optional-dependencies]` 段（含 `gpu`
-  extra）；`gpu` extra 的依赖列表 MUST 含 `torch==2.9.0+cu128`（Blackwell sm_120
-  支持的最低 cu128 系列）；不含 `cupy` / `numba`
+#### Scenario: 无 GPU optional extra（避免污染共享 lock）
+- **WHEN** 用户执行 `grep -n "optional-dependencies\|cu128" pyproject.toml`
+- **THEN** 活跃配置（非注释行）MUST NOT 含 `[project.optional-dependencies].gpu`
+  段；MUST NOT 出现 `torch==2.9.0+cu128`；MUST NOT 为 torch 配 cu128 索引 source
+  （`[tool.uv.sources]` / `[[tool.uv.index]]` 不引用 cu128）；`torch>=2.0` MUST 保留
+  为核心依赖（pypi CPU wheel 默认）；不含 `cupy` / `numba`
 
-#### Scenario: gpu 不再是独立安装路径
-- **WHEN** 用户执行 `grep -n "optional-dependencies" pyproject.toml`
-- **THEN** MUST 命中 **恰好一个** `[project.optional-dependencies]` 段；MUST NOT
-  存在第三个 GPU 安装 extra（`cudnn` / `rocm` / `xpu` 等）；`--device` 是运行时参数
-  （语义保留），不再是安装路径
-
-#### Scenario: sync-torch-cu helper 在 uv sync 后恢复 cu128 wheel
-- **WHEN** GPU 协作者首次 `uv sync`（CPU wheel 装上）后跑 `bash scripts/sync-torch-cu.sh`
+#### Scenario: sync-torch-cu helper 是 GPU wheel 唯一安装路径
+- **WHEN** GPU 协作者 `uv sync`（CPU wheel 装上）后跑 `bash scripts/sync-torch-cu.sh`
 - **THEN** 脚本 MUST 检测当前 torch 是 CPU 版，自动 `uv pip install --reinstall
   --index-strategy unsafe-best-match torch==2.9.0+cu128 --index-url
   https://download.pytorch.org/whl/cu128`；退出码 0；之后 `uv run` MUST 不再回退到
@@ -413,7 +411,7 @@ sweep 路由规则（`core/sweep.sweep()`）：
 
 ### Requirement: Filtered mean-reversion strategy (`filtered_mr`)
 
-`FilteredMRStrategy` 是 `VectorizedStrategy` 子类，实现 4 重过滤以避免单边暴涨暴跌中均值回归"接飞刀"：
+`FilteredMRStrategy` 是 `VectorizedStrategy` 子类，MUST 实现 4 重过滤以避免单边暴涨暴跌中均值回归"接飞刀"：
 
 1. **大周期顺势过滤**：用 `--higher-period`（如 1h）桶的 `EMA(higher_ema_period)` 判定方向；
    大周期多头时关闭上轨做空信号，大周期空头时关闭下轨做多信号。
@@ -496,7 +494,7 @@ framework 的所有接口 MUST NOT 包含资金 / 持仓 / 撮合 / PnL / 收益
 
 ### Requirement: Engine drives step only
 
-framework 唯一职责 = 桶预计算 + `step` 驱动循环 + 累计 sig/state。
+framework 唯一职责 MUST 限于桶预计算 + `step` 驱动循环 + 累计 sig/state。
 
 - `VectorizedEngine.run_vectorized` MUST 仅做：
   1. 桶聚合（numpy 向量化；调用 `core/tsbucket.py::precompute_ts_mark`）
@@ -532,7 +530,7 @@ params 承担）。每组参数组合 MUST 调一次 `run_vectorized` 跑完桶�
 
 ### Requirement: CLI is step-driver surface
 
-CLI = `python -m evtrade {backtest, sweep, params}` 三个子命令。
+CLI MUST 仅暴露 `python -m evtrade {backtest, sweep, params}` 三个子命令（无 `replay` 等其它子命令）。
 
 - `backtest`：仅 `--strategy / --params / --period / --code / --start / --end / --synthetic-days /
   --device / --verbose / --signals-out`。**删除** `--init-cash / --init-position / --buy-pct /
@@ -647,7 +645,7 @@ framework 行为（`Engine._process_bucket` / `run_vectorized` 的 `info` 透传
 | Indicators are private to strategies | kbs/05, kbs/11 §5, kbs/12, kbs/14 §2 |
 | metrics.summary covers full field shape | kbs/13, kbs/09 |
 | Code hygiene (no unused imports, internal helpers underscored) | kbs/01 (源码地图: 本次清理 + 改名) |
-| PyTorch 统一后端 (`gpu` extra 是受支持路径) | kbs/15 §7.1, kbs/10, 使用说明 §0 |
+| PyTorch 统一后端 (默认 CPU wheel; GPU 走 sync-torch-cu.sh, 非 extra) | kbs/07 §7.1, kbs/10, 使用说明 §0 |
 | Market data DB connection has a sane default | kbs/08 §1.3 |
 | Strategy signal line shows trigger bar context | kbs/06 (策略信号行打印段) |
 | 用户文档单一入口 (无 docs/ 目录) | kbs/README, kbs/使用说明 |

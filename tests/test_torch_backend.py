@@ -7,7 +7,7 @@
   - cupy 已下线 (import cupy 不应出现在 evtrade/ 代码)
   - 旧 device="gpu" 字符串仍接受 (转 torch.device("cuda"))
   - to_tensor / to_host 工具函数
-  - --device gpu ValueError 文案含 GPU 安装引导 (uv sync --extra gpu / sync-torch-cu.sh)
+  - --device gpu ValueError 文案含 GPU 安装引导 (uv sync + bash scripts/sync-torch-cu.sh)
 """
 from __future__ import annotations
 
@@ -113,18 +113,21 @@ def test_resolve_device_gpu_request_without_gpu_raises():
 
 
 def test_resolve_device_gpu_error_message_includes_install_hints():
-    """2026-09-12 add-gpu-extra-pyproject: --device gpu 报错的文案必须含 GPU 安装引导
+    """2026-09-13 drop-gpu-extra-cpu-default: --device gpu 报错的文案必须含 GPU 安装引导
 
     当 torch 是 CPU wheel 时, ValueError 文案需提示:
       - 当前 torch 构建无 CUDA 支持 (含 torch.__version__ / cuda 字段)
       - 改用 --device auto 或 --device cpu
-      - GPU 机器请 `uv sync --extra gpu` 或 `bash scripts/sync-torch-cu.sh`
+      - GPU 机器请 `uv sync` 后 `bash scripts/sync-torch-cu.sh` 覆盖到 cu128
+        (不再提示 `--extra gpu`, 该 extra 已下线)
     """
     with pytest.raises(ValueError) as ei:
         resolve_device("gpu", gpu_ok=False)
     msg = str(ei.value)
-    assert "uv sync --extra gpu" in msg or "sync-torch-cu.sh" in msg, (
-        f"ValueError 文案必须含 GPU 安装引导, 实际: {msg!r}")
+    assert "sync-torch-cu.sh" in msg, (
+        f"ValueError 文案必须含 GPU 安装引导 (sync-torch-cu.sh), 实际: {msg!r}")
+    assert "--extra gpu" not in msg, (
+        "gpu extra 已下线, 文案不应再提示 --extra gpu")
     assert "auto" in msg and "cpu" in msg, "文案需提示改用 --device auto/cpu"
 
 

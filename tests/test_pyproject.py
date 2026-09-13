@@ -6,8 +6,10 @@
   - dev-dependencies 走 [dependency-groups] dev (PEP 735, 替代已废弃的
     tool.uv.dev-dependencies)
   - 核心依赖: numpy/pandas/sqlalchemy/pymysql/torch (2026-09-09 已删 numba)
-  - GPU extra: [project.optional-dependencies].gpu 锁 torch==2.9.0+cu128
-    (2026-09-12 add-gpu-extra-pyproject: 替代旧的"无 GPU extra"约束)
+  - GPU 走 scripts/sync-torch-cu.sh (非 pyproject extra):
+    pyproject MUST NOT 声明 gpu optional extra, MUST NOT 为 torch 配 cu128
+    source/index —— 否则 `uv lock` 会把默认 `uv sync` 的 torch 也塌缩成 cu128
+    (2026-09-13 drop-gpu-extra-cpu-default: 替代 add-gpu-extra-pyproject)
   - 排除目录 (tests/docs/...) 不被打包
   - 若环境有 uv: uv lock --check 通过
 """
@@ -25,6 +27,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def _read_pyproject() -> str:
     return (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+
+def _active_pyproject() -> str:
+    """只保留非注释行的 pyproject 文本。
+
+    pyproject 里的注释会提及 `cu128` / `torch==2.9.0+cu128` 以说明"为何不再
+    用 extra 装 GPU", 故校验"活跃配置"时须剔除纯注释行, 否则会误伤文档注释。
+    (TOML 本文件无行内 # 注释, 逐行去 `#` 前缀行即可。)
+    """
+    lines = _read_pyproject().splitlines()
+    return "\n".join(l for l in lines if l.strip() and not l.strip().startswith("#"))
 
 
 # ---------- 基础字段 ----------
@@ -69,48 +82,49 @@ def test_numba_dependency_removed():
     assert '"numba>=' not in text, "numba 已下线, 不应再列为核心依赖"
 
 
-def test_gpu_optional_extra_present():
-    """2026-09-12 add-gpu-extra-pyproject: `[project.optional-dependencies].gpu`
-    锁 torch==2.9.0+cu128, 是受支持的 GPU 安装路径。
+def test_no_gpu_optional_extra():
+    """2026-09-13 drop-gpu-extra-cpu-default: pyproject MUST NOT 声明 gpu extra。
 
-    旧约束 "无独立 GPU 安装路径" 由本约束替代 — torch 主体在核心依赖,
-    CPU/GPU 仍由同一 torch 包的不同 wheel 提供, 但走受控 extra。
+    原因: `uv lock` 会把 base(`torch>=2.0`)与所有 extras 一起锁进同一份 lock;
+    若声明 `gpu = ["torch==2.9.0+cu128"]`, torch 会被统一塌缩成 cu128, 导致
+    默认 `uv sync` (CPU 机器) 也被迫下载 GPU wheel。GPU 改走
+    scripts/sync-torch-cu.sh (与 lockfile 无关)。
     """
-    text = _read_pyproject()
-    assert "[project.optional-dependencies]" in text, (
-        "[project.optional-dependencies] 必须存在 (gpu extra 是受支持路径)")
-    assert 'gpu = [' in text, "gpu extra 必须存在"
-    assert "torch==2.9.0+cu128" in text, (
-        "gpu extra 必须锁 torch==2.9.0+cu128 (Blackwell sm_120 最低要求)")
-
-
-def test_no_other_gpu_extras():
-    """spec: 仅 `gpu` 一个 GPU 安装 extra; cudnn/rocm/xpu 等不出现"""
-    text = _read_pyproject()
-    # 检查 [project.optional-dependencies] 段中只有 gpu
+    active = _active_pyproject()
+    # 整个 [project.optional-dependencies] 段要么不存在, 要么不含 gpu extra
     import re
-    m = re.search(r"\[project\.optional-dependencies\](.*?)(?=\n\[|\Z)", text, re.S)
-    assert m, "找不到 [project.optional-dependencies] 段"
-    block = m.group(1)
-    # 提取所有 `xxx = [` 形式的 key
-    extras = re.findall(r"^(\w+)\s*=\s*\[", block, re.M)
-    assert "gpu" in extras, "gpu extra 必须存在"
-    assert len(extras) == 1, f"不应有第三个 GPU extra, 发现: {extras}"
+    m = re.search(r"\[project\.optional-dependencies\](.*?)(?=\n\[|\Z)", active, re.S)
+    assert m is None or "gpu" not in m.group(1), (
+        "gpu optional extra 已下线 (会污染共享 lock 的 torch 解析); GPU 走 sync-torch-cu.sh")
+    assert "torch==2.9.0+cu128" not in active, (
+        "torch==2.9.0+cu128 不应再作为活跃配置出现 (GPU 由 sync-torch-cu.sh 安装)")
 
 
-def test_uv_sources_for_torch():
-    """spec: torch 在启用 gpu extra 时从 pytorch-cu128 索引解析"""
-    text = _read_pyproject()
-    assert "[tool.uv.sources]" in text, "torch 必须在 [tool.uv.sources] 中指定索引"
-    assert "pytorch-cu128" in text, "torch 必须指向 pytorch-cu128 索引"
-    assert "https://download.pytorch.org/whl/cu128" in text, (
-        "cu128 索引 URL 必须正确")
+def test_no_cupynum_gpu_extras():
+    """spec: 不得出现 cupy/numba 依赖, 也不得出现其它 GPU extra (cudnn/rocm/xpu)"""
+    active = _active_pyproject()
+    assert "cupy" not in active, "cupy 已下线, 由 torch 统一接管 CPU/GPU"
+    assert '"numba>=' not in active, "numba 已下线, 不应再列为核心依赖"
+    import re
+    m = re.search(r"\[project\.optional-dependencies\](.*?)(?=\n\[|\Z)", active, re.S)
+    if m:
+        extras = re.findall(r"^(\w+)\s*=\s*\[", m.group(1), re.M)
+        assert not (set(extras) & {"cudnn", "rocm", "xpu", "gpu"}), (
+            f"不应存在 GPU 安装 extra, 发现: {extras}")
 
 
-def test_cupy_dependency_removed():
-    """2026-09-10 pytorch-unified-strategy: cupy 已下线"""
-    text = _read_pyproject()
-    assert "cupy" not in text, "cupy 已下线, 由 torch 统一接管 CPU/GPU"
+def test_no_torch_cu128_source():
+    """spec: torch MUST 从 pypi 默认解析 (CPU wheel); 不得配 cu128 source/index。
+
+    若为 torch 配 `[tool.uv.sources]` 指向 cu128 索引, `uv lock` 会把默认 torch
+    也解析到 cu128 (即便加 explicit 索引也无法阻止 base 与 extra 的统一)。
+    cu128 由 scripts/sync-torch-cu.sh 在 `uv sync` 后单独安装。
+    """
+    active = _active_pyproject()
+    assert "cu128" not in active, (
+        "pyproject 活跃配置不应引用 cu128 索引 (GPU wheel 由 sync-torch-cu.sh 安装)")
+    # torch 仍是核心依赖, 走 pypi 默认
+    assert '"torch>=' in active, "torch>=2.0 必须保留为核心依赖 (pypi CPU wheel)"
 
 
 # ---------- dev 依赖用 [dependency-groups] (PEP 735, uv 推荐) ----------
