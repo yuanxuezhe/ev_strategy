@@ -45,7 +45,7 @@ from .strategies.ma_crossover import MACrossoverStrategy
 from .strategies.filtered_mr import FilteredMRStrategy
 
 # ---- backends / vectorized ----
-from .backends import get_xp, gpu_available, resolve_device
+from .backends import get_xp, gpu_available, resolve_device, to_tensor, to_host
 from .core.vectorized_engine import run_vectorized
 
 # ---- indicators (仅 EMA: step 增量版 + numpy 批量参考版 + torch 批量版) ----
@@ -73,6 +73,7 @@ __all__ = [
     "Engine",
     "run_vectorized", "run_one_vectorized",
     "get_xp", "gpu_available", "resolve_device",
+    "to_tensor", "to_host",
     "sweep", "parse_grid", "GRID_KEYS",
     "DB_URL", "TABLE",
 ]
