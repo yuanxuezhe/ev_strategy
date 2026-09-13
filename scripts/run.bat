@@ -27,9 +27,9 @@ echo  [2] 单参数回测 - 显式传 --params (覆盖默认)
 echo  [3] 单参数回测 - ma_crossover 双均线策略
 echo  [4] 网格参数扫描 - 单窗, low1/tf1 网格, 输出 CSV
 echo  [5] 网格参数扫描 - 滚动 WFO (--splits) + 自动落盘最优参数
-echo  [6] 网格参数扫描 - 含手续费/置换检验 (mc)
+echo  [6] 网格参数扫描 - 仅产 SIG + final_state (无手续费/置换检验参数)
 echo  [7] GPU 回测 (无 CUDA 自动降级, 需 --device auto)
-echo  [8] 回放对账 (需 bar 日志 CSV)
+echo  [8] 信号轨迹导出 (--signals-out CSV, 桶级对齐)
 echo  [9] 无库体验 - 合成数据回测
 echo  [0] 退出
 echo ==========================================
@@ -77,13 +77,12 @@ rem 网格参数扫描: 滚动 WFO 3 窗 + 自动落盘最优参数到 _defaults
 goto :end
 
 :cmd6
-rem 网格参数扫描: 手续费 5bp + 前 5 名各做 300 次置换检验
+rem 网格参数扫描: 仅产 SIG + final_state (无手续费/置换检验参数, framework 不再做)
 %PYTHON% -m evtrade sweep --strategy channel_deviation --device cpu ^
     --period 5m --start %START% --end %END% ^
     --grid "low1=1.0,1.5,2.0" ^
     --grid "tf1=21,50" ^
-    --fee-bp 5 --min-trades 30 --mc 300 --mc-top 5 ^
-    --out sweep_results.csv
+    --out sweep_results.csv --top 10
 goto :end
 
 :cmd7
@@ -93,9 +92,10 @@ rem GPU 回测: 无 CUDA 时 auto 自动降级 cpu
 goto :end
 
 :cmd8
-rem 回放对账: 需先有 bar 日志 (evtrade.replay.write_bars_log 产生)
-%PYTHON% -m evtrade replay --log /tmp/demo.log --strategy channel_deviation ^
-    --device cpu --against-ref
+rem 信号轨迹导出: backtest --signals-out 写 (ts, sig) CSV (桶级对齐; framework 不再有 replay 子命令)
+%PYTHON% -m evtrade backtest --strategy channel_deviation --device cpu ^
+    --period 5m --start %START% --end %END% ^
+    --signals-out signals.csv --verbose
 goto :end
 
 :cmd9
