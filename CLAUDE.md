@@ -26,28 +26,22 @@
 | 角色 | 路径 | 说明 |
 |---|---|---|
 | 行为权威 | `openspec/specs/evtrade-architecture/spec.md` | 20+ 条 Requirement + Scenario；通过 `openspec validate --specs` 校验 |
-| 中文详述 | `kbs/*.md`（15 份 + README + 使用说明） | 与 spec 一一映射；改一处必改另一处 |
+| 中文详述 | `kbs/*.md`（8 份 + README + archive/DSL-HISTORY） | 与 spec 一一映射；改一处必改另一处 |
 | 变更提案 | `openspec/changes/<name>/` | proposal.md + spec delta + design.md + tasks.md |
 
-## 2. KB 索引（15 份 + README + 使用说明）
+## 2. KB 索引（8 份 + README + archive）
 
 | 文档 | 内容 |
 |---|---|
-| `kbs/01-项目总览.md` | 项目定位、核心特性、技术栈、快速上手 |
-| `kbs/02-系统架构.md` | 分层架构、数据流、framework 仅驱动 step |
-| `kbs/03-核心数据结构.md` | Bar、周期桶 dict、`resolve_period_seconds` 周期秒数、stime 格式 |
-| `kbs/04-周期合并机制.md` | `compute_bucket_general` 桶算法、桶生命周期、warmup |
-| `kbs/05-指标计算-EMA通道.md` | EMA / 通道轨增量版（`ema_step`/`ema_channel_step`）+ numpy 批量参考（`ema`/`ema_channel`）+ torch 批量版（`torch_ema`）|
-| `kbs/06-交易策略详解.md` | 通道偏离回撤策略、锁存、单桶单操作、策略 hook |
-| `kbs/07-账户与执行器.md` | **策略自负责资金/持仓/撮合/记账**（2026-09-13 framework 不再做）|
-| `kbs/08-行情源Feed.md` | 行情数据加载（`core/data.py` `load_bars`/`synthetic_bars`）、bar 流契约、预热窗口 |
-| `kbs/09-引擎Engine与主流程.md` | Engine 装配、`on_bars` 桶 CLOSE 语义、framework 仅驱动 step |
-| `kbs/10-配置参数与运行指南.md` | CLI 参数全表（含 `--device {cpu,gpu,auto}`），典型命令，输出解读 |
-| `kbs/11-扩展指南.md` | 新增 bar 流/策略/周期 + VectorizedStrategy 模板 |
-| `kbs/12-重构与性能内核.md` | evtrade 包结构、vectorized 引擎、CPU/GPU 统一路径、重构历史 |
-| `kbs/13-绩效评估与鲁棒选参框架.md` | WFO、邻域衰减 S、score（基于策略 final_state primary_score）、置换检验 |
-| `kbs/14-策略DSL与三端转译.md` | 旧 DSL→三端转译（numba/CUDA/state_spec）**已下线**，归档说明 |
-| `kbs/15-PyTorch统一策略.md` | PyTorch 统一后端（`backends.get_xp`）、CPU/GPU 双端统一、batched_step 仅产 sig |
+| `kbs/01-总览.md` | 项目定位、分层架构、核心特性、技术栈、包结构、文档地图 |
+| `kbs/02-数据与桶.md` | `Bar` / 桶 dict / `stime` 14 位 / `compute_bucket_general` / `BarAggregator` / 任意 m/h/d |
+| `kbs/03-指标-EMA.md` | EMA 三形态（`ema_step` / `ema` / `torch_ema`）+ 双 rail `ema_channel_step` + dataclass state |
+| `kbs/04-策略.md` | 三策略（`channel_deviation` / `ma_crossover` / `filtered_mr`）+ 统一契约 + 策略自管执行 |
+| `kbs/05-引擎与CLI.md` | Engine / `run_vectorized` 装配 + 桶 CLOSE 语义 + CLI 全表 + 数据加载 + 输出解读 + FAQ |
+| `kbs/06-扩展指南.md` | 新增 bar 流 / 策略 / 周期 / 指标 + `VectorizedStrategy` 模板 + 实盘接入 |
+| `kbs/07-PyTorch与性能.md` | PyTorch 统一后端 + CPU/GPU 透明路由 + 性能内核 + `batched_step` opt-in hook |
+| `kbs/08-选参与鲁棒性.md` | WFO + 邻域衰减 S + 复合 score + 帕累托前沿 + 落盘默认参数 |
+| `kbs/archive/DSL-HISTORY.md` | 旧 DSL → 三端转译（numba/CUDA/`state_spec`）**已下线** 归档 |
 
 ## 3. 源码地图（核心要点）
 
