@@ -25,6 +25,7 @@
 from .vectorized_base import (
     VectorizedStrategy, register_strategy, get_strategy,
     get_strategy_class, get_strategy_param_spec, available_strategies,
+    _STRATEGIES,
 )
 from . import channel_deviation  # noqa: F401  注册 channel_deviation
 from . import ma_crossover       # noqa: F401  注册 ma_crossover
@@ -41,6 +42,6 @@ __all__ = [
     "VectorizedStrategy",
     "register_strategy", "get_strategy", "get_strategy_class",
     "get_strategy_param_spec", "available_strategies",
-    "_STRATEGY_SUMMARIES",
+    "_STRATEGIES", "_STRATEGY_SUMMARIES",
 ]
 

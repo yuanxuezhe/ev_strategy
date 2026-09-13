@@ -411,12 +411,14 @@ _FALLBACK_SUMMARIES: dict[str, str] = {}
 
 
 def build_help_parser(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """help 子命令 parser: --strategy [STRATEGY ...] (nargs='*' 允许空)
+    """help 子命令 parser: --strategy NAME (action='append' 允许多个)
 
-    空 --strategy = 列表模式 (列所有策略); 非空 = 详细参数表
+    --strategy 省略 = 列表模式 (列所有策略);
+    --strategy X = 详细参数表 X;
+    --strategy X --strategy Y = 两段表。
     """
-    ap.add_argument("--strategy", nargs="*", default=[],
-                    help="策略 key (可多个); 省略时列出所有已注册策略")
+    ap.add_argument("--strategy", action="append", default=None,
+                    help="策略 key (可多次指定, 一次输出一段; 省略则列出所有已注册策略)")
     return ap
 
 
@@ -511,6 +513,8 @@ def help_main(argv=None):
     from .strategies import (
         available_strategies, get_strategy_class, get_strategy_param_spec,
     )
+
+    args.strategy = args.strategy or []
 
     if not args.strategy:
         _print_strategy_list(available_strategies())
