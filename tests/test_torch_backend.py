@@ -1,11 +1,13 @@
-"""PyTorch 后端基础 (pytorch-unified-strategy, 2026-09-10)
+"""PyTorch 后端 + 设备解析 (pytorch-unified-strategy + add-gpu-extra-pyproject)
 
 锁定:
   - evtrade.backends.get_xp(device) -> torch.device
   - evtrade.backends.gpu_available -> torch.cuda.is_available
-  - cupy 已下线 (import cupy 抛 ImportError)
+  - evtrade.backends.resolve_device(requested, gpu_ok) -> str (cpu/gpu)
+  - cupy 已下线 (import cupy 不应出现在 evtrade/ 代码)
   - 旧 device="gpu" 字符串仍接受 (转 torch.device("cuda"))
   - to_tensor / to_host 工具函数
+  - --device gpu ValueError 文案含 GPU 安装引导 (uv sync --extra gpu / sync-torch-cu.sh)
 """
 from __future__ import annotations
 
@@ -15,7 +17,10 @@ import pytest
 import torch
 
 import evtrade.backends as backends
+from evtrade.backends import gpu_available, resolve_device
 
+
+# ============ get_xp / torch.device ============
 
 def test_get_xp_returns_torch_device():
     """get_xp 必须返回 torch.device (不是 numpy/cupy 模块)"""
@@ -48,7 +53,6 @@ def test_cupy_import_fails_or_unused():
 
     注: cupy 可能作为可选依赖存在于环境, 但项目代码不应 import。
     """
-    # 项目代码不应有 "import cupy" 出现在 evtrade/ 任何 .py
     import subprocess
     r = subprocess.run(
         ["grep", "-r", "import cupy", "evtrade/"],
@@ -85,3 +89,44 @@ def test_to_host_returns_cpu_tensor():
     assert isinstance(h, torch.Tensor)
     assert h.device.type == "cpu"
 
+
+# ============ resolve_device (ex test_device_resolution.py) ============
+
+def test_resolve_device_cpu_request_returns_cpu():
+    assert resolve_device("cpu", gpu_ok=True) == "cpu"
+    assert resolve_device("cpu", gpu_ok=False) == "cpu"
+
+
+def test_resolve_device_auto_without_gpu_returns_cpu():
+    """auto + 无 gpu 环境 -> cpu"""
+    assert resolve_device("auto", gpu_ok=False) == "cpu"
+
+
+def test_resolve_device_auto_with_gpu_returns_gpu():
+    """auto + 有 gpu -> gpu"""
+    assert resolve_device("auto", gpu_ok=True) == "gpu"
+
+
+def test_resolve_device_gpu_request_without_gpu_raises():
+    with pytest.raises(ValueError, match="gpu"):
+        resolve_device("gpu", gpu_ok=False)
+
+
+def test_resolve_device_gpu_error_message_includes_install_hints():
+    """2026-09-12 add-gpu-extra-pyproject: --device gpu 报错的文案必须含 GPU 安装引导
+
+    当 torch 是 CPU wheel 时, ValueError 文案需提示:
+      - 当前 torch 构建无 CUDA 支持 (含 torch.__version__ / cuda 字段)
+      - 改用 --device auto 或 --device cpu
+      - GPU 机器请 `uv sync --extra gpu` 或 `bash scripts/sync-torch-cu.sh`
+    """
+    with pytest.raises(ValueError) as ei:
+        resolve_device("gpu", gpu_ok=False)
+    msg = str(ei.value)
+    assert "uv sync --extra gpu" in msg or "sync-torch-cu.sh" in msg, (
+        f"ValueError 文案必须含 GPU 安装引导, 实际: {msg!r}")
+    assert "auto" in msg and "cpu" in msg, "文案需提示改用 --device auto/cpu"
+
+
+def test_resolve_device_gpu_request_with_gpu_returns_gpu():
+    assert resolve_device("gpu", gpu_ok=True) == "gpu"
