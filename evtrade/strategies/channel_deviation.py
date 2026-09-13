@@ -156,17 +156,27 @@ class ChannelDeviationStrategy(VectorizedStrategy):
     """通道偏离回撤策略"""
 
     params_spec = {
-        "low1":  {"default": 1.5, "type": float, "min": 0.0, "max": 100.0},
-        "low2":  {"default": 1.0, "type": float, "min": 0.0, "max": 100.0},
-        "high1": {"default": 1.5, "type": float, "min": 0.0, "max": 100.0},
-        "high2": {"default": 0.5, "type": float, "min": 0.0, "max": 100.0},
-        "tf1":   {"default": 21,  "type": int,   "min": 2,   "max": 1000},
+        "low1":  {"default": 1.5, "type": float, "min": 0.0, "max": 100.0,
+                  "desc": "下轨极端偏离阈值(%), 价格跌穿 DW×(1+low1%) 时置位"},
+        "low2":  {"default": 1.0, "type": float, "min": 0.0, "max": 100.0,
+                  "desc": "下轨回撤确认阈值(%), H 回到 DW 附近触发 BUY; 必须 < low1"},
+        "high1": {"default": 1.5, "type": float, "min": 0.0, "max": 100.0,
+                  "desc": "上轨极端偏离阈值(%), H 突破 UP×(1+high1%) 时置位"},
+        "high2": {"default": 0.5, "type": float, "min": 0.0, "max": 100.0,
+                  "desc": "上轨回撤确认阈值(%), L 回到 UP 附近触发 SELL; 必须 < high1"},
+        "tf1":   {"default": 21,  "type": int,   "min": 2,   "max": 1000,
+                  "desc": "EMA 通道周期(策略私有); tf1 越大轨道越平滑"},
         # 资金/持仓/撮合参数 (2026-09-13: framework 不再有 CLI flag, 走 --params)
-        "init_cash":     {"default": 200000.0, "type": float, "min": 0.0, "max": 1e12},
-        "init_position": {"default": 0.0,     "type": float, "min": 0.0, "max": 1e9},
-        "trade_qty":     {"default": 10000.0, "type": float, "min": 0.0, "max": 1e9},
-        "buy_pct":       {"default": 0.0,     "type": float, "min": 0.0, "max": 1.0},
-        "sell_pct":      {"default": 0.0,     "type": float, "min": 0.0, "max": 1.0},
+        "init_cash":     {"default": 200000.0, "type": float, "min": 0.0, "max": 1e12,
+                          "desc": "期初资金(元); 策略 state 自管, framework 不汇总"},
+        "init_position": {"default": 0.0,     "type": float, "min": 0.0, "max": 1e9,
+                          "desc": "期初持仓股数; 默认 0 空仓起步"},
+        "trade_qty":     {"default": 10000.0, "type": float, "min": 0.0, "max": 1e9,
+                          "desc": "每笔交易股数; buy_pct/sell_pct=0 时生效"},
+        "buy_pct":       {"default": 0.0,     "type": float, "min": 0.0, "max": 1.0,
+                          "desc": "BUY 时按当前 cash 比例下注; 0=关闭走 trade_qty, 1=全仓"},
+        "sell_pct":      {"default": 0.0,     "type": float, "min": 0.0, "max": 1.0,
+                          "desc": "SELL 时按当前 position 比例卖; 0=关闭走 trade_qty, 1=全清"},
     }
 
     validators = [_validate_latch_order]

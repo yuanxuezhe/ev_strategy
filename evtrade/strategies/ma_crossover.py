@@ -87,13 +87,20 @@ class MACrossoverStrategy(VectorizedStrategy):
     """双均线交叉策略"""
 
     params_spec = {
-        "fast": {"default": 5,  "type": int, "min": 2, "max": 1000},
-        "slow": {"default": 20, "type": int, "min": 2, "max": 1000},
-        "init_cash":     {"default": 200000.0, "type": float, "min": 0.0, "max": 1e12},
-        "init_position": {"default": 0.0,     "type": float, "min": 0.0, "max": 1e9},
-        "trade_qty":     {"default": 10000.0, "type": float, "min": 0.0, "max": 1e9},
-        "buy_pct":       {"default": 0.0,     "type": float, "min": 0.0, "max": 1.0},
-        "sell_pct":      {"default": 0.0,     "type": float, "min": 0.0, "max": 1.0},
+        "fast": {"default": 5,  "type": int, "min": 2, "max": 1000,
+                 "desc": "fast EMA 周期; 快线, 周期越小对价格越敏感"},
+        "slow": {"default": 20, "type": int, "min": 2, "max": 1000,
+                 "desc": "slow EMA 周期; 慢线, 必须 > fast 才出有意义交叉"},
+        "init_cash":     {"default": 200000.0, "type": float, "min": 0.0, "max": 1e12,
+                          "desc": "期初资金(元); 策略 state 自管, framework 不汇总"},
+        "init_position": {"default": 0.0,     "type": float, "min": 0.0, "max": 1e9,
+                          "desc": "期初持仓股数; 默认 0 空仓起步"},
+        "trade_qty":     {"default": 10000.0, "type": float, "min": 0.0, "max": 1e9,
+                          "desc": "每笔交易股数; buy_pct/sell_pct=0 时生效"},
+        "buy_pct":       {"default": 0.0,     "type": float, "min": 0.0, "max": 1.0,
+                          "desc": "BUY 时按当前 cash 比例下注; 0=关闭走 trade_qty, 1=全仓"},
+        "sell_pct":      {"default": 0.0,     "type": float, "min": 0.0, "max": 1.0,
+                          "desc": "SELL 时按当前 position 比例卖; 0=关闭走 trade_qty, 1=全清"},
     }
 
     def init_state(self, params: dict) -> MACrossoverState:
